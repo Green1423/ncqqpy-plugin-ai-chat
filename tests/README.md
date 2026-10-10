@@ -4,10 +4,10 @@
 
 ```bash
 # ① 独立 clone 本插件仓库：把框架仓库挂到 PYTHONPATH
-PYTHONPATH=/path/to/napcat-py python -B tests/test_ai_chat.py
+PYTHONPATH=/path/to/ncqqpy python -B tests/test_ai_chat.py
 
 # ② 框架仓库布局（本插件已 clone 到框架的 plugins/ai_chat/ 下）
-cd /path/to/napcat-py && python -B tests/test_ai_chat.py
+cd /path/to/ncqqpy && python -B tests/test_ai_chat.py
 ```
 
 | 套件 | 覆盖 |
