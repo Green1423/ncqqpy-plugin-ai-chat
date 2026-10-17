@@ -163,6 +163,21 @@ class ModelSchema(CommandSchema):
     show = BoolField(default=False, description="只显示当前生效值")
 
 
+class MaxTokensSchema(CommandSchema):
+    """查看 / 设置**会话级** max_tokens（`/aichat maxtokens`）。
+
+    `value` 用字符串而不是 IntField：既要支持数字（4096）和简写（8k），也要支持
+    `off`（清除会话覆盖、回到全局默认）。解析放进处理器，与 `/aichat think` 的
+    `level` 一致 —— 不在 schema 里维护第二份词汇表。
+    """
+
+    value = StrField(default="", max_length=20,
+                     description="数字或 8k；off=清除会话覆盖（回到全局）")
+    session = StrField(default="", max_length=64,
+                       description="会话 ID 或名字（默认当前会话）")
+    show = BoolField(default=False, description="只显示当前生效值（不修改）")
+
+
 class ThinkSchema(CommandSchema):
     """查看/切换思考强度。
 

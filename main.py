@@ -835,6 +835,36 @@ class AiChatPlugin(PluginBase):
             session.updated_at = time.time()
             self.store._save_locked()
 
+    @staticmethod
+    def _session_max_tokens(session: Optional[Session]) -> int:
+        """会话级 max_tokens 覆盖（`/aichat maxtokens` 写进 meta）。0 = 未设置。"""
+        if session is None:
+            return 0
+        value = (session.meta or {}).get("max_tokens")
+        try:
+            return max(0, int(value))
+        except (TypeError, ValueError):
+            return 0
+
+    def _set_session_max_tokens(self, session: Session, value: int) -> None:
+        """写会话级 max_tokens；`value <= 0` 表示清除覆盖（回到全局）。"""
+        with self.store._lock:
+            if value > 0:
+                session.meta["max_tokens"] = int(value)
+            else:
+                session.meta.pop("max_tokens", None)
+            session.updated_at = time.time()
+            self.store._save_locked()
+
+    def effective_max_tokens(self, session: Optional[Session]) -> int:
+        """当前生效的 max_tokens（会话覆盖 → 全局/客户端默认）。
+
+        ⚠️ 这只是**预算**：推理模型的思考下界由
+        `llm.reasoning_policy.min_max_tokens()` 在发请求时再抬一次
+        （与 `/aichat think --global_` 的预算模式同一条路）。
+        """
+        return self._session_max_tokens(session) or int(self.llm.max_tokens)
+
     def effective_reasoning(self, session: Optional[Session]) -> ReasoningSpec:
         """当前生效的思考强度（会话覆盖 → per-model → 全局默认）。"""
         return self.reasoning.spec_for(self.llm.model,
@@ -2259,7 +2289,8 @@ class AiChatPlugin(PluginBase):
         await self._send(target, chain)
 
     async def _chat_with_retry(self, messages, *, tools, reasoning,
-                               target: Optional[ChatTarget] = None):
+                               target: Optional[ChatTarget] = None,
+                               max_tokens: Optional[int] = None):
         """调模型；**可重试的失败**按配置自动重试，其余立刻抛出。
 
         重试放在**单次模型调用**这一层，而不是整轮对话：一轮里可能已经跑过工具
@@ -2277,7 +2308,8 @@ class AiChatPlugin(PluginBase):
         told = False
         for attempt in range(tries + 1):
             try:
-                return await self.llm.chat(messages, tools=tools, reasoning=reasoning)
+                return await self.llm.chat(messages, tools=tools, reasoning=reasoning,
+                                           max_tokens=max_tokens)
             except Exception as e:  # noqa: BLE001 - 分类交给 _is_retryable
                 if attempt >= tries or not _is_retryable(e) \
                         or _looks_like_context_overflow(e):
@@ -2330,6 +2362,7 @@ class AiChatPlugin(PluginBase):
                 result = await self._chat_with_retry(
                     api_messages, tools=schemas or None,
                     reasoning=self._session_reasoning(session) or None,
+                    max_tokens=self.effective_max_tokens(session),
                     target=target)
             except Exception as e:  # noqa: BLE001
                 if retries_left > 0 and _looks_like_context_overflow(e) \
@@ -3097,6 +3130,12 @@ class AiChatPlugin(PluginBase):
         async def cmd_think(params, event: MessageEvent):
             return self._do_think(params, event)
 
+        @self.register_command(f"{A}.maxtokens", schema=S.MaxTokensSchema, permission="",
+                               scope="all",
+                               description="查看/设置单个会话的 max_tokens（会话级覆盖）")
+        async def cmd_maxtokens(params, event: MessageEvent):
+            return self._do_maxtokens(params, event)
+
         # ---- 超级用户 + 仅私聊：绑定 ----
         @self.register_command(f"{A}.config", schema=S.ConfigSchema,
                                permission="superuser", scope="private",
@@ -3459,6 +3498,75 @@ class AiChatPlugin(PluginBase):
                          "「想完但没字数回答」（content 为空）")
         return "\n".join(lines)
 
+    def _do_maxtokens(self, params, event: MessageEvent) -> str:
+        """`/aichat maxtokens` —— 查看/设置**会话级** max_tokens。
+
+        默认作用于**当前会话**（与 `/aichat think` 一致）；`--session=<id|名字>`
+        可指定别的会话（需要管理权限：会话所有者 / 群主管理员 / 超管）。
+        `off` 清除覆盖，回到全局默认。值只是预算，思考下界在发请求时另抬高。
+        """
+        target = self._target_of(event)
+        uid = int(event.user_id)
+        if params.session:
+            session = self.store.resolve(params.session)
+            if session is None:
+                return f"找不到会话：{params.session}"
+            ok, why = self._may_manage(session, uid)
+            if not ok and not self.perm.is_superuser(uid):
+                return f"⚠️ {why}"
+        else:
+            session = self._current_session(target, uid)
+
+        raw = str(getattr(params, "value", "") or "").strip()
+        if not raw or bool(getattr(params, "show", False)):
+            return self._maxtokens_status(session)
+
+        if raw.lower() in {"off", "none", "-", "clear"}:
+            value = 0
+        else:
+            parsed = _parse_token_budget(raw)
+            if parsed is None:
+                return (f"不认识 max_tokens {raw!r}。\n"
+                        f"用法：/aichat maxtokens 4096（或 8k）· off=清除覆盖 · "
+                        f"--session=<会话id> 指定会话\n（{VALIDATION_HINT}）")
+            value = parsed
+            if not (MIN_MAX_TOKENS <= value <= MAX_MAX_TOKENS):
+                return (f"max_tokens 需在 {MIN_MAX_TOKENS}–{MAX_MAX_TOKENS} 之间"
+                        f"（收到 {value}）")
+
+        if session is None:
+            return ("你在此处还没有会话，无法设置会话级 max_tokens。\n"
+                    "先说话建一个会话；只想改全局默认用 "
+                    "/aichat model --max_tokens=N。\n"
+                    + self._maxtokens_status(None))
+
+        self._set_session_max_tokens(session, value)
+        what = f"{value}" if value else "清除（回到全局默认）"
+        return (f"🔢 已将会话 {session.id}「{session.name}」的 max_tokens 设为 {what}\n"
+                + self._maxtokens_status(session))
+
+    def _maxtokens_status(self, session: Optional[Session]) -> str:
+        base = int(self.llm.max_tokens)
+        lines = ["🔢 max_tokens（每次回复最多生成多少 token）",
+                 f"  全局默认：{base}"]
+        if session is not None:
+            over = self._session_max_tokens(session)
+            eff = self.effective_max_tokens(session)
+            lines.append(f"  当前会话：{session.id}「{session.name}」"
+                         f"（{'会话设置' if over else '全局默认'}）")
+            try:
+                final = self.llm.reasoning_policy.min_max_tokens(
+                    self.effective_reasoning(session), eff)
+            except Exception:  # noqa: BLE001 - 状态卡不该因为估算失败而报错
+                final = eff
+            extra = f"（思考下界会抬到 {final}）" if final != eff else ""
+            lines.append(f"  实际生效：{eff}{extra}")
+        else:
+            lines.append("  当前会话：无（此处还没建会话）")
+        lines += ["  设置：/aichat maxtokens 4096（或 8k）· off=清除覆盖",
+                  "         --session=<会话id> 指定别的会话 · --show 只看不改"]
+        return "\n".join(lines)
+
     def _do_invite(self, params, event: MessageEvent, *, invite: bool) -> str:
         """邀请 / 取消邀请 —— 只有会话所有者（群归属的会话由群主/管理员代管）。
 
@@ -3670,6 +3778,29 @@ def _is_retryable(e: BaseException) -> bool:
     if flag is not None:
         return bool(flag)
     return isinstance(e, (asyncio.TimeoutError, TimeoutError))
+
+
+#: 会话级 max_tokens 的合法区间（与 /aichat model --max_tokens 同一个口径）
+MIN_MAX_TOKENS = 64
+MAX_MAX_TOKENS = 200000
+
+
+def _parse_token_budget(text: str) -> Optional[int]:
+    """`4096` / `8k` / `8K` / `8_192` → 整数；认不出返回 None。
+
+    只做「人类写法 → 数字」这一件事，范围校验在调用方（命令里给提示），
+    这样 `/aichat think` 的预算解析与这里不会各写一套。
+    """
+    t = str(text or "").strip().lower().replace("_", "")
+    if not t:
+        return None
+    mult = 1
+    if t.endswith("k"):
+        mult, t = 1024, t[:-1]
+    try:
+        return int(float(t) * mult)
+    except (TypeError, ValueError):
+        return None
 
 
 def _coerce_int(value, default: int) -> int:

@@ -49,8 +49,9 @@
   - [7.3 强度取值](#73-强度取值)
   - [7.4 命令](#74-命令)
   - [7.5 max_tokens 下界保护](#75-max_tokens-下界保护)
-  - [7.6 压缩摘要单独一档](#76-压缩摘要单独一档)
-  - [7.7 手工改了 config.json 怎么生效](#77-手工改了-configjson-怎么生效)
+  - [7.6 会话级 max_tokens（`/aichat maxtokens`）](#76-会话级-max_tokensaichat-maxtokens)
+  - [7.7 压缩摘要单独一档](#77-压缩摘要单独一档)
+  - [7.8 手工改了 config.json 怎么生效](#78-手工改了-configjson-怎么生效)
 - [八、内置工具](#八内置工具)
   - [8.1 与其它插件彻底解耦](#81-与其它插件彻底解耦)
   - [8.2 自定义 HTTP 工具](#82-自定义-http-工具)
@@ -860,6 +861,10 @@ token 是**字符数 ÷ `chars_per_token`**（默认 1.6，中文为主的聊天
 /aichat think 8k                   思考预算
 /aichat think off                  退回不干预
 /aichat think low --global_=true   改全局默认（写入 config.json）
+/aichat maxtokens                  查看本会话生效的 max_tokens（全局/覆盖/思考下界后）
+/aichat maxtokens 2048             只改当前会话（8k 简写亦可）
+/aichat maxtokens off              清除会话覆盖，回到全局默认
+/aichat maxtokens 8192 --session=<id|名字>   改指定会话（需管理权限）
 /aichat model                      顺带显示思考强度
 ```
 
@@ -873,7 +878,26 @@ token 是**字符数 ÷ `chars_per_token`**（默认 1.6，中文为主的聊天
 所以开思考时会自动抬高下界（默认 4096；预算模式给「预算 + 1024」余量），
 `/aichat think` 会显示实际用的值。
 
-### 7.6 压缩摘要单独一档
+### 7.6 会话级 max_tokens（`/aichat maxtokens`）
+
+`llm.max_tokens` 是**全局默认**；但「这个会话要不要长回答」其实与会话绑定更合理
+（和思考强度同一个理由）。所以会话可以有自己的 `max_tokens` 覆盖：
+
+| 命令 | 作用 |
+|------|------|
+| `/aichat maxtokens` | 查看：全局默认 / 本会话覆盖 / 实际生效（含思考下界） |
+| `/aichat maxtokens 2048` | 只改**当前会话**（`8k`、`1.5k` 简写都行） |
+| `/aichat maxtokens off` | 清除会话覆盖，回到全局默认 |
+| `/aichat maxtokens 8192 --session=<id\|名字>` | 改指定会话（会话所有者 / 群主管理员 / 超管） |
+
+- 覆盖值存在会话的 `meta.max_tokens` 里，**随会话持久化**（重启不丢）；
+- 生效优先级：**会话覆盖 → `llm.max_tokens`（含 `/aichat model --max_tokens` 的
+  运行期改动）**，之后仍会过一遍 7.5 的思考下界抬升；
+- 合法范围 64–200000；`off`/`0` 表示清除；
+- 全局默认要持久化改，仍走 `plugins.ai_chat.llm.max_tokens`（或
+  `/aichat model --max_tokens=N`，仅本次运行有效）。
+
+### 7.7 压缩摘要单独一档
 
 摘要要求「短、密、结构化」，思考链在这里纯属浪费，所以 `reasoning.compaction`
 默认 `off`。但有些推理模型关掉思考后摘要质量明显下降，所以留了单独配置的余地：
@@ -882,7 +906,7 @@ token 是**字符数 ÷ `chars_per_token`**（默认 1.6，中文为主的聊天
 "reasoning": { "default": "high", "compaction": "off" }
 ```
 
-### 7.7 手工改了 config.json 怎么生效
+### 7.8 手工改了 config.json 怎么生效
 
 `ConfigManager` 只在启动时读一次文件。自己改自己（`/aichat think --global_=true`
 之类）会同时更新内存与文件；但**手工编辑文件**后需要：

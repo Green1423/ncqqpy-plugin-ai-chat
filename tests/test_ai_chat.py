@@ -3695,6 +3695,70 @@ async def test_unbound_is_silent(h: Harness):
 
 
 
+async def test_maxtokens_command(h: Harness):
+    print("\n[40] /aichat maxtokens：按会话改 max_tokens")
+    await establish(h)
+    h.clear()
+    await h.private("/aichat maxtokens", settle=0.9)
+    text = await h.wait_reply()
+    check("maxtokens 显示状态", "max_tokens" in text and "全局默认" in text, text[:200])
+    base = h.plugin.llm.max_tokens
+
+    h.clear()
+    await h.private("默认一轮//", settle=1.0)
+    await h.wait_for_replies(1)
+    check("默认用全局 max_tokens", h.llm.last_max_tokens == base,
+          f"{h.llm.last_max_tokens} vs {base}")
+
+    h.clear()
+    await h.private("/aichat maxtokens 2048", settle=0.9)
+    text = await h.wait_reply()
+    check("设置成功", "已" in text and "2048" in text, text[:200])
+    sid = _current_session(h).id
+    check("落库到 session.meta",
+          h.plugin.store.get(sid).meta.get("max_tokens") == 2048,
+          f"{h.plugin.store.get(sid).meta}")
+    check("状态卡标为会话设置", "会话设置" in text, text[:300])
+
+    h.clear()
+    await h.private("再来一轮//", settle=1.0)
+    await h.wait_for_replies(1)
+    check("payload 真的用 2048", h.llm.last_max_tokens == 2048,
+          f"{h.llm.last_max_tokens}")
+
+    h.clear()
+    await h.private("/aichat maxtokens 8k", settle=0.9)
+    await h.wait_for_replies(1)
+    check("8k 简写 = 8192",
+          h.plugin.store.get(sid).meta.get("max_tokens") == 8192,
+          f"{h.plugin.store.get(sid).meta}")
+
+    h.clear()
+    await h.private("/aichat maxtokens off", settle=0.9)
+    await h.wait_reply()
+    check("off 清除覆盖", "max_tokens" not in (h.plugin.store.get(sid).meta or {}),
+          f"{h.plugin.store.get(sid).meta}")
+    h.clear()
+    await h.private("清掉后一轮//", settle=1.0)
+    await h.wait_for_replies(1)
+    check("清除后回到全局", h.llm.last_max_tokens == base, f"{h.llm.last_max_tokens}")
+
+    h.clear()
+    await h.private("/aichat maxtokens 很多", settle=0.9)
+    text = await h.wait_reply()
+    check("非法值有明确提示", "不认识" in text, text[:150])
+
+    h.clear()
+    await h.private("/aichat maxtokens 10", settle=0.9)
+    text = await h.wait_reply()
+    check("低于下界被拒", "64" in text, text[:150])
+
+    h.clear()
+    await h.private("/aichat maxtokens 2048 --session=nope-xyz", settle=0.9)
+    text = await h.wait_reply()
+    check("指定不存在的会话有提示", "找不到会话" in text, text[:150])
+
+
 async def test_unified_help(h: Harness):
     """帮助统一走框架 `CommandManager` 的 /help，插件不再自绘一份。"""
     from napcat.models import parse_event
@@ -3930,7 +3994,8 @@ async def main():
         test_llm_retry, test_llm_timeout_hint, test_escaped_prefix_paste,
         test_sse_parse, test_llm_stream_cutoff, test_partial_reply_on_cutoff,
         test_llm_stream_wiring,
-        test_think_command, test_reasoning_dialect_via_config,
+        test_think_command, test_maxtokens_command,
+        test_reasoning_dialect_via_config,
         test_config_template_seeding,
         test_no_deferred_relative_imports, test_no_coupling_with_other_plugins,
         test_binding_allowlist, test_binding_group_vs_private, test_binding_cooldown,
