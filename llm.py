@@ -263,7 +263,8 @@ class _StreamAcc:
             raise LlmError(
                 f"空响应（finish_reason={self.finish or '无'}，"
                 f"思考链 {sum(len(x) for x in self.reasoning)} 字）；"
-                "若为推理模型请调大 ai_chat.llm.max_tokens")
+                "若为推理模型请调大 ai_chat.llm.max_tokens（建议 ≥ 16384："
+                "思考 token 与正文共用配额，给少了就会「想完但没字数回答」）")
         return ChatResult(
             text=text, tool_calls=calls, model=self.model,
             finish_reason=self.finish, usage=dict(self.usage),
@@ -536,7 +537,7 @@ class LlmClient:
             self.last_error = f"空响应（finish_reason={finish}）"
             raise LlmError(
                 f"空响应（finish_reason={finish}）；"
-                "若为推理模型请调大 ai_chat.llm.max_tokens")
+                "若为推理模型请调大 ai_chat.llm.max_tokens（建议 ≥ 16384）")
 
         usage = data.get("usage") if isinstance(data.get("usage"), dict) else {}
         return ChatResult(text=text, tool_calls=calls,

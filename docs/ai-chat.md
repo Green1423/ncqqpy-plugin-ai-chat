@@ -877,6 +877,34 @@ token 是**字符数 ÷ `chars_per_token`**（默认 1.6，中文为主的聊天
 会拿到 `finish_reason=length` 且 **content 为空串** —— 用户只看到「机器人没反应」。
 所以开思考时会自动抬高下界（默认 4096；预算模式给「预算 + 1024」余量），
 `/aichat think` 会显示实际用的值。
+### 7.5.1 上游「自己会思考」时的空响应（实测）
+
+有些网关/模型**不管你是否传思考参数，都会先吐一段思考链**（`reasoning_content`），
+而思考 token 与正文共用 `max_tokens`。这时 `llm.max_tokens=4096` 的典型表现是：
+
+- 难题（数学 / 竞赛 / 长推导）把配额全花在思考上 → 上游结束流时**只有 reasoning、
+  没有 content、也没有 `finish_reason`**；
+- 插件抛 `空响应（finish_reason=无，思考链 N 字）`，用户收到
+  `⚠️ AI 对话出错（E-xxxx）：…`，会话里**只留下没被回答的提问**；
+- 简单问题（「1+1」）4096 也够 → 于是表现为「只有某个会话怎么问都不回」。
+
+实测（BUPT 网关 `myai.bupt.edu.cn/llm-gw/v1` + `deepseek-v4-flash`，同一段 math 会话历史）：
+
+| `max_tokens` | 结果 |
+|---|---|
+| 4096 | 37s 后「空响应（思考链 989 字）」，无回复 |
+| 8192 | 思考更久 → 撞 `llm.timeout=120` 超时 |
+| **16384 + `timeout=300`** | **正常回复（409 字，assistant 记录已落库）** |
+
+处理：
+
+- `llm.max_tokens` 提到 **≥ 16384**，`llm.timeout` 提到 **≥ 300**（思考久时 120s 不够）；
+- ⚠️ `reasoning.default=off` 只是**不发思考参数**（`build_params()` 在 off 时返回空
+  dict，所有方言一致），**不等于让模型不思考**；`reasoning.max_tokens_floor` 也只在
+  **我们要了思考**时才生效（`min_max_tokens()` 在 off 时直接返回 base），这条路上兜不住；
+- 空响应会带错误编号（`E-xxxx`），`/aichat model` 可临时改本次运行的 `max_tokens`，
+  但持久化要改 `plugins.ai_chat.llm.max_tokens` 再 `/aichat reload`。
+
 
 ### 7.6 会话级 max_tokens（`/aichat maxtokens`）
 

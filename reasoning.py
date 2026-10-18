@@ -18,8 +18,9 @@
 dialect               生成的 payload 字段
 ====================  ==========================================================
 `effort`（默认）       `reasoning_effort: "<level>"`（OpenAI / DeepSeek / 通义）
-`thinking`             `thinking: {"type": "enabled"|"disabled"|"auto"}`
-                       （DeepSeek V3.2 风格；`off` → `disabled`）
+`thinking`             `thinking: {"type": "enabled"}`（DeepSeek V3.2 风格）
+                       ⚠️ `off` 时**什么都不发**，不是发 `disabled`：见 `build_params()`
+                       的首行提前返回 —— 「不干预」是所有方言共同的语义
 `enable_thinking`      `enable_thinking: true|false`（Qwen / vLLM 部署常见）
 `none`                 什么都不发（让端点用自己的默认值）
 `raw`                  由 `params` 原样合并（自建端点万能兜底）
