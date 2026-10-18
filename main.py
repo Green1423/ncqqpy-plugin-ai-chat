@@ -70,7 +70,7 @@ from .history import (SUMMARY_SYSTEM_PROMPT, SummaryCache, extract_exchanges,
                       parse_range, reject_range, render_list, summarize_context,
                       summary_key)
 from .markdown import (has_inline_math, split_inline_math,
-                       split_rich_segments)
+                       split_rich_segments, to_plain_text)
 from .plot import PlotService, extract_markers, strip_markers
 from .render import HistoryRenderer, RenderError, RenderOptions
 from .search import ANYSEARCH_URL, WebClient
@@ -2590,9 +2590,9 @@ class AiChatPlugin(PluginBase):
                                 chain.image(file=Path(ipath).as_uri(),
                                             name=os.path.basename(ipath))
                             else:
-                                chain.text(sub + "\n")
+                                chain.text(to_plain_text(sub) + "\n")
                     else:
-                        chain.text(content + "\n")
+                        chain.text(to_plain_text(content) + "\n")
                     continue
                 path = await self.renderer.render_rich(kind, content)
                 chain.image(file=Path(path).as_uri(), name=os.path.basename(path))
@@ -2614,8 +2614,12 @@ class AiChatPlugin(PluginBase):
 
     async def _send_text(self, target: ChatTarget, text: str, *,
                          quote_id: Optional[int] = None) -> None:
-        """把模型输出按配额分段发送（长回复不会被 QQ 截断或刷屏）。"""
-        body = (text or "").strip()
+        """把模型输出按配额分段发送（长回复不会被 QQ 截断或刷屏）。
+
+        文本模式下 QQ 不渲染 Markdown，所以先过 `to_plain_text()` 把 `**`、`>`、
+        `[文本](url)`、反引号这些符号降噪掉 —— 否则用户看到的是源码。
+        """
+        body = to_plain_text(text or "").strip()
         if not body:
             body = str(self.cfg["reply"]["fallback_text"])
         chain = MessageChain()

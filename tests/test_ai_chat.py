@@ -3827,6 +3827,50 @@ async def test_timeout_command(h: Harness):
     check("指定不存在的会话有提示", "找不到会话" in text, text[:150])
 
 
+async def test_plain_text_formatting(h: Harness):
+    print("\n[45] 文本模式：Markdown 残留发出去前被清掉")
+    md = plugin_module("markdown")
+    cases = [
+        ("**重点**：注意", "重点：注意"),
+        ("> 引用的话", "引用的话"),
+        ("### 小标题", "小标题"),
+        ("看[文档](https://example.com/a)", "看文档（https://example.com/a）"),
+        ("用 `pip install x`", "用 pip install x"),
+        ("~~删掉~~ 和 *斜体* 和 __粗__", "删掉 和 斜体 和 粗"),
+        ("转义 \\*字面星号\\*", "转义 *字面星号*"),
+    ]
+    for src, want in cases:
+        got = md.to_plain_text(src)
+        check(f"to_plain_text({src!r})", got == want, f"{got!r} != {want!r}")
+    # 公式必须一字不动（里面的 * _ \frac 不能被当成 Markdown）
+    math_src = "公式 $a*b = c$ 和 $$\\frac{a}{b}$$ 不动"
+    check("公式整段保护", md.to_plain_text(math_src) == math_src,
+          md.to_plain_text(math_src))
+    check("分隔线换成实线", md.to_plain_text("---") == "─" * 10)
+
+    # —— 端到端：桩回一段带 Markdown 的话，文本模式下发出的必须是降噪后的 ——
+    await establish(h)
+    h.llm.script_text = "> **注意**：先看[文档](https://example.com/a)。\n用 `pip install x` 安装。"
+    h.clear()
+    await h.private("来一段//", settle=1.0)
+    await h.wait_for_replies(1)
+    text = await h.wait_reply()
+    check("发出的话里没有 ** 残留", "**" not in text, text[:200])
+    check("没有行首 > 残留", not any(ln.startswith(">") for ln in text.splitlines()), text[:200])
+    check("链接改成了 标题（url）", "文档（https://example.com/a）" in text, text[:200])
+    check("反引号去掉了", "`" not in text, text[:200])
+
+    # —— 混合路径：正文 + 行内公式（公式出图，文本部分同样要降噪）——
+    h.llm.script_text = "**重点**：看公式 $x^2$ 的结果。"
+    h.clear()
+    await h.private("再一段//", settle=1.5)
+    await h.wait_for_replies(1)
+    text = await h.wait_reply()
+    check("图文混合时文本段也降噪", "**" not in text, text[:200])
+    check("公式部分没退化成源码", "$x^2$" not in text, text[:200])
+    h.llm.script_text = "好的，我收到了。"
+
+
 async def test_unified_help(h: Harness):
     """帮助统一走框架 `CommandManager` 的 /help，插件不再自绘一份。"""
     from napcat.models import parse_event
@@ -4063,6 +4107,7 @@ async def main():
         test_sse_parse, test_llm_stream_cutoff, test_partial_reply_on_cutoff,
         test_llm_stream_wiring,
         test_think_command, test_maxtokens_command, test_timeout_command,
+        test_plain_text_formatting,
         test_reasoning_dialect_via_config,
         test_config_template_seeding,
         test_no_deferred_relative_imports, test_no_coupling_with_other_plugins,

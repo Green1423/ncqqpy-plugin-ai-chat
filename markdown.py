@@ -769,6 +769,81 @@ def split_rich_segments(text: str) -> list[tuple[str, str]]:
     return segs
 
 
+# ---- 文本模式：把 Markdown 压成纯文本 ------------------------------------
+
+#: 文本模式里要**一字不改**的片段：数学公式（含 `*` `_` `\frac`，被当成强调/转义就改错意思了）
+_PLAIN_PROTECT_RE = re.compile(
+    r"\$\$.+?\$\$"
+    r"|\\\[.+?\\\]"
+    r"|(?<![\w$])\$[^$\n]{1,200}\$(?![\w$])(?!\d)"
+    r"|\\\(.+?\\\)", re.S)
+_BOLD2_RE = re.compile(r"__(?!\s)(.+?)(?<!\s)__", re.S)
+#: Markdown 反斜杠转义（只处理这些字符；`\f` `\s` 这类是 LaTeX，不能动）
+_MD_ESCAPE_RE = re.compile(r"\\([\\`*_{}\[\]()#+\-.!~>|])")
+
+
+def to_plain_text(text: str) -> str:
+    r"""把 Markdown 正文压成「QQ 纯文本里读得懂」的样子（**不改写内容**）。
+
+    文本模式（没加 `//md`）整段不出图，而 QQ 不渲染 Markdown —— 直接把模型输出
+    发出去，用户看到的就是 `**重点**` 的星号、`> 引用` 的尖括号、
+    `[文档](https://…)` 的原样链接、`` `code` `` 的反引号。
+
+    这里只做**降噪**：去强调/删除线标记、链接改成 `标题（url）`、引用去掉 `>`、
+    分隔线换成实线、标题去掉 `#`、行内代码去掉反引号、还原 `\*` 这类转义；
+    顺带压掉行尾空白与 3 个以上连续空行（QQ 里会显得空得莫名其妙）。
+
+    ⚠️ 数学公式（`$…$` / `$$…$$` / `\(…\)` / `\[…\]`）整段保护、一字不改：
+    公式里的 `*` `_` `\frac` 如果被当成 Markdown 处理，语义直接变了。
+    """
+    body = str(text or "")
+    if not body.strip():
+        return body
+    stash: list[str] = []
+
+    def keep_math(m):
+        stash.append(m.group(0))
+        return _PH.format(len(stash) - 1)
+
+    body = _PLAIN_PROTECT_RE.sub(keep_math, body)
+
+    def keep_escape(m):
+        # `\*` = 用户/模型想要的**字面星号**，先收起来，否则会被下面的强调规则
+        # 当成斜体标记吃掉（实测 `\*星号\*` 会变成 `\星号\`）。
+        stash.append(m.group(1))
+        return _PH.format(len(stash) - 1)
+
+    body = _MD_ESCAPE_RE.sub(keep_escape, body)
+
+    def keep_code(m):
+        stash.append(m.group(1))          # 行内代码：保留内容、去掉反引号
+        return _PH.format(len(stash) - 1)
+
+    body = _INLINE_CODE_RE.sub(keep_code, body)
+
+    lines: list[str] = []
+    for line in body.replace("\r\n", "\n").replace("\r", "\n").split("\n"):
+        if _HR_RE.match(line):
+            lines.append("─" * 10)
+            continue
+        line = _HEADING_RE.sub(lambda m: m.group(2).strip(), line)
+        line = _QUOTE_RE.sub(lambda m: m.group(1), line)
+        lines.append(line)
+    body = "\n".join(lines)
+
+    body = _BOLD_RE.sub(lambda m: m.group(1), body)
+    body = _BOLD2_RE.sub(lambda m: m.group(1), body)
+    body = _STRIKE_RE.sub(lambda m: m.group(1), body)
+    body = _ITALIC_RE.sub(lambda m: m.group(1), body)
+    body = _LINK_RE.sub(
+        lambda m: (m.group(1) if m.group(1).strip() == m.group(2).strip()
+                   else f"{m.group(1)}（{m.group(2)}）"), body)
+    body = re.sub(r"[ \t]+\n", "\n", body)
+    body = re.sub(r"\n{3,}", "\n\n", body)
+    body = _PH_RE.sub(lambda m: stash[int(m.group(1))], body)
+    return body.strip()
+
+
 def has_rich_blocks(text: str) -> bool:
     return bool(find_rich_blocks(text))
 
