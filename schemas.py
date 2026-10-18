@@ -178,6 +178,20 @@ class MaxTokensSchema(CommandSchema):
     show = BoolField(default=False, description="只显示当前生效值（不修改）")
 
 
+class TimeoutSchema(CommandSchema):
+    """查看 / 设置**会话级**的单次调用时长上限（`/aichat timeout`）。
+
+    值用字符串：支持 `600`、`600s`、`10m`、`1.5h`，以及 `off`（清除覆盖）。
+    解析与范围校验在处理器里（与 `/aichat maxtokens` 同一套写法）。
+    """
+
+    value = StrField(default="", max_length=16,
+                     description="秒数或 10m / 1.5h；off=清除会话覆盖（回到全局）")
+    session = StrField(default="", max_length=64,
+                       description="会话 ID 或名字（默认当前会话）")
+    show = BoolField(default=False, description="只显示当前生效值（不修改）")
+
+
 class ThinkSchema(CommandSchema):
     """查看/切换思考强度。
 

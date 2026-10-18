@@ -865,6 +865,35 @@ class AiChatPlugin(PluginBase):
         """
         return self._session_max_tokens(session) or int(self.llm.max_tokens)
 
+    @staticmethod
+    def _session_timeout(session: Optional[Session]) -> float:
+        """会话级单次调用时长上限（`/aichat timeout` 写进 meta）。0 = 未设置。"""
+        if session is None:
+            return 0.0
+        value = (session.meta or {}).get("timeout")
+        try:
+            return max(0.0, float(value))
+        except (TypeError, ValueError):
+            return 0.0
+
+    def _set_session_timeout(self, session: Session, value: float) -> None:
+        """写会话级 timeout；`value <= 0` 表示清除覆盖（回到全局）。"""
+        with self.store._lock:
+            if value > 0:
+                session.meta["timeout"] = float(value)
+            else:
+                session.meta.pop("timeout", None)
+            session.updated_at = time.time()
+            self.store._save_locked()
+
+    def effective_timeout(self, session: Optional[Session]) -> float:
+        """当前生效的单次调用总时长上限（会话覆盖 → 全局 llm.timeout）。
+
+        ⚠️ 这是「想 + 答」的**总**时长；`stall_timeout` 是「多久没新数据」，
+        两者判据不同（见 llm._chat_stream）。思考链一直在流时，只有它兜底。
+        """
+        return self._session_timeout(session) or float(self.llm.timeout)
+
     def effective_reasoning(self, session: Optional[Session]) -> ReasoningSpec:
         """当前生效的思考强度（会话覆盖 → per-model → 全局默认）。"""
         return self.reasoning.spec_for(self.llm.model,
@@ -2095,7 +2124,8 @@ class AiChatPlugin(PluginBase):
                  if getattr(e, "retryable", True) is False else tail)
         return (f"（超过单次 {secs:.0f} 秒的上限{tried}；"
                 "先把已经生成的部分发给你了。这类问题拆小一点问更快，"
-                "也可以调大 ai_chat.llm.timeout）")
+                "也可以调大 ai_chat.llm.timeout，或只改本会话："
+                "/aichat timeout 600）")
 
     def _last_reply_text(self, session: Session) -> str:
         """会话里**最后一条**有正文的 AI 回复（`/md` 用）。"""
@@ -2290,7 +2320,8 @@ class AiChatPlugin(PluginBase):
 
     async def _chat_with_retry(self, messages, *, tools, reasoning,
                                target: Optional[ChatTarget] = None,
-                               max_tokens: Optional[int] = None):
+                               max_tokens: Optional[int] = None,
+                               timeout: Optional[float] = None):
         """调模型；**可重试的失败**按配置自动重试，其余立刻抛出。
 
         重试放在**单次模型调用**这一层，而不是整轮对话：一轮里可能已经跑过工具
@@ -2309,7 +2340,7 @@ class AiChatPlugin(PluginBase):
         for attempt in range(tries + 1):
             try:
                 return await self.llm.chat(messages, tools=tools, reasoning=reasoning,
-                                           max_tokens=max_tokens)
+                                           max_tokens=max_tokens, timeout=timeout)
             except Exception as e:  # noqa: BLE001 - 分类交给 _is_retryable
                 if attempt >= tries or not _is_retryable(e) \
                         or _looks_like_context_overflow(e):
@@ -2363,6 +2394,7 @@ class AiChatPlugin(PluginBase):
                     api_messages, tools=schemas or None,
                     reasoning=self._session_reasoning(session) or None,
                     max_tokens=self.effective_max_tokens(session),
+                    timeout=self.effective_timeout(session),
                     target=target)
             except Exception as e:  # noqa: BLE001
                 if retries_left > 0 and _looks_like_context_overflow(e) \
@@ -3136,6 +3168,12 @@ class AiChatPlugin(PluginBase):
         async def cmd_maxtokens(params, event: MessageEvent):
             return self._do_maxtokens(params, event)
 
+        @self.register_command(f"{A}.timeout", schema=S.TimeoutSchema, permission="",
+                               scope="all",
+                               description="查看/设置单个会话的单次调用时长上限（会话级覆盖）")
+        async def cmd_timeout(params, event: MessageEvent):
+            return self._do_timeout(params, event)
+
         # ---- 超级用户 + 仅私聊：绑定 ----
         @self.register_command(f"{A}.config", schema=S.ConfigSchema,
                                permission="superuser", scope="private",
@@ -3567,6 +3605,76 @@ class AiChatPlugin(PluginBase):
                   "         --session=<会话id> 指定别的会话 · --show 只看不改"]
         return "\n".join(lines)
 
+    def _do_timeout(self, params, event: MessageEvent) -> str:
+        """`/aichat timeout` —— 查看/设置**会话级**的单次调用时长上限。
+
+        默认作用于当前会话（与 `/aichat maxtokens` 一致）；`--session=<id|名字>`
+        可指定别的会话（需要管理权限）。`off` 清除覆盖。
+        ⚠️ 调大的代价是「上游真的卡住时要等更久才报错」；判据里的
+        `stall_timeout`（多久没新数据）不受这里影响。
+        """
+        target = self._target_of(event)
+        uid = int(event.user_id)
+        if params.session:
+            session = self.store.resolve(params.session)
+            if session is None:
+                return f"找不到会话：{params.session}"
+            ok, why = self._may_manage(session, uid)
+            if not ok and not self.perm.is_superuser(uid):
+                return f"⚠️ {why}"
+        else:
+            session = self._current_session(target, uid)
+
+        raw = str(getattr(params, "value", "") or "").strip()
+        if not raw or bool(getattr(params, "show", False)):
+            return self._timeout_status(session)
+
+        if raw.lower() in {"off", "none", "-", "clear", "0"}:
+            value = 0.0
+        else:
+            parsed = _parse_duration(raw)
+            if parsed is None:
+                return (f"不认识时长 {raw!r}。\n"
+                        f"用法：/aichat timeout 600（或 10m / 1.5h）· off=清除覆盖 · "
+                        f"--session=<会话id> 指定会话\n（{VALIDATION_HINT}）")
+            value = parsed
+            if not (MIN_TIMEOUT <= value <= MAX_TIMEOUT):
+                return (f"timeout 需在 {MIN_TIMEOUT:.0f}–{MAX_TIMEOUT:.0f} 秒之间"
+                        f"（收到 {value:.0f}）")
+
+        if session is None:
+            return ("你在此处还没有会话，无法设置会话级 timeout。\n"
+                    "先说话建一个会话；只想改全局默认改 "
+                    "plugins.ai_chat.llm.timeout。\n"
+                    + self._timeout_status(None))
+
+        self._set_session_timeout(session, value)
+        what = f"{value:.0f}s" if value else "清除（回到全局默认）"
+        return (f"⏱ 已将会话 {session.id}「{session.name}」的单次调用上限设为 {what}\n"
+                + self._timeout_status(session))
+
+    def _timeout_status(self, session: Optional[Session]) -> str:
+        base = float(self.llm.timeout)
+        lines = ["⏱ 单次模型调用时长上限（思考 + 回答的总时长）",
+                 f"  全局默认：{base:.0f}s"]
+        if session is not None:
+            over = self._session_timeout(session)
+            eff = self.effective_timeout(session)
+            lines.append(f"  当前会话：{session.id}「{session.name}」"
+                         f"（{'会话设置' if over else '全局默认'}）")
+            lines.append(f"  实际生效：{eff:.0f}s")
+        else:
+            lines.append("  当前会话：无（此处还没建会话）")
+        try:
+            stall = float(self.cfg["llm"]["stall_timeout"])
+        except Exception:  # noqa: BLE001 - 状态卡不该因配置异常挂掉
+            stall = 60.0
+        lines.append(f"  另：{stall:.0f}s 没有任何新数据才判「停滞」（stall_timeout，"
+                     "与上面的总时长不是一回事）")
+        lines += ["  设置：/aichat timeout 600（或 10m）· off=清除覆盖",
+                  "         --session=<会话id> 指定别的会话 · --show 只看不改"]
+        return "\n".join(lines)
+
     def _do_invite(self, params, event: MessageEvent, *, invite: bool) -> str:
         """邀请 / 取消邀请 —— 只有会话所有者（群归属的会话由群主/管理员代管）。
 
@@ -3778,6 +3886,28 @@ def _is_retryable(e: BaseException) -> bool:
     if flag is not None:
         return bool(flag)
     return isinstance(e, (asyncio.TimeoutError, TimeoutError))
+
+
+#: 会话级 timeout 的合法区间（秒）—— 再小会比一次正常思考还短，再大等于没上限
+MIN_TIMEOUT = 10.0
+MAX_TIMEOUT = 3600.0
+
+
+def _parse_duration(text: str) -> Optional[float]:
+    """`600` / `600s` / `10m` / `1.5h` → 秒；认不出返回 None。"""
+    t = str(text or "").strip().lower().replace("_", "")
+    if not t:
+        return None
+    mult = 1.0
+    for suffix, factor in (("ms", 0.001), ("s", 1.0), ("m", 60.0), ("h", 3600.0)):
+        if t.endswith(suffix):
+            t = t[: -len(suffix)]
+            mult = factor
+            break
+    try:
+        return float(t) * mult
+    except (TypeError, ValueError):
+        return None
 
 
 #: 会话级 max_tokens 的合法区间（与 /aichat model --max_tokens 同一个口径）

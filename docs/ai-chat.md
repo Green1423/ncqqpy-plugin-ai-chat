@@ -50,6 +50,7 @@
   - [7.4 命令](#74-命令)
   - [7.5 max_tokens 下界保护](#75-max_tokens-下界保护)
   - [7.6 会话级 max_tokens（`/aichat maxtokens`）](#76-会话级-max_tokensaichat-maxtokens)
+  - [7.6.1 会话级 timeout（`/aichat timeout`）](#761-会话级-timeoutaichat-timeout)
   - [7.7 压缩摘要单独一档](#77-压缩摘要单独一档)
   - [7.8 手工改了 config.json 怎么生效](#78-手工改了-configjson-怎么生效)
 - [八、内置工具](#八内置工具)
@@ -865,6 +866,9 @@ token 是**字符数 ÷ `chars_per_token`**（默认 1.6，中文为主的聊天
 /aichat maxtokens 2048             只改当前会话（8k 简写亦可）
 /aichat maxtokens off              清除会话覆盖，回到全局默认
 /aichat maxtokens 8192 --session=<id|名字>   改指定会话（需管理权限）
+/aichat timeout                    查看本会话生效的单次调用时长上限
+/aichat timeout 600                只改当前会话（10m / 1.5h 亦可）
+/aichat timeout off                清除会话覆盖，回到全局 llm.timeout
 /aichat model                      顺带显示思考强度
 ```
 
@@ -903,7 +907,9 @@ token 是**字符数 ÷ `chars_per_token`**（默认 1.6，中文为主的聊天
   dict，所有方言一致），**不等于让模型不思考**；`reasoning.max_tokens_floor` 也只在
   **我们要了思考**时才生效（`min_max_tokens()` 在 off 时直接返回 base），这条路上兜不住；
 - 空响应会带错误编号（`E-xxxx`），`/aichat model` 可临时改本次运行的 `max_tokens`，
-  但持久化要改 `plugins.ai_chat.llm.max_tokens` 再 `/aichat reload`。
+  但持久化要改 `plugins.ai_chat.llm.max_tokens` 再 `/aichat reload`；
+- 单个会话想单独放宽等待时间，用 `/aichat timeout 600`（见 7.6.1），
+  不需要改 `config.json`。
 
 
 ### 7.6 会话级 max_tokens（`/aichat maxtokens`）
@@ -924,6 +930,28 @@ token 是**字符数 ÷ `chars_per_token`**（默认 1.6，中文为主的聊天
 - 合法范围 64–200000；`off`/`0` 表示清除；
 - 全局默认要持久化改，仍走 `plugins.ai_chat.llm.max_tokens`（或
   `/aichat model --max_tokens=N`，仅本次运行有效）。
+
+### 7.6.1 会话级 timeout（`/aichat timeout`）
+
+`llm.timeout` 是**单次调用的总时长上限**（「想 + 答」加起来）。推理模型在难题上
+可能想几十秒到几分钟，而这个上限是全局的；所以会话可以自己覆盖：
+
+| 命令 | 作用 |
+|------|------|
+| `/aichat timeout` | 查看：全局默认 / 本会话覆盖 / 实际生效（并解释 `stall_timeout`） |
+| `/aichat timeout 600` | 只改**当前会话**（`10m`、`1.5h` 也能写） |
+| `/aichat timeout off` | 清除会话覆盖，回到全局 `llm.timeout` |
+| `/aichat timeout 600 --session=<id\|名字>` | 改指定会话（会话所有者 / 群主管理员 / 超管） |
+
+- 值存在会话的 `meta.timeout` 里，**随会话持久化**；合法范围 10–3600 秒；
+- 生效优先级：**会话覆盖 → `llm.timeout`**，通过 `LlmClient.chat(timeout=…)`
+  传到流式循环的 deadline 和 socket 超时；
+- ⚠️ **和 `stall_timeout` 不是一回事**：`timeout` 是「总共最多等多久」，
+  `stall_timeout`（默认 60s）是「多久没有新数据就判卡死」。思考链一直在流时，
+  停滞判据永远不触发，只有 `timeout` 兜底 —— 所以难题超时应该调这里，
+  而不是调 `stall_timeout`（后者调大只会让真卡死时等更久）；
+- 调大的代价：上游真的挂住时要等更久才报错。建议 300–600，够覆盖慢思考，
+  又不至于让用户干等十几分钟。
 
 ### 7.7 压缩摘要单独一档
 

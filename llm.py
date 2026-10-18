@@ -383,7 +383,8 @@ class LlmClient:
 
     async def chat(self, messages: list[dict], *, tools: Optional[list[dict]] = None,
                    max_tokens: Optional[int] = None,
-                   reasoning: Any = None) -> ChatResult:
+                   reasoning: Any = None,
+                   timeout: Optional[float] = None) -> ChatResult:
         """发一次请求并解析（默认流式，见 `_chat_stream`）。
 
         Raises:
@@ -391,6 +392,8 @@ class LlmClient:
         """
         if not self.enabled:
             raise LlmError("未配置 base_url / model / api_key")
+        # 单次调用的总时长上限：会话可以用 `/aichat timeout` 覆盖（见 main.effective_timeout）。
+        limit = float(timeout or self.timeout)
         use_stream = bool(self.stream)
         payload = self.build_payload(messages, tools=tools, max_tokens=max_tokens,
                                      stream=use_stream, reasoning=reasoning)
@@ -404,7 +407,7 @@ class LlmClient:
         # 总时长上限：流式下由 `_chat_stream` 自己按「已经跑了多久」判，
         # socket 层给一个略宽一点的硬上限兜底（防的是「判据逻辑写漏了 → 永久挂住」）；
         # 非流式没有别的手段，就直接用它当超时。
-        total = (self.timeout + 15) if use_stream else self.timeout
+        total = (limit + 15) if use_stream else limit
         try:
             async with session.post(
                     f"{self.base_url}/chat/completions", json=payload, headers=headers,
@@ -418,7 +421,7 @@ class LlmClient:
                                    status=resp.status, retryable=retryable)
                 ctype = str(resp.headers.get("Content-Type") or "")
                 if use_stream and "event-stream" in ctype:
-                    return await self._chat_stream(resp)
+                    return await self._chat_stream(resp, timeout=limit)
                 # 没按 SSE 回（有的网关直接忽略 `stream`）→ 当普通 JSON 读完，
                 # 这样「流式」只是请求方式，不影响解析口径。
                 body = await resp.text()
@@ -432,7 +435,7 @@ class LlmClient:
 
     # ---- 流式 ----
 
-    async def _chat_stream(self, resp) -> ChatResult:
+    async def _chat_stream(self, resp, *, timeout: Optional[float] = None) -> ChatResult:
         """读 SSE 流，边收边判「是不是卡住了」。
 
         为什么值得为它写一整套：非流式请求在「模型正在想 100 秒」和「上游彻底
@@ -447,13 +450,14 @@ class LlmClient:
         acc = _StreamAcc()
         buf = SseBuffer()
         loop = asyncio.get_running_loop()
-        deadline = loop.time() + self.timeout
+        limit = float(timeout or self.timeout)
+        deadline = loop.time() + limit
         content = resp.content
         while True:
             left = deadline - loop.time()
             if left <= 0:
                 raise LlmError(
-                    f"超过单次调用总时长上限 {self.timeout:.0f}s（已生成 "
+                    f"超过单次调用总时长上限 {limit:.0f}s（已生成 "
                     f"{len(acc.partial)} 字正文）", retryable=False,
                     partial=acc.partial)
             try:
@@ -462,7 +466,7 @@ class LlmClient:
             except asyncio.TimeoutError:
                 if loop.time() >= deadline - 0.05:
                     raise LlmError(
-                        f"超过单次调用总时长上限 {self.timeout:.0f}s（已生成 "
+                        f"超过单次调用总时长上限 {limit:.0f}s（已生成 "
                         f"{len(acc.partial)} 字正文）", retryable=False,
                         partial=acc.partial) from None
                 raise LlmError(

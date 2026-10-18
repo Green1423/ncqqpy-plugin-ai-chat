@@ -165,6 +165,7 @@ class StubLlm:
         self._real_client = None   # Harness 注入：用于读取 reasoning_policy
         self.last_reasoning_params: dict = {}
         self.last_max_tokens = 0
+        self.last_timeout = 0.0
         # 供 compaction 压缩调用使用（摘要必须够长才不被下界拦掉）
         self.summary = (
             "## 用户诉求\n- 用户在测试里反复确认会话与上下文行为\n\n"
@@ -185,7 +186,8 @@ class StubLlm:
     def build_payload(self, messages, **kwargs):     # 兼容接口
         return {"messages": messages}
 
-    async def chat(self, messages, *, tools=None, max_tokens=None, reasoning=None):
+    async def chat(self, messages, *, tools=None, max_tokens=None, reasoning=None,
+                   timeout=None):
         """复刻 `LlmClient.chat()` 的思考强度行为（打桩也要能验证 payload）。
 
         刻意**不**在桩里存 policy 快照：从真 client 现取，这样 `/aichat think`
@@ -209,6 +211,9 @@ class StubLlm:
             floor = max_tokens or self.max_tokens
         self.last_reasoning_params = params
         self.last_max_tokens = floor
+        # 会话级 `/aichat timeout` 走的是 chat(timeout=…)：桩必须记下来，
+        # 否则「真的用上了吗」这条断言永远看到 0。
+        self.last_timeout = float(timeout or 0.0)
         self.requests.append({"messages": messages, "tools": tools,
                               "reasoning": reasoning, "reasoning_params": params,
                               "max_tokens": floor})
@@ -491,6 +496,7 @@ class Harness:
         self.llm.calls = 0
         self.llm.last_reasoning_params = {}
         self.llm.last_max_tokens = 0
+        self.llm.last_timeout = 0.0
 
 
 def reply_text(rec: dict) -> str:
@@ -3759,6 +3765,68 @@ async def test_maxtokens_command(h: Harness):
     check("指定不存在的会话有提示", "找不到会话" in text, text[:150])
 
 
+async def test_timeout_command(h: Harness):
+    print("\n[41] /aichat timeout：按会话改单次调用时长上限")
+    await establish(h)
+    h.clear()
+    await h.private("/aichat timeout", settle=0.9)
+    text = await h.wait_reply()
+    check("timeout 显示状态", "时长上限" in text and "全局默认" in text, text[:200])
+    check("状态卡解释 stall_timeout 与它的区别", "stall_timeout" in text, text[:400])
+    base = float(h.plugin.llm.timeout)
+
+    h.clear()
+    await h.private("默认一轮//", settle=1.0)
+    await h.wait_for_replies(1)
+    check("默认用全局 timeout", h.llm.last_timeout == base, f"{h.llm.last_timeout} vs {base}")
+
+    h.clear()
+    await h.private("/aichat timeout 600", settle=0.9)
+    text = await h.wait_reply()
+    check("设置成功", "已" in text and "600" in text, text[:200])
+    sid = _current_session(h).id
+    check("落库到 session.meta",
+          h.plugin.store.get(sid).meta.get("timeout") == 600.0,
+          f"{h.plugin.store.get(sid).meta}")
+
+    h.clear()
+    await h.private("设完再一轮//", settle=1.0)
+    await h.wait_for_replies(1)
+    check("本会话调用真的用 600", h.llm.last_timeout == 600.0, f"{h.llm.last_timeout}")
+
+    h.clear()
+    await h.private("/aichat timeout 10m", settle=0.9)
+    await h.wait_for_replies(1)
+    check("10m = 600 秒",
+          h.plugin.store.get(sid).meta.get("timeout") == 600.0,
+          f"{h.plugin.store.get(sid).meta}")
+
+    h.clear()
+    await h.private("/aichat timeout 5", settle=0.9)
+    text = await h.wait_reply()
+    check("低于下界被拒", "10" in text, text[:150])
+
+    h.clear()
+    await h.private("/aichat timeout abc", settle=0.9)
+    text = await h.wait_reply()
+    check("非法值有提示", "不认识" in text, text[:150])
+
+    h.clear()
+    await h.private("/aichat timeout off", settle=0.9)
+    await h.wait_reply()
+    check("off 清除覆盖", "timeout" not in (h.plugin.store.get(sid).meta or {}),
+          f"{h.plugin.store.get(sid).meta}")
+    h.clear()
+    await h.private("清掉后一轮//", settle=1.0)
+    await h.wait_for_replies(1)
+    check("清除后回到全局", h.llm.last_timeout == base, f"{h.llm.last_timeout}")
+
+    h.clear()
+    await h.private("/aichat timeout 600 --session=nope-xyz", settle=0.9)
+    text = await h.wait_reply()
+    check("指定不存在的会话有提示", "找不到会话" in text, text[:150])
+
+
 async def test_unified_help(h: Harness):
     """帮助统一走框架 `CommandManager` 的 /help，插件不再自绘一份。"""
     from napcat.models import parse_event
@@ -3994,7 +4062,7 @@ async def main():
         test_llm_retry, test_llm_timeout_hint, test_escaped_prefix_paste,
         test_sse_parse, test_llm_stream_cutoff, test_partial_reply_on_cutoff,
         test_llm_stream_wiring,
-        test_think_command, test_maxtokens_command,
+        test_think_command, test_maxtokens_command, test_timeout_command,
         test_reasoning_dialect_via_config,
         test_config_template_seeding,
         test_no_deferred_relative_imports, test_no_coupling_with_other_plugins,
