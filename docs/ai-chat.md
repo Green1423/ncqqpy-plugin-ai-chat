@@ -140,7 +140,7 @@
 3. **幂等** —— 没有缺键就不写盘。
 
 > 这三条现在是**框架对所有插件的统一契约**（插件声明 `config_template()`，
-> 框架在构造插件时补齐），见 [`docs/plugin-dev.md` §14.3.1](plugin-dev.md#1431-首次运行即初始化全部配置项config_template)。
+> 框架在构造插件时补齐），见 [`docs/plugin-dev.md` §15.3.1](plugin-dev.md#1531-首次运行即初始化全部配置项config_template)。
 
 手工改完文件后：`/aichat reload --confirm=true`（超级用户 · 仅私聊），
 或直接 `/aichat config` 查看/补齐。
