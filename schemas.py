@@ -6,9 +6,8 @@ Schema 漂移，帮助里显示的参数也就和实际校验对不上。
 """
 from __future__ import annotations
 
-from napcat import (
-    BoolField, ChoiceField, CommandSchema, IntField, QQField, StrField,
-    VariadicField,
+from napcat.command import (
+    BoolField, ChoiceField, CommandSchema, IntField, QQField, StrField, VariadicField,
 )
 
 NAME_MAX = 40

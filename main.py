@@ -49,11 +49,12 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Optional
 
-from napcat import (
-    ApiError, CommandExecutionError, GROUP_AT_HINT, GroupRecallEvent,
-    MessageChain, MessageEvent, NapCatError, PluginBase, PluginRuntimeError,
-    short_reason,
-)
+from napcat.api import ApiError
+from napcat.command import CommandExecutionError, GROUP_AT_HINT
+from napcat.models import GroupRecallEvent, MessageEvent
+from napcat.message import MessageChain
+from napcat.errors import NapCatError, PluginRuntimeError, short_reason
+from napcat.plugin import PluginBase
 
 from .compaction import (
     CompactionPolicy, Compactor, DshWrapping, Usage,
