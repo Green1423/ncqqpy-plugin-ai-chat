@@ -470,6 +470,31 @@ def test_trace_chain():
     check("断链只剩自己", got == [4], f"{got}")
 
 
+def test_card_with_chain():
+    """历史卡片里的「引用链」：带上上文、标出段号；没有上文就不硬凑。"""
+    print("\n[9.97] 历史卡片的引用链")
+    from plugins.ai_chat.history import Exchange
+    from plugins.ai_chat.render import build_html
+
+    first = Exchange(index=1, question="问题一", answer="回答一",
+                     speaker="爱丽丝", time="09-30 22:15",
+                     seq=11, answer_seq=12)
+    second = Exchange(index=2, question="问题二", answer="回答二",
+                      speaker="爱丽丝", time="09-30 22:16",
+                      seq=13, answer_seq=14)
+    alone = build_html(second, session_name="测试", total=2)
+    # 注意：CSS 里也有「引用链」三个字（注释），所以判据只能是结构块
+    check("没有上文时不出现引用链块", 'class="ctx"' not in alone, "")
+    check("主问答照常在", "问题二" in alone and "回答二" in alone, "")
+
+    with_chain = build_html(second, session_name="测试", total=2,
+                            context=[first, second])
+    check("有上文时出现引用链块", 'class="ctx"' in with_chain, "")
+    check("链上的上文也渲染出来", "问题一" in with_chain, "")
+    check("文字标出问答段号",
+          "[#13]" in with_chain and "[#14]" in with_chain, "")
+
+
 def main():
     for fn in (test_short_time, test_speaker, test_basic_extraction,
                test_answer_is_last_not_first, test_tool_counting,
@@ -479,7 +504,8 @@ def main():
                test_render_list_paging, test_format_exchange_is_one_record,
                test_parse_range, test_reject_range, test_parse_question_summaries,
                test_fallback_and_key, test_summarize_context, test_summary_cache,
-               test_exchange_quote_meta, test_trace_chain):
+               test_exchange_quote_meta, test_trace_chain,
+               test_card_with_chain):
         try:
             fn()
         except Exception as e:  # noqa: BLE001

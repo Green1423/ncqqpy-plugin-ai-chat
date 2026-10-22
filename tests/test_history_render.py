@@ -210,12 +210,16 @@ def test_markdown_rendering():
 
 
 def test_truncation():
+    import re as _re
     print("\n[3] 超长截断（防止一张图几万像素高）")
     long_q = "问" * 5000
     long_a = "答" * 5000
     doc = build_html(ex(question=long_q, answer=long_a), max_chars_per_side=100)
-    check("问题被截断", doc.count("问") <= 100, f"{doc.count('问')}")
-    check("回答被截断", doc.count("答") <= 100, f"{doc.count('答')}")
+    # 只在**正文**里数：`<style>` 里的注释与页头标题也会出现汉字，
+    # 拿整份文档计数会被它们带偏（实测：样式注释里一个「主问答之上」就让计数 +1）。
+    body = _re.sub(r"<style>.*?</style>", "", doc, flags=_re.S)
+    check("问题被截断", body.count("问") <= 100, f"{body.count('问')}")
+    check("回答被截断", body.count("答") <= 100, f"{body.count('答')}")
     check("有截断提示", "已截断" in doc)
     check("没超长就不出提示",
           "已截断" not in build_html(ex(), max_chars_per_side=100))

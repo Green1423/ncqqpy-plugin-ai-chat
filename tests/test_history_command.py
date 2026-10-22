@@ -199,7 +199,8 @@ class StubLlm:
     #: 摘要请求被识别时返回的内容（测试可以改它来模拟模型跑偏）
     summary_reply: str = ""
 
-    async def chat(self, messages, *, tools=None, max_tokens=None, reasoning=None):
+    async def chat(self, messages, *, tools=None, max_tokens=None, reasoning=None,
+                   timeout=None):
         self.calls += 1
         self.requests.append({"messages": messages, "tools": tools})
         self.reasoning_seen.append(reasoning)

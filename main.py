@@ -2060,6 +2060,9 @@ class AiChatPlugin(PluginBase):
             local_time=str(meta.get("local_time") or ""),
             group_id=int(meta.get("group_id") or 0),
             message_ids=meta.get("message_ids") or [],
+            # 引用了谁（QQ 消息 id）：`hget` 与「链式引用」都靠这条线索
+            # 在**本地**追上文，不必每层再付一次 get_msg（框架节流 1~5 秒）
+            reply_to=int(meta.get("reply_to") or 0),
             parts=int(meta.get("parts") or 1),
         )
         self.store.append(session.id, message)
@@ -2988,8 +2991,13 @@ class AiChatPlugin(PluginBase):
 
             # 文字头：图片在聊天里是独立气泡，没有头用户不知道这是哪一段
             head = f"🖼 {session.name} · 第 {n} 对（共 {len(exchanges)} 对）"
+            labels = []
             if picked.seq:
-                head += f" · 段落 [#{picked.seq}]"
+                labels.append(f"问 [#{picked.seq}]")
+            if getattr(picked, "answer_seq", 0):
+                labels.append(f"答 [#{picked.answer_seq}]")
+            if labels:
+                head += " · 段落 " + " ".join(labels)
             upstream = [x for x in chain if x != n]
             if upstream:
                 head += (f"\n沿引用追溯：第 "

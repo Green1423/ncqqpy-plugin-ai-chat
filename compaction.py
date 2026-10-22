@@ -146,11 +146,11 @@ class DshWrapping:
                             "content": self._label(m, rendered)})
                 continue
             api = m.to_api_message()
-            # 只给**有正文**的消息编号：工具结果、以及「只发起工具调用」的
-            # assistant 片段都不是「段落」，给它们编号只会把编号用掉，
+            # 只给**有正文的对话消息**编号：`tool` 结果与「只发起工具调用」的
+            # assistant 片段都不是「段落」—— 给它们编号只会把编号用掉，
             # 还会让工具调用协议里那段 content 多出一串没人引用的前缀。
             text = str(api.get("content") or "")
-            if text.strip():
+            if m.role != ROLE_TOOL and text.strip():
                 api["content"] = self._label(m, text)
             out.append(api)
         return out

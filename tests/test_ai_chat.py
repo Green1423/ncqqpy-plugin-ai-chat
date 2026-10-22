@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 import shutil
 import sys
 import tempfile
@@ -531,8 +532,10 @@ async def test_private_flow(h: Harness):
     # 又会诱导模型在回复里模仿同样的编号（提示词专门叮嘱过不要写）。
     check("分段直接拼接、不加序号",
           "(1/3)" not in content and "(3/3)" not in content, repr(content))
+    # 段落编号（`[#N]`）是这一版**故意**加的；这条断言要的是「除了它之外没有
+    # 别的包装」，所以先剥掉编号再比。
     check("没有多余的标记，只有用户写的内容",
-          content.strip() == "你好\n第一段\n第二段", repr(content))
+          _unlabeled(content).strip() == "你好\n第一段\n第二段", repr(content))
     check("分段内容按顺序保留",
           content.index("第一段") < content.index("第二段"), repr(content))
     reply = await h.wait_reply()
@@ -858,7 +861,7 @@ async def test_wrapping(h: Harness):
           "历史里出现了 system 消息")
     # 私聊一对一 → 不加前缀
     check("一对一私聊不加说话人前缀",
-          not h.llm.last_user_content().startswith("["),
+          not _unlabeled(h.llm.last_user_content()).startswith("["),
           repr(h.llm.last_user_content()))
 
 
@@ -1744,6 +1747,73 @@ async def test_recall_removes_staged(h: Harness):
     check("撤回后暂存区清空", not (state.get("items")), f"{state}")
 
 
+async def test_hget_traces_chain(h: Harness):
+    """`hget` 沿**引用**追溯：被引用的上文一起渲染进那张卡片。
+
+    用户要求「hget 支持追溯完整的对话（沿引用）」：单看一对问答往往缺上下文
+    （这一对是在接着上文说的），所以要把引用链上的前几对也带上。
+    """
+    print("\n[19.6] hget 沿引用追溯")
+    session = await establish(h)
+    h.clear()
+    h.llm.script_text = "第一段回答。"
+    await h.private("第一问//", settle=1.2)
+    await h.wait_reply()
+    hist = h.plugin.store.history(session.id)
+    q1 = next(m for m in reversed(hist) if m.role == "user")
+    q1_id = int((q1.metadata.get("message_ids") or [0])[0])
+    check("第一问记得自己的 QQ 消息 id", q1_id > 0, f"{q1_id}")
+    # 第二问引用第一问（在上下文里，所以连 get_msg 都不用调）
+    h.llm.script_text = "第二段回答。"
+    await h.private("第二问//", with_reply=q1_id, settle=1.2)
+    await h.wait_reply()
+    h.clear()
+    await h.private("/aichat hget 2", settle=1.5)
+    texts = [reply_text(r) for r in h.replies]
+    check("文字头提到「沿引用追溯」",
+          any("沿引用追溯" in t for t in texts), f"{texts}")
+    check("链上标出 1 → 2", any("1 → 2" in t for t in texts), f"{texts}")
+    check("文字头带总数", any("共 2 对" in t for t in texts), f"{texts}")
+    imgs = [seg for r in h.replies
+            for seg in (r["params"].get("message") or [])
+            if isinstance(seg, dict) and seg.get("type") == "image"]
+    check("出了 1 张图", len(imgs) == 1, f"{len(imgs)} 张")
+
+    # 第一对没有上文 —— 不该硬凑一段「引用链」
+    h.clear()
+    await h.private("/aichat hget 1", settle=1.3)
+    texts = [reply_text(r) for r in h.replies]
+    check("第一对不报引用链", not any("沿引用追溯" in t for t in texts), f"{texts}")
+
+
+async def test_hget_by_label(h: Harness):
+    """`hget #N`：按**段落编号**查那一对（模型回复里就是用 `[#N]` 指代上文的）。"""
+    print("\n[19.65] hget 按段落编号查")
+    session = await establish(h)
+    h.clear()
+    h.llm.script_text = "第二段回答。"
+    await h.private("第一问//", settle=1.2)
+    await h.wait_reply()
+    await h.private("第二问//", settle=1.2)
+    await h.wait_reply()
+    hist = h.plugin.store.history(session.id)
+    answers = [m for m in hist if m.role == "assistant" and (m.text or "").strip()]
+    label = int(answers[-1].seq or 0)
+    check("第二条回答有编号", label > 0, f"{label}")
+
+    h.clear()
+    await h.private(f"/aichat hget #{label}", settle=1.4)
+    texts = [reply_text(r) for r in h.replies]
+    check("按编号查到的是第 2 对", any("第 2 对" in t for t in texts), f"{texts}")
+    check("文字头标出「答」的段落编号",
+          any(f"答 [#{label}]" in t for t in texts), f"{texts}")
+
+    h.clear()
+    await h.private("/aichat hget #99999", settle=1.0)
+    texts = [reply_text(r) for r in h.replies]
+    check("编号查不到时说清楚", any("找不到标号" in t for t in texts), f"{texts}")
+
+
 async def test_paragraph_labels(h: Harness):
     """请求里每条**文本段落**带 `[#N]` 编号（N = 会话内 seq），系统提示讲清含义。
 
@@ -1752,8 +1822,17 @@ async def test_paragraph_labels(h: Harness):
     print("\n[19.8] 段落编号 [#N]")
     await establish(h)
     h.clear()
-    h.llm.script_text = "第一答"
-    await h.private("第一问//", settle=1.2)
+    # 第一轮让模型调一次工具 —— 否则「工具结果不加编号」是条空断言
+    # （这个坑真的踩过：代码把 `tool` 也编上了号，用例却因为没有工具调用而全绿）
+    def responder(messages, tools):
+        if not any(m["role"] == "tool" for m in messages):
+            return StubResult(text="", tool_calls=[StubCall(
+                "get_current_time", {}, "t1")])
+        return StubResult(text="第一答")
+
+    h.llm.responder = responder
+    await h.private("第一问//", settle=1.5)
+    h.llm.responder = None
     h.llm.script_text = "第二答"
     await h.private("第二问//", settle=1.2)
 
@@ -1761,16 +1840,23 @@ async def test_paragraph_labels(h: Harness):
     users = [m["content"] for m in msgs if m.get("role") == "user"]
     assists = [m["content"] for m in msgs if m.get("role") == "assistant"]
     session = _current_session(h)
-    seqs = [int(m.seq or 0) for m in h.plugin.store.history(session.id) if m.seq]
+    hist = h.plugin.store.history(session.id)
+    want_users = [int(m.seq or 0) for m in hist if m.role == "user" and m.seq]
     check("用户消息带编号", all(u.startswith("[#") for u in users), f"{users}")
-    check("回答也带编号", all(a.startswith("[#") for a in assists), f"{assists}")
     check("编号就是会话 seq",
-          [int(u[2:u.index("]")]) for u in users] == [seqs[0], seqs[2]],
-          f"{[u[:8] for u in users]} vs seq={seqs}")
-    check("工具消息不加编号",
-          all("[#" not in str(m.get("content") or "")
-              for m in msgs if m.get("role") == "tool"),
-          f"{[m for m in msgs if m.get('role') == 'tool']}")
+          [int(u[2:u.index("]")]) for u in users] == want_users,
+          f"{[u[:8] for u in users]} vs seq={want_users}")
+    # 只发起工具调用的那条 assistant content 为空 → 不编号（也没法编号）
+    said = [a for a in assists if a.strip()]
+    check("有正文的回答都带编号",
+          bool(said) and all(a.startswith("[#") for a in said), f"{assists}")
+    check("只发起工具调用的那条不加编号", "" in assists, f"{assists}")
+    tool_msgs = [m for m in msgs if m.get("role") == "tool"]
+    check("这一轮真的产生了工具结果（否则下面的断言是空转）",
+          bool(tool_msgs), f"{[m.get('role') for m in msgs]}")
+    check("工具结果不加编号",
+          all(not str(m.get("content") or "").startswith("[#") for m in tool_msgs),
+          f"{[m.get('content') for m in tool_msgs]}")
     check("系统提示里说明了编号",
           "[#N]" in h.llm.requests[-1]["messages"][0]["content"],
           h.llm.requests[-1]["messages"][0]["content"][:200])
@@ -1984,7 +2070,7 @@ async def test_submit_while_busy(h: Harness):
         seen = h.llm.last_user_content()
         check("模型看到的是第二段内容", "第二段内容" in seen, seen)
         check("第二段没有被标成多段、也没有序号",
-              seen.strip() == "第二段内容", seen)
+              _unlabeled(seen).strip() == "第二段内容", seen)
 
         # 回答期间再按一次结束符：回执要说明「正在回答」，不能说「暂存区是空的」
         h.clear()
@@ -2244,9 +2330,9 @@ async def test_quote_ai_image(h: Harness):
     seen = h.llm.last_user_content()
     # 现在这段原文**还在上下文里**，所以按「引用上文用标号代替原文」的规矩
     # 只给编号（不再重抄一遍原文，也不再贴「机器人自己发的图」的原文段）。
-    answers = [m for m in h.plugin.store.history(
-        _current_session(h).id) if m.role == "assistant" and m.seq]
-    label = int(answers[-1].seq) if answers else 0
+    target = next((m for m in h.plugin.store.history(_current_session(h).id)
+                   if m.role == "assistant" and "长半轴 5" in (m.text or "")), None)
+    label = int(target.seq or 0) if target is not None else 0
     check("用标号指代那条回答", label and f"[#{label}]" in seen, seen)
     check("没有重抄原文", "长半轴 5" not in seen, seen)
     check("这句也进了正文", "那张图里写的什么" in seen, seen)
@@ -3669,8 +3755,10 @@ async def test_shared_context(h: Harness):
     check("共享上下文：Bob 看得到 Alice 的话",
           any("Alice 开场" in u for u in user_msgs), f"{user_msgs}")
     check("两人各自的话都带说话人标注",
-          any(u.startswith("[用户20001]") and "Alice 开场" in u for u in user_msgs)
-          and any(u.startswith("[用户20002]") and "Bob 接着说" in u for u in user_msgs),
+          any(_unlabeled(u).startswith("[用户20001]") and "Alice 开场" in u
+              for u in user_msgs)
+          and any(_unlabeled(u).startswith("[用户20002]") and "Bob 接着说" in u
+                  for u in user_msgs),
           f"{user_msgs}")
     check("系统提示说明会话是共用的",
           "共享" in req[0]["content"], req[0]["content"][:400])
@@ -3698,7 +3786,8 @@ async def test_solo_session_not_marked_shared(h: Harness):
     await h.wait_for_replies(1)
     req = h.llm.requests[-1]["messages"]
     check("独享会话不加说话人前缀",
-          not any(m["content"].startswith("[") for m in req if m["role"] == "user"),
+          not any(_unlabeled(m["content"]).startswith("[")
+                  for m in req if m["role"] == "user"),
           f"{[m['content'] for m in req if m['role'] == 'user']}")
     check("独享会话的系统提示不提「共用」",
           "共享" not in req[0]["content"], req[0]["content"][:300])
@@ -4124,6 +4213,15 @@ async def test_unified_help(h: Harness):
 
 # ==================== 驱动 ====================
 
+#: 段落编号前缀 `[#N] `（见 compaction.WrappingConfig.number_paragraphs）。
+#: 断言「有没有说话人前缀」「有没有分段序号」时要先剥掉它 —— 那是另一件事。
+_LABEL_RE = re.compile(r"^\[#\d+\] ")
+
+
+def _unlabeled(text: str) -> str:
+    return _LABEL_RE.sub("", str(text or ""), count=1)
+
+
 async def establish(h: Harness, *, user_id=ALICE, group_id=None):
     """建一个会话并把它设为焦点（会话不再自动创建，所以每个用例都要显式建）。
 
@@ -4226,6 +4324,7 @@ async def main():
         test_recall_removes_staged, test_detach_drops_staged, test_staging_persistence,
         test_staging_shared_across_windows, test_window_key_migration,
         test_submit_while_busy, test_terminator_waits_for_ingest,
+        test_hget_traces_chain, test_hget_by_label,
         test_paragraph_labels, test_quote_uses_label,
         test_quote_chain_labels, test_quote_falls_back_to_text,
         test_multi_part_reply, test_reply_text_as_context,
