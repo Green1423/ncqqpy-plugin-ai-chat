@@ -64,6 +64,10 @@ class WrappingConfig:
     speaker_prefix: str = "auto"        # auto | always | never
     include_timestamp: bool = False     # 每条消息前加 [HH:MM]
     group_placeholder: bool = True      # 工具调用轮次的占位符文案
+    #: 给「文本段落」编号：每条 user 消息与有正文的 assistant 消息前加 `[#N]`
+    #: （N = 该消息在会话里的 `seq`，落盘、压缩后依然有效）。有了编号，引用
+    #: 上文时就能用编号指代而**不必重抄原文**（见 `_quoted_suffix`）。
+    number_paragraphs: bool = True
 
     def wants_prefix(self, *, in_group: bool, multi_user: bool) -> bool:
         if self.speaker_prefix == "always":
@@ -138,10 +142,34 @@ class DshWrapping:
                 if not rendered.strip():
                     continue
                 # 不改写原消息，只改投影结果（历史里保留原始文本）
-                out.append({"role": ROLE_USER, "content": rendered})
+                out.append({"role": ROLE_USER,
+                            "content": self._label(m, rendered)})
                 continue
-            out.append(m.to_api_message())
+            api = m.to_api_message()
+            # 只给**有正文**的消息编号：工具结果、以及「只发起工具调用」的
+            # assistant 片段都不是「段落」，给它们编号只会把编号用掉，
+            # 还会让工具调用协议里那段 content 多出一串没人引用的前缀。
+            text = str(api.get("content") or "")
+            if text.strip():
+                api["content"] = self._label(m, text)
+            out.append(api)
         return out
+
+    def _label(self, m: Message, body: str) -> str:
+        """给一段正文加 `[#N] ` 前缀（N = 该消息的会话内 seq）。
+
+        `seq` 为 0（老数据 / 还没落盘）时不加 —— 编号宁缺毋滥：
+        两条消息共用一个编号比没有编号更糟。
+        """
+        if not self.config.number_paragraphs:
+            return body
+        try:
+            seq = int(getattr(m, "seq", 0) or 0)
+        except (TypeError, ValueError):
+            seq = 0
+        if seq <= 0:
+            return body
+        return f"[#{seq}] {body}"
 
     def build_request(self, system_prompt: str, history: list[Message], *,
                       in_group: bool = False, multi_user: bool = False) -> list[dict]:
@@ -320,6 +348,7 @@ def build_system_prompt(*, persona: str = "", extra_sections: Optional[list[str]
                         tool_names: Optional[list[str]] = None,
                         tool_guidance: str = _TOOL_GUIDANCE,
                         markdown: bool = False,
+                        numbering: bool = True,
                         role: str = "",
                         now: Optional[datetime] = None) -> str:
     """按「人格 → 会话角色 → 运行上下文 → 能力」分节装配系统提示。
@@ -363,6 +392,13 @@ def build_system_prompt(*, persona: str = "", extra_sections: Optional[list[str]
     if speaker:
         ctx_lines.append(f"- 当前说话人：{speaker}"
                          + (f"（QQ {user_id}）" if user_id else ""))
+    if numbering:
+        # 编号与「引用上文」是一件事的两面：有编号，引文才能用 `[#N]` 指代而
+        # 不必重抄一遍原文（重抄既费 token，又容易抄走样）。
+        ctx_lines.append(
+            "- 每条消息开头的 `[#N]` 是它在会话里的**段落编号**（唯一、稳定，"
+            "压缩后依然有效）。要指代之前说过的内容时写 `[#N]`，"
+            "**不要重抄原文**；用户引用上文时也会用这个编号")
     if markdown:
         ctx_lines.append("- 你的回复会被**渲染成一张图片**发到聊天里，"
                          "所以不要写「(1/3)」这类分段标记，也不要自己画 ASCII 边框")

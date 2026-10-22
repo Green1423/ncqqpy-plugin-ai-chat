@@ -158,6 +158,18 @@ def _css() -> str:
     .q > *:last-child, .a > *:last-child { margin-bottom: 0; }
     .q { background: #eef3ff; border-radius: 10px; padding: 12px 14px; }
     .a { padding: 2px 2px 0; }
+    /* 引用链：主问答之上的一块灰色上下文，视觉上明确「这是上文」 */
+    .ctx { margin: 10px 0 14px; padding: 10px 12px; background: #f6f6f8;
+           border-left: 3px solid #c9ccd6; border-radius: 8px; }
+    .ctx-title { font-size: 12px; color: #7a7f8c; margin-bottom: 8px; }
+    .ctx-item { margin: 8px 0; padding: 8px 10px; background: #fff;
+                border-radius: 6px; }
+    .ctx-head { font-size: 12px; color: #9096a3; margin-bottom: 4px; }
+    .ctx-q { font-size: 13px; color: #3a3f4b; }
+    .ctx-a { font-size: 13px; color: #5b6170; margin-top: 4px;
+             padding-left: 10px; border-left: 2px solid #e3e5ea; }
+    .ctx-q > *:first-child, .ctx-a > *:first-child { margin-top: 0; }
+    .ctx-q > *:last-child, .ctx-a > *:last-child { margin-bottom: 0; }
     .ai { display: flex; align-items: baseline; gap: 8px; margin: 16px 0 8px; }
     .ai .name { font-size: 17px; font-weight: 700; color: #2b6cb0; }
     .tool {
@@ -181,7 +193,8 @@ def _esc(text: str) -> str:
 
 
 def build_html(ex: Exchange, *, width: int = 720, session_name: str = "",
-               total: int = 0, max_chars_per_side: int = 2000) -> str:
+               total: int = 0, max_chars_per_side: int = 2000,
+               context: Optional[list] = None) -> str:
     """一对问答 → 完整 HTML 文档。
 
     ⚠️ 所有动态内容都必须过 `_esc()`。群友昵称和消息正文直接拼进 HTML 是一个
@@ -197,7 +210,29 @@ def build_html(ex: Exchange, *, width: int = 720, session_name: str = "",
     # 所以这里**不能**再 escape 一次，否则 `&lt;` 会被原样显示出来。
     q_html = markdown_to_html(question)
     a_html = markdown_to_html(answer)
-    katex = katex_head(q_html + a_html)
+
+    # 引用链（沿引用追溯出来的上文，最早在前）：每一对只给**问**与答案首段，
+    # 否则一张卡片会被上文撑爆 —— 要看全文就 /aichat hget 那一对的编号。
+    ctx_html = ""
+    for old_ex in (context or []):
+        if not isinstance(old_ex, Exchange) or old_ex.index == ex.index:
+            continue
+        q_prev, _ = _truncate(str(old_ex.question or ""), 240)
+        a_prev, _ = _truncate(str(old_ex.answer or ""), 240)
+        ctx_html += (
+            '<div class="ctx-item">'
+            f'<div class="ctx-head">第 {int(old_ex.index)} 对'
+            + (f' · [#{int(old_ex.seq)}]' if getattr(old_ex, "seq", 0) else "")
+            + f' · {_esc(old_ex.speaker or "")} {_esc(old_ex.time or "")}</div>'
+            f'<div class="ctx-q">{markdown_to_html(q_prev)}</div>'
+            f'<div class="ctx-a">{markdown_to_html(a_prev)}</div>'
+            '</div>')
+    ctx_block = ('<div class="ctx"><div class="ctx-title">引用链（沿引用追溯，'
+                 '最早在前）</div>' + ctx_html + "</div>") if ctx_html else ""
+
+    q_label = f" [#{int(ex.seq)}]" if getattr(ex, "seq", 0) else ""
+    a_label = f" [#{int(ex.answer_seq)}]" if getattr(ex, "answer_seq", 0) else ""
+    katex = katex_head(q_html + a_html + ctx_block)
 
     title = f"会话：{session_name}" if session_name else "历史对话"
     count = f"第 {ex.index} 对" + (f" / 共 {total} 对" if total else "")
@@ -219,11 +254,12 @@ def build_html(ex: Exchange, *, width: int = 720, session_name: str = "",
   </div>
   <div class="who">
     <div class="name">{_esc(ex.speaker or "（未知）")}</div>
-    <div class="time">{_esc(ex.time or "")}</div>
+    <div class="time">{_esc(ex.time or "")}{_esc(q_label)}</div>
   </div>
   <div class="q">{q_html}</div>
-  <div class="ai"><div class="name">AI</div></div>
+  <div class="ai"><div class="name">AI{_esc(a_label)}</div></div>
   <div class="a">{a_html}</div>
+  {ctx_block}
   {tool_line}
   {cut_lines}
 </div>
@@ -308,7 +344,7 @@ class HistoryRenderer:
     # ---- 渲染 ----
 
     async def render(self, ex: Exchange, *, session_name: str = "",
-                     total: int = 0) -> str:
+                     total: int = 0, context: Optional[list] = None) -> str:
         """渲染一对问答，返回 PNG 的绝对路径。失败抛 `RenderError`。"""
         chrome = self.chromium()
         if not chrome:
@@ -321,7 +357,8 @@ class HistoryRenderer:
         profile = os.path.join(self.out_dir, f"prof-{stamp}")
 
         doc = build_html(ex, width=self.opt.width, session_name=session_name,
-                         total=total, max_chars_per_side=self.opt.max_chars_per_side)
+                         total=total, max_chars_per_side=self.opt.max_chars_per_side,
+                         context=context)
         try:
             with open(html_path, "w", encoding="utf-8") as f:
                 f.write(doc)

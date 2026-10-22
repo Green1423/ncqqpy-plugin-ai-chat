@@ -1744,6 +1744,130 @@ async def test_recall_removes_staged(h: Harness):
     check("撤回后暂存区清空", not (state.get("items")), f"{state}")
 
 
+async def test_paragraph_labels(h: Harness):
+    """请求里每条**文本段落**带 `[#N]` 编号（N = 会话内 seq），系统提示讲清含义。
+
+    编号是「引用用标号代替原文」的前提：没有编号就没法指代，只能重抄。
+    """
+    print("\n[19.8] 段落编号 [#N]")
+    await establish(h)
+    h.clear()
+    h.llm.script_text = "第一答"
+    await h.private("第一问//", settle=1.2)
+    h.llm.script_text = "第二答"
+    await h.private("第二问//", settle=1.2)
+
+    msgs = h.llm.requests[-1]["messages"]
+    users = [m["content"] for m in msgs if m.get("role") == "user"]
+    assists = [m["content"] for m in msgs if m.get("role") == "assistant"]
+    session = _current_session(h)
+    seqs = [int(m.seq or 0) for m in h.plugin.store.history(session.id) if m.seq]
+    check("用户消息带编号", all(u.startswith("[#") for u in users), f"{users}")
+    check("回答也带编号", all(a.startswith("[#") for a in assists), f"{assists}")
+    check("编号就是会话 seq",
+          [int(u[2:u.index("]")]) for u in users] == [seqs[0], seqs[2]],
+          f"{[u[:8] for u in users]} vs seq={seqs}")
+    check("工具消息不加编号",
+          all("[#" not in str(m.get("content") or "")
+              for m in msgs if m.get("role") == "tool"),
+          f"{[m for m in msgs if m.get('role') == 'tool']}")
+    check("系统提示里说明了编号",
+          "[#N]" in h.llm.requests[-1]["messages"][0]["content"],
+          h.llm.requests[-1]["messages"][0]["content"][:200])
+
+
+async def test_quote_uses_label(h: Harness):
+    """引用上文时：文本还在上下文里 → 只给 `[#N]`，**不重抄原文**、也不调 get_msg。"""
+    print("\n[19.9] 引用在上文里 → 用标号代替原文")
+    session = await establish(h)
+    h.clear()
+    h.llm.script_text = "这是要被引用的那段回答。"
+    await h.private("讲一下椭圆//", settle=1.2)
+    answered = h.replies  # noqa: F841 - 只为确保上一轮真的答完
+    hist = h.plugin.store.history(session.id)
+    bot_msg = next(m for m in reversed(hist) if m.role == "assistant")
+    label = int(bot_msg.seq or 0)
+    check("回答有 seq（可被编号）", label > 0, f"{label}")
+    # 让机器人自己那条也能被「按 QQ 消息 id 认出来」
+    sent_id = 950001
+    h.plugin.sent_reply.add([sent_id], session.id, label)
+    h.msg_lookup[sent_id] = {
+        "message_id": sent_id, "message_type": "private",
+        "sender": {"user_id": BOT_ID, "nickname": "测试机器人"},
+        "message": [{"type": "text", "data": {"text": "这是要被引用的那段回答。"}}],
+    }
+    h.clear()
+    before = len(h.calls)
+    h.llm.script_text = "好的，接着说。"
+    await h.private("那它的焦点呢？//", with_reply=sent_id, settle=1.3)
+    seen = h.llm.last_user_content()
+    check(f"用标号指代 [#{label}]", f"[#{label}]" in seen, seen)
+    check("没有重抄原文", "这是要被引用的那段回答" not in seen, seen)
+    check("用户的问题还在", "那它的焦点呢" in seen, seen)
+    gets = [c for c in h.calls[before:] if c.get("action") == "get_msg"]
+    check("不再为这次引用调 get_msg（省掉 1~5 秒节流）", not gets, f"{gets}")
+
+
+async def test_quote_chain_labels(h: Harness):
+    """链式引用：被引用的那条自己也引用了上文 → 两个标号都要带出来。"""
+    print("\n[19.95] 链式引用（引用的引用）")
+    session = await establish(h)
+    h.clear()
+    # 造两条历史消息：m1 是普通回答；m2 是一条**引用着 m1** 的用户输入
+    h.llm.script_text = "第一段回答。"
+    await h.private("第一问//", settle=1.2)
+    hist = h.plugin.store.history(session.id)
+    first = next(m for m in reversed(hist) if m.role == "assistant")
+    first_label = int(first.seq or 0)
+    q1 = next(m for m in reversed(hist) if m.role == "user")
+    q1_label = int(q1.seq or 0)
+    # 让 q1 也「可被按 QQ id 认出」，并把它的 reply_to 指向更早的一条
+    q1.metadata.setdefault("message_ids", []).append(961001)
+    h.plugin.store.replace_history(session.id, h.plugin.store.history(session.id))
+    # 第二层：另一条消息引用 q1（q1 自己又引用着 first）
+    h.msg_lookup[961001] = {
+        "message_id": 961001, "message_type": "private",
+        "sender": {"user_id": ALICE, "nickname": "爱丽丝"},
+        "message": [{"type": "text", "data": {"text": "第一问"}}],
+    }
+    q1.metadata["reply_to"] = 950001
+    # 第二环指向的是一条**机器人回答**：要能被按消息 id 认出来，得先进索引
+    # （线上由 `_remember_sent` 在发送后写入）
+    h.plugin.sent_reply.add([950001], session.id, first_label)
+    h.msg_lookup[950001] = {
+        "message_id": 950001, "message_type": "private",
+        "sender": {"user_id": BOT_ID, "nickname": "测试机器人"},
+        "message": [{"type": "text", "data": {"text": "第一段回答。"}}],
+    }
+    h.clear()
+    h.llm.script_text = "第二段回答。"
+    await h.private("继续//", with_reply=961001, settle=1.3)
+    seen = h.llm.last_user_content()
+    check("第一层用标号", f"[#{q1_label}]" in seen, seen)
+    check("第二层（引用的引用）也用标号", f"[#{first_label}]" in seen, seen)
+    check("两段原文都没重抄",
+          "第一问" not in seen and "第一段回答" not in seen, seen)
+
+
+async def test_quote_falls_back_to_text(h: Harness):
+    """引用的上文**已不在上下文里**时，退回贴原文（老行为）。"""
+    print("\n[19.97] 引用不在上下文里 → 贴原文")
+    await establish(h)
+    h.clear()
+    h.msg_lookup[970001] = {
+        "message_id": 970001, "message_type": "private",
+        "sender": {"user_id": BOB, "nickname": "鲍勃"},
+        "message": [{"type": "text", "data": {"text": "很久以前的一条消息"}}],
+    }
+    h.llm.script_text = "收到。"
+    await h.private("这个怎么理解？//", with_reply=970001, settle=1.3)
+    seen = h.llm.last_user_content()
+    check("原文被贴进来了", "很久以前的一条消息" in seen, seen)
+    check("带上发送人", "鲍勃" in seen, seen)
+    check("没有凭空编标号", "[#" not in seen.split("对方")[-1] if "对方" in seen
+          else True, seen)
+
+
 async def test_terminator_waits_for_ingest(h: Harness):
     """结束符要先**等**那条还在读引用的消息落进暂存区，不能直接说「暂存区是空的」。
 
@@ -2118,8 +2242,13 @@ async def test_quote_ai_image(h: Harness):
     h.llm.script_text = "好的。"
     await h.private("那张图里写的什么？//", with_reply=pic_id, settle=1.6)
     seen = h.llm.last_user_content()
-    check("拿到了 AI 当时生成的原文", "长半轴 5" in seen, seen)
-    check("说明了这是机器人自己发的图", "机器人自己发的" in seen, seen)
+    # 现在这段原文**还在上下文里**，所以按「引用上文用标号代替原文」的规矩
+    # 只给编号（不再重抄一遍原文，也不再贴「机器人自己发的图」的原文段）。
+    answers = [m for m in h.plugin.store.history(
+        _current_session(h).id) if m.role == "assistant" and m.seq]
+    label = int(answers[-1].seq) if answers else 0
+    check("用标号指代那条回答", label and f"[#{label}]" in seen, seen)
+    check("没有重抄原文", "长半轴 5" not in seen, seen)
     check("这句也进了正文", "那张图里写的什么" in seen, seen)
 
     # 别人发的图读不到内容，但用户的问题照常提交（不再整轮回绝）
@@ -4097,6 +4226,8 @@ async def main():
         test_recall_removes_staged, test_detach_drops_staged, test_staging_persistence,
         test_staging_shared_across_windows, test_window_key_migration,
         test_submit_while_busy, test_terminator_waits_for_ingest,
+        test_paragraph_labels, test_quote_uses_label,
+        test_quote_chain_labels, test_quote_falls_back_to_text,
         test_multi_part_reply, test_reply_text_as_context,
         test_reply_media_submits_text,
         test_paging_long_reply, test_llm_error_surfaces,

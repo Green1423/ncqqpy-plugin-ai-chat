@@ -66,6 +66,11 @@ class Exchange:
     tool_calls: list = field(default_factory=list)   # 调过的工具名（去重、保序）
     tool_count: int = 0                 # 工具调用总次数（含重复）
     seq: int = 0                        # 首条消息的 seq（诊断用）
+    answer_seq: int = 0                 # 回答那条消息的 seq（卡片上标 `[#N]` 用）
+    #: 这一对各条**提问消息**的 QQ 消息 id —— 「按 id 反查是哪一对」靠它
+    message_ids: list = field(default_factory=list)
+    #: 这一对引用了哪些 QQ 消息 id（沿引用链追溯的起点）
+    quotes: list = field(default_factory=list)
 
     @property
     def tool_note(self) -> str:
@@ -159,6 +164,28 @@ def extract_exchanges(messages: Iterable[Message]) -> list[Exchange]:
             continue                # 不完整的一对：跳过，不占编号
 
         names, total = _collect_tools(span)
+        msg_ids: list[int] = []
+        quotes: list[int] = []
+        for m in span:
+            if not is_question(m):
+                continue
+            meta = m.metadata or {}
+            for raw in meta.get("message_ids") or []:
+                try:
+                    msg_ids.append(int(raw))
+                except (TypeError, ValueError):
+                    continue
+            try:
+                quoted = int(meta.get("reply_to") or 0)
+            except (TypeError, ValueError):
+                quoted = 0
+            if quoted and quoted not in quotes:
+                quotes.append(quoted)
+        answer_seq = 0
+        for m in reversed(span):
+            if is_answer(m):
+                answer_seq = int(m.seq or 0)
+                break
         out.append(Exchange(
             index=len(out) + 1,
             question=question,
@@ -169,8 +196,52 @@ def extract_exchanges(messages: Iterable[Message]) -> list[Exchange]:
             tool_calls=names,
             tool_count=total,
             seq=int(head.seq or 0),
+            answer_seq=answer_seq,
+            message_ids=msg_ids,
+            quotes=quotes,
         ))
     return out
+
+
+def trace_chain(messages: Iterable[Message], index: int, *,
+                max_depth: int = 8) -> list[int]:
+    """沿「引用」往回追溯，返回引用链上的**问答编号**（最早 → 最晚，含自己）。
+
+    用途：`hget` 看到的是「一对问答」，但那一对往往是在接着上文说的
+    （用户引用着上一条提问、或者模型引着上一段回答）。只看一对会缺上下文，
+    所以把整条链一并渲染出来。
+
+    只认**会话历史里的线索**（`metadata.reply_to` → 另一对的消息 id），
+    不联网：`get_msg` 每层要 1~5 秒（框架节流），而这里只做本地映射。
+    找不到（老消息没记 reply_to、或上文已被压缩吸收）就到此为止 ——
+    「追溯不到」比「编一段上文」诚实。
+
+    环用 `seen` 挡住；`max_depth` 兜底（正常对话不会绕那么远）。
+    """
+    msgs = list(messages)
+    exchanges = extract_exchanges(msgs)
+    if not exchanges:
+        return []
+    by_msg_id: dict[int, int] = {}
+    for ex in exchanges:
+        for mid in ex.message_ids:
+            by_msg_id.setdefault(int(mid), ex.index)
+    by_index = {ex.index: ex for ex in exchanges}
+
+    chain: list[int] = []
+    seen: set[int] = set()
+    cur = int(index)
+    while cur and cur in by_index and cur not in seen and len(chain) < max_depth:
+        seen.add(cur)
+        chain.append(cur)
+        ex = by_index[cur]
+        nxt = 0
+        for quoted in ex.quotes:
+            if int(quoted) in by_msg_id:
+                nxt = by_msg_id[int(quoted)]
+                break
+        cur = nxt
+    return list(reversed(chain))
 
 
 def has_compaction(messages: Iterable[Message]) -> bool:

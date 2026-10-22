@@ -40,7 +40,7 @@ from plugins.ai_chat.history import (          # noqa: E402
     SUMMARY_CHARS, SummaryCache, extract_exchanges, fallback_summary,
     format_exchange, has_compaction, parse_question_summaries, parse_range,
     reject_range, render_list, short_time, speakername,
-    summarize_context, summary_key)
+    summarize_context, summary_key, trace_chain)
 from plugins.ai_chat.segments import (          # noqa: E402
     Block, Message, assistant_message, compact_message, tool_message,
     user_message)
@@ -417,6 +417,59 @@ def test_summary_cache():
           f"{sorted(c3._data)}")
 
 
+def test_exchange_quote_meta():
+    """一对问答要记下「它引用了谁」与「它的 QQ 消息 id」—— 引用链靠这个追。"""
+    print("\n[9.9] 问答的引用元数据")
+    q1, a1 = _ask("第一个问题"), _ans("第一个回答")
+    q1.metadata["message_ids"] = [7001]
+    q2, a2 = _ask("第二个问题"), _ans("第二个回答")
+    q2.metadata["message_ids"] = [7002, 7003]      # 一次输入分两段发
+    q2.metadata["reply_to"] = 7001
+    ex = extract_exchanges([q1, a1, q2, a2])
+    check("记下提问消息 id", ex[1].message_ids == [7002, 7003],
+          f"{ex[1].message_ids}")
+    check("记下引用了谁", ex[1].quotes == [7001], f"{ex[1].quotes}")
+    check("没引用就是空", ex[0].quotes == [], f"{ex[0].quotes}")
+    check("回答也记了 seq 字段（默认 0）", ex[1].answer_seq == 0,
+          f"{ex[1].answer_seq}")
+
+
+def test_trace_chain():
+    """`trace_chain`：沿引用往回追溯（最早在前），并挡住环与断链。"""
+    print("\n[9.95] 沿引用追溯")
+    q1, a1 = _ask("问题一"), _ans("回答一")
+    q1.metadata["message_ids"] = [101]
+    q2, a2 = _ask("问题二（引用一）"), _ans("回答二")
+    q2.metadata["message_ids"] = [102]
+    q2.metadata["reply_to"] = 101
+    q3, a3 = _ask("问题三（引用二）"), _ans("回答三")
+    q3.metadata["message_ids"] = [103]
+    q3.metadata["reply_to"] = 102
+    msgs = [q1, a1, q2, a2, q3, a3]
+
+    check("两段的链", trace_chain(msgs, 2) == [1, 2], f"{trace_chain(msgs, 2)}")
+    check("三段的链（最早在前）", trace_chain(msgs, 3) == [1, 2, 3],
+          f"{trace_chain(msgs, 3)}")
+    check("第一对没有上文", trace_chain(msgs, 1) == [1], f"{trace_chain(msgs, 1)}")
+    check("编号不存在时为空", trace_chain(msgs, 99) == [], f"{trace_chain(msgs, 99)}")
+    check("max_depth 生效", trace_chain(msgs, 3, max_depth=2) == [2, 3],
+          f"{trace_chain(msgs, 3, max_depth=2)}")
+
+    # 环：第三对引用第三对（QQ 里不该出现，出现了不能转不出来）
+    q4, a4 = _ask("自引用"), _ans("回答四")
+    q4.metadata["message_ids"] = [104]
+    q4.metadata["reply_to"] = 104
+    loop = msgs + [q4, a4]
+    check("环被挡住", trace_chain(loop, 4) == [4], f"{trace_chain(loop, 4)}")
+
+    # 引用了「不在历史里」的消息（被压缩吸收/别的会话）→ 链到此为止
+    q5, a5 = _ask("引用消失的消息"), _ans("回答五")
+    q5.metadata["message_ids"] = [105]
+    q5.metadata["reply_to"] = 999
+    got = trace_chain(msgs + [q5, a5], 4)
+    check("断链只剩自己", got == [4], f"{got}")
+
+
 def main():
     for fn in (test_short_time, test_speaker, test_basic_extraction,
                test_answer_is_last_not_first, test_tool_counting,
@@ -425,7 +478,8 @@ def main():
                test_consecutive_user_messages_share_one_pair,
                test_render_list_paging, test_format_exchange_is_one_record,
                test_parse_range, test_reject_range, test_parse_question_summaries,
-               test_fallback_and_key, test_summarize_context, test_summary_cache):
+               test_fallback_and_key, test_summarize_context, test_summary_cache,
+               test_exchange_quote_meta, test_trace_chain):
         try:
             fn()
         except Exception as e:  # noqa: BLE001

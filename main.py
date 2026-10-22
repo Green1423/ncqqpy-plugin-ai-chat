@@ -67,6 +67,7 @@ from .reasoning import (
     override_text, spec_from_text,
 )
 from .history import (SUMMARY_SYSTEM_PROMPT, SummaryCache, extract_exchanges,
+                      trace_chain,
                       fallback_summary, has_compaction, parse_question_summaries,
                       parse_range, reject_range, render_list, summarize_context,
                       summary_key)
@@ -1463,7 +1464,10 @@ class AiChatPlugin(PluginBase):
         ingest_key = target.conversation_key
         self._begin_ingest(ingest_key)
         try:
-            text, media = await self._extract_text_async(event)
+            # 先解析会话：判断「引用的那条还在不在上下文里」要用它。
+            # 没有会话就是 None —— 那就退回贴原文，行为与以前一致。
+            session = self._session_for(target, event)
+            text, media = await self._extract_text_async(event, session)
             if not text.strip() and not media:
                 return
             if trigger["ignore_command_messages"] and self._is_command_text(text):
@@ -1480,7 +1484,7 @@ class AiChatPlugin(PluginBase):
             # 都卡在暂存区不提交。
             text, finished, md_mode = self._strip_terminator(text)
             # 引用内容在**剥完结束符之后**才拼上去（见 _extract_text_async 的说明）
-            text += await self._quoted_suffix(event)
+            text += await self._quoted_suffix(event, session)
 
             # 服务范围（白名单）—— 与权限等级无关，不做超级用户豁免。
             # ⚠️ 必须放在「是不是命令」的判定**之后**：管理服务范围本身的命令
@@ -1543,9 +1547,6 @@ class AiChatPlugin(PluginBase):
         return False
 
     #: 引用消息里算「多媒体」的类型 —— 本插件不做多模态，遇到就明确回绝
-    #: 菊花链最多往上追几层。3 层足够覆盖「引用 + 接龙」的实际用法，
-    #: 再多只是把一串半截话塞给模型，还多几次 get_msg 往返。
-    _QUOTE_CHAIN_MAX = 3
 
     _MEDIA_SEGMENTS = frozenset({"image", "record", "video", "file", "forward",
                                  "json", "xml", "mface"})
@@ -1553,7 +1554,15 @@ class AiChatPlugin(PluginBase):
                      "file": "文件", "forward": "合并转发", "json": "卡片",
                      "xml": "卡片", "mface": "表情"}
 
-    async def _extract_text_async(self, event: MessageEvent) -> tuple[str, str]:
+    #: 引用链最多往上追几层（**贴原文**的上限：每层一次 `get_msg`，而框架给
+    #: 每次 API 调用加了 1~5 秒节流）。用标号指代的那几层不花这个预算。
+    _QUOTE_CHAIN_MAX = 3
+    #: 用 **标号** 指代的链最多追几层（不联网、不花钱，可以给得宽一点）
+    _QUOTE_LABEL_MAX = 10
+
+    async def _extract_text_async(self, event: MessageEvent,
+                                  session: Optional[Session] = None,
+                                  ) -> tuple[str, str]:
         """取这条消息的**自身文本**与引用情况，返回 `(自身文本, 多媒体类型名)`。
 
         ⚠️ 只返回「用户自己敲的那部分」：结束符只可能出现在这里，所以**必须**由
@@ -1564,23 +1573,39 @@ class AiChatPlugin(PluginBase):
         ⚠️ 这里也**不回绝、不发消息**：输入要先经暂存区（用户可能还分几段发），
         回绝必须发生在**提交那一刻**，否则会和「结束符才提交」的协议错位。
 
-        引用内容由调用方通过 `_quoted_suffix(event)` 单独取。
+        `session` 用来判断「引用的那条还在不在上下文里」：在的话这里连
+        `get_msg` 都不用调（见 `_reply_media`）。
         """
-        return self._extract_text(event), await self._reply_media(event)
+        return (self._extract_text(event),
+                await self._reply_media(event, session))
 
-    async def _reply_media(self, event: MessageEvent) -> str:
+    async def _reply_media(self, event: MessageEvent,
+                           session: Optional[Session] = None) -> str:
         """引用的那条是不是多媒体；是则回类型名（图片/语音/…），否则空串。
 
-        ⚠️ 机器人**自己**发的图不算 —— 那种情况原文能找回来（见 `_own_original`），
+        ⚠️ 机器人**自己**发的图不算 —— 那种情况原文能找回来（见 `_own_message`），
         正文由 `_quoted_suffix` 补上，不该再回一句「暂不支持多模态」。
+
+        ⚠️ 引用的那条**在上下文里**时直接返回空串：它的正文已经由
+        `_quoted_suffix` 用 `[#N]` 指代，这里再判一次多模态既没用、又要多付
+        一次 `get_msg`（节流 1~5 秒）。
         """
         reply_id = self._reply_message_id(event)
         if reply_id is None:
             return ""
+        if session is not None and self._session_message(session, reply_id) is not None:
+            return ""
         _, media, _ = await self._read_quoted(reply_id)
-        if media and self._own_original(reply_id) is not None:
+        if media and self._own_message(reply_id) is not None:
             return ""
         return media
+
+    def _own_message(self, message_id: int) -> Optional[Message]:
+        """机器人**自己**发的那条消息对应的会话消息（没有则 None）。"""
+        got = self.sent_reply.get(message_id)
+        if got is None:
+            return None
+        return self.store.find(*got)
 
     def _own_original(self, message_id: int) -> Optional[str]:
         """机器人**自己**发的那条消息，当时生成的原文。
@@ -1591,23 +1616,46 @@ class AiChatPlugin(PluginBase):
         原文就躺在会话历史里（`SentReplyIndex` 记着它在哪一条）。
 
         不是自己发的、或索引里没有（重启前发的、超出保留条数）→ 返回 None，
-        调用方退回原来的「不支持多模态」口径。
+        调用方退回「读不到」口径。
         """
-        got = self.sent_reply.get(message_id)
-        if got is None:
-            return None
-        sid, seq = got
-        msg = self.store.find(sid, seq)
+        msg = self._own_message(message_id)
         text = (getattr(msg, "text", "") or "") if msg is not None else ""
         return text.strip() or None
 
-    async def _quoted_suffix(self, event: MessageEvent) -> str:
-        """把引用的内容拼成「引用上文」段落，**沿着菊花链一直往上读**。
+    def _session_message(self, session: Optional[Session],
+                         msg_id: int) -> Optional[Message]:
+        """按 **QQ 消息 id** 找会话里的那条消息（找不到返回 None）。
 
-        「菊花链」= 被引用的那条消息自己也是引用别人的（群聊里接龙式对话、以及
-        用户引机器人回答、机器人回答里本来又带着上一轮的引用）。只读一层的话，
-        模型看到的是半截话。这里最多往上追 `_QUOTE_CHAIN_MAX` 层，
-        并且用 `seen` 挡住环（QQ 里理论上不该出现，真出现了也不能转不出来）。
+        两条来源：用户消息的 `metadata.message_ids`（一次输入可能由好几段拼成），
+        以及机器人自己发的消息（`SentReplyIndex`）。找不到就说明这段上文**已经不在
+        上下文里**了（被压缩吸收 / 超出保留条数 / 换过会话），调用方要退回贴原文。
+        """
+        if session is None or not msg_id:
+            return None
+        want = int(msg_id)
+        for m in self.store.history(session.id):
+            for raw in ((m.metadata or {}).get("message_ids") or []):
+                try:
+                    if int(raw) == want:
+                        return m
+                except (TypeError, ValueError):
+                    continue
+        return self._own_message(want)
+
+    async def _quoted_suffix(self, event: MessageEvent,
+                             session: Optional[Session] = None) -> str:
+        """把引用的内容拼成「引用上文」段落，**沿着引用链一直往上追**。
+
+        两条路，按「这段上文还在不在上下文里」二选一：
+
+        * **在**（会话历史里找得到）→ 只给它的 `[#N]` 编号，**不重抄原文**。
+          重抄既费 token，又容易抄走样；链式引用同理：每一环都能在历史里认出来时
+          只报编号，而且**不需要任何 `get_msg`**（框架给每次 API 调用加了 1~5 秒
+          节流，一条引用链能省十几秒）；
+        * **不在**（压缩吸收过、超出保留条数、别的会话）→ 退回贴原文，
+          用 `get_msg` 读，最多贴 `_QUOTE_CHAIN_MAX` 段。
+
+        环用 `seen` 挡住（QQ 里理论上不该出现，真出现了也不能转不出来）。
         """
         cur = self._reply_message_id(event)
         if cur is None:
@@ -1615,29 +1663,48 @@ class AiChatPlugin(PluginBase):
         out: list[str] = []
         seen: set[int] = set()
         depth = 0
-        while cur is not None and depth < self._QUOTE_CHAIN_MAX and cur not in seen:
+        pasted = 0
+        while (cur is not None and depth < self._QUOTE_LABEL_MAX
+               and cur not in seen):
             seen.add(cur)
+            depth += 1
+            msg = self._session_message(session, cur)
+            label = int(getattr(msg, "seq", 0) or 0) if msg is not None else 0
+            if msg is not None and label:
+                if depth == 1:
+                    out.append(f"\n[引用上文] 对方引用的是上文 [#{label}]"
+                               "（原文已在上下文中，这里不再重复）。")
+                else:
+                    out.append(f"\n[引用上文] 上面那条自己又引用了 [#{label}]"
+                               "（同样在上下文中）。")
+                # 链继续走：本地 metadata 就够，不用 get_msg
+                cur = int((msg.metadata or {}).get("reply_to") or 0) or None
+                continue
+
+            if pasted >= self._QUOTE_CHAIN_MAX:
+                # 贴原文是有预算的（每层一次 get_msg）；标号那条路不受此限
+                break
             text, media, nested = await self._read_quoted(cur)
             if media:
-                # 机器人自己发的图 → 用当时生成的原文替代（用户要求）
-                own = self._own_original(cur)
+                own = self._own_message(cur)
                 if own is None:
                     # 别人的图/语音：读不到内容，但**不能因此丢掉用户的问题** ——
                     # 留一句提示占住引文的位置，用户写的正文照常提交
                     out.append(f"\n[引用上文] 对方引用的是一条{media}"
                                f"（暂不支持多模态，读不到里面的内容）。")
                     break
-                text = f"（这是机器人自己发的{media}，以下是它当时生成的原文）\n{own}"
+                text = (f"（这是机器人自己发的{media}，"
+                        f"以下是它当时生成的原文）\n{own.text}")
             if not text:
-                if depth == 0:
+                if depth == 1:
                     out.append("\n（引用的那条消息读不到内容）")
                 break
-            if depth == 0:
+            pasted += 1
+            if depth == 1:
                 out.append(f"\n[引用上文] 对方引用的那条消息内容如下：\n{text}")
             else:
                 out.append(f"\n[引用上文] 上面那条消息自己又引用了：\n{text}")
             cur = nested
-            depth += 1
         return "".join(out)
 
     @staticmethod
@@ -1850,6 +1917,10 @@ class AiChatPlugin(PluginBase):
             "ts": datetime.now().astimezone().isoformat(timespec="seconds"),
             "local_time": datetime.now().astimezone().strftime("%H:%M"),
             "message_id": int(event.message_id or 0),
+            # 这条消息引用了谁（QQ 消息 id；没引用为 0）。落进会话历史后，
+            # 「引用链」可以只靠本地数据追溯 —— 不用为每一层再付一次 get_msg
+            # （框架给每次 API 调用加了 1~5 秒节流，见 docs §12.3）。
+            "reply_to": int(self._reply_message_id(event) or 0),
             "group_id": int(event.group_id) if event.group_id else 0,
             # 这一段的引用目标是不是多媒体（提交时才回绝，见 _extract_text_async）
             "media": media,
@@ -1917,6 +1988,9 @@ class AiChatPlugin(PluginBase):
             "ts": str(first.get("ts") or ""),
             "message_ids": [int(it.get("message_id") or 0) for it in items],
             "group_id": int(last.get("group_id") or 0),
+            # 这段输入整体引用了谁（取最后一段的引用目标：分几段发时，
+            # 引用通常挂在最后那段上）
+            "reply_to": int(last.get("reply_to") or 0),
             #: 这一段输入由几条消息拼成。**只是诊断信息**（落进会话 jsonl，
             #: 排查「用户说发了却没人回」这类问题时靠它），不投影给模型 ——
             #: 用户看不到序号，模型也不该看到。
@@ -2545,7 +2619,10 @@ class AiChatPlugin(PluginBase):
                            and self.cfg["search"]["enabled"]
                            and self.cfg["tools"]["enabled"]),
                 markdown=bool(md)),
-            markdown=bool(md))
+            markdown=bool(md),
+            # 提示里讲的编号必须与投影里真的加上的编号一致，否则模型会指着
+            # 一个不存在的 `[#N]` 说话
+            numbering=bool(self.wrapping.config.number_paragraphs))
 
     # ---------------- 外发 ----------------
 
@@ -2861,26 +2938,46 @@ class AiChatPlugin(PluginBase):
             if not self.cfg["history"]["enabled"]:
                 return "历史出图已被管理员关闭（history.enabled=false）"
 
-            raw_n = getattr(params, "n", "")
+            raw_n = str(getattr(params, "n", "") or "").strip()
             ranged = reject_range(raw_n)
             if ranged:
                 return ranged          # 一次只取一条，区间直接说清楚
-            exchanges = extract_exchanges(self.store.history(session.id))
-            want, err = parse_range(raw_n, total=len(exchanges))
-            if err:
-                return err
+            messages = self.store.history(session.id)
+            exchanges = extract_exchanges(messages)
+            if not exchanges:
+                return (f"「{session.name}」还没有可查看的问答"
+                        f"（一问一答才算数）。")
 
-            n = want[0]
-            picked = next((x for x in exchanges if x.index == n), None)
-            if picked is None:              # 理论上 parse_range 已经拦住了
-                return f"没有第 {n} 对 —— 当前共 {len(exchanges)} 对"
+            if raw_n.startswith("#"):
+                # `hget #37`：按**段落编号**找那一对。模型在回复里就是用 `[#N]`
+                # 指代上文的（见 compaction 的段落编号），用户拿到那句 `[#N]`
+                # 应该能直接查 —— 否则那个编号对用户等于不存在。
+                picked = self._exchange_by_label(exchanges, raw_n[1:])
+                if picked is None:
+                    return (f"找不到标号 {raw_n} 对应的问答"
+                            f"（这条可能没配成问答，或已被压缩吸收）")
+                n = picked.index
+            else:
+                want, err = parse_range(raw_n, total=len(exchanges))
+                if err:
+                    return err
+                n = want[0]
+                picked = next((x for x in exchanges if x.index == n), None)
+                if picked is None:          # 理论上 parse_range 已经拦住了
+                    return f"没有第 {n} 对 —— 当前共 {len(exchanges)} 对"
+
+            # 沿引用追溯上文：那条链上的问答一起渲染（最早在前）
+            chain = trace_chain(messages, n)
+            context = [x for x in (next((e for e in exchanges if e.index == i), None)
+                                   for i in chain) if x is not None]
 
             # ⚠️ 先渲染完，**再**发文字头。
             # 反过来的话，渲染失败时用户已经收到一句「🖼 第 3 对」然后什么都不来 ——
             # 一个没有下文的头比一句错误更让人困惑（实测踩过）。
             try:
                 path = await self.renderer.render(
-                    picked, session_name=session.name, total=len(exchanges))
+                    picked, session_name=session.name, total=len(exchanges),
+                    context=context)
             except RenderError as e:
                 raise CommandExecutionError(f"渲染历史图片失败：{e}") from None
             except Exception as e:  # noqa: BLE001 - 渲染是外部进程，什么都可能
@@ -2890,8 +2987,15 @@ class AiChatPlugin(PluginBase):
                     f"渲染历史图片失败：{err_text(e)}") from None
 
             # 文字头：图片在聊天里是独立气泡，没有头用户不知道这是哪一段
-            await self._send(target, MessageChain().text(
-                f"🖼 {session.name} · 第 {n} 对（共 {len(exchanges)} 对）"))
+            head = f"🖼 {session.name} · 第 {n} 对（共 {len(exchanges)} 对）"
+            if picked.seq:
+                head += f" · 段落 [#{picked.seq}]"
+            upstream = [x for x in chain if x != n]
+            if upstream:
+                head += (f"\n沿引用追溯：第 "
+                         + " → ".join(str(i) for i in chain)
+                         + f" 对（图上灰色的就是前 {len(upstream)} 对）")
+            await self._send(target, MessageChain().text(head))
             await self._send(target, MessageChain().image(
                 file=Path(path).as_uri(), name=os.path.basename(path)))
             return None
@@ -3354,6 +3458,26 @@ class AiChatPlugin(PluginBase):
 
             self._visibility_filter = _visible
             cmds.add_visibility_filter(_visible)
+
+    @staticmethod
+    def _exchange_by_label(exchanges: list, label: str):
+        """按**段落编号**（`[#N]` 里的 N）找它所属的那一对问答。
+
+        用户/模型在正文里用 `[#N]` 指代上文，而那条消息可能是一对问答里的
+        提问或回答 —— 两种都认。N 直接对到消息的 `seq`（落盘、压缩后仍在）。
+        """
+        try:
+            want = int(str(label or "").strip().lstrip("#"))
+        except (TypeError, ValueError):
+            return None
+        if want <= 0:
+            return None
+        for ex in exchanges:
+            if int(getattr(ex, "seq", 0) or 0) == want:
+                return ex
+            if int(getattr(ex, "answer_seq", 0) or 0) == want:
+                return ex
+        return None
 
     def _render_session_list(self, sessions: list, target: ChatTarget,
                              uid: int) -> str:
