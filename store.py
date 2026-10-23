@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import json
 import os
+import random
 import threading
 import time
 from dataclasses import dataclass, field
@@ -144,6 +145,10 @@ class Session:
     #: 消息历史 —— 两者根本不在一条路上，所以角色文本天然不会进摘要。
     #: 详见 `docs/ai-chat.md` 的「角色设定」一节。
     role: str = ""
+    #: **公开会话**：群归属的会话打开它之后，**本群成员无需邀请**即可 attach。
+    #: 只对群会话有意义 —— 私聊会话用它没有对象（私聊里只有两个人），
+    #: 那种场景用邀请码（`/aichat invite <会话>`）更合适。
+    public: bool = False
     meta: dict = field(default_factory=dict)
 
     def to_dict(self) -> dict:
@@ -156,6 +161,7 @@ class Session:
             "compact_count": self.compact_count,
             "compacted_upto": self.compacted_upto,
             "last_summary": self.last_summary, "role": self.role,
+            "public": bool(self.public),
             "meta": self.meta,
         }
 
@@ -187,6 +193,8 @@ class Session:
             last_summary=str(d.get("last_summary", "")),
             # 旧记录没有这个字段 → 默认空串（等于「没设角色」），不需要迁移
             role=str(d.get("role") or ""),
+            # 旧记录没有这个字段 → 默认私有（公开是显式动作）
+            public=bool(d.get("public")),
             meta=d.get("meta") if isinstance(d.get("meta"), dict) else {},
         )
 
@@ -217,6 +225,8 @@ class Session:
         kind = "个人" if self.owner_kind == OWNER_USER else "群"
         bits = [f"`{self.id}`", self.name, f"[{kind}:{self.owner_label}]",
                 f"{self.message_count} 条"]
+        if self.public:
+            bits.append("公开（本群免邀请）")
         if self.guests:
             bits.append(f"受邀 {len(self.guests)} 人")
         if self.compact_count:
@@ -224,6 +234,40 @@ class Session:
         if self.archived:
             bits.append("已归档")
         return " · ".join(bits)
+
+
+# ==================== 邀请码 ====================
+
+#: 邀请码字符表：**去掉 0/O/1/I/L** 这些「抄错一个字母就废」的字符。
+#: 用户是从 QQ 里手抄或转发的，可读性直接影响能不能用。
+CODE_ALPHABET = "ABCDEFGHJKMNPQRSTUVWXYZ23456789"
+#: 6 位 → 约 7 亿种，配合「24 小时 + 1 次」的使用约束足够。
+CODE_LEN = 6
+#: 默认有效期（秒）与默认可用次数
+CODE_TTL = 24 * 3600
+CODE_USES = 1
+#: 每个会话最多同时留几个未用完的码（防「一直生成」把 state.json 撑大）
+CODE_MAX_PER_SESSION = 10
+#: 全局上界（跑飞了也不会无限增长）
+CODE_MAX_TOTAL = 200
+
+
+def normalize_code(raw: str) -> str:
+    """把人给的邀请码归一：去空白、转大写、去掉常见分隔符（`A-3K 9MZ`）。
+
+    只做归一，**不校验** —— 认不出来时的提示由调用方给（它知道上下文）。
+    """
+    text = str(raw or "").strip().upper()
+    for junk in (" ", "-", "－", "_", "|"):
+        text = text.replace(junk, "")
+    return text
+
+
+def generate_code(rng=None) -> str:
+    """生成一个邀请码（`CODE_LEN` 位，字符表里没有易混字符）。"""
+    import secrets
+    pick = getattr(rng or secrets, "choice", None) or random.choice
+    return "".join(pick(CODE_ALPHABET) for _ in range(CODE_LEN))
 
 
 # ==================== 会话存储 ====================
@@ -334,6 +378,8 @@ class SessionStore:
         self._seq: int = 0                       # 会话 id 自增
         self._cache: dict[str, list[Message]] = {}
         self._dirty: set[str] = set()            # 需要触发裁剪的会话
+        #: 邀请码：`{code: {"sid": ..., "expires": 时间戳, "uses": 剩余次数, "by": 创建者}}`
+        self._codes: dict[str, dict] = {}
 
         os.makedirs(self.sessions_dir, exist_ok=True)
         self._load()
@@ -376,6 +422,23 @@ class SessionStore:
             if sid.startswith("s") and sid[1:].isdigit():
                 highest = max(highest, int(sid[1:]))
         self._seq = max(int(data.get("seq") or 0), highest)
+        raw_codes = data.get("invites")
+        if isinstance(raw_codes, dict):
+            now = time.time()
+            for code, rec in raw_codes.items():
+                if not isinstance(rec, dict):
+                    continue
+                sid = str(rec.get("sid") or "")
+                # 会话没了 / 过期的码直接不加载（重启后不该还能用）
+                if not sid or sid not in self._sessions:
+                    continue
+                expires = float(rec.get("expires") or 0)
+                uses = int(rec.get("uses") or 0)
+                if uses <= 0 or (expires and expires < now):
+                    continue
+                self._codes[str(code).upper()] = {
+                    "sid": sid, "expires": expires, "uses": uses,
+                    "by": int(rec.get("by") or 0)}
 
     def _save_locked(self) -> None:
         payload = {
@@ -383,6 +446,9 @@ class SessionStore:
             "seq": self._seq,
             "sessions": {sid: s.to_dict() for sid, s in self._sessions.items()},
             "focus": dict(self._bindings),
+            # 邀请码：跟会话一起落盘（进程重启后码要还能用 —— 用户可能
+            # 隔天才把码发给别人）
+            "invites": {code: dict(v) for code, v in self._codes.items()},
         }
         tmp = self.state_path + ".tmp"
         try:
@@ -504,6 +570,9 @@ class SessionStore:
             # 一并清掉指向它的焦点，避免留下悬空引用
             for k in [k for k, v in self._bindings.items() if v == sid]:
                 del self._bindings[k]
+            # 邀请码也要作废：留着就是一堆指向空会话的死码
+            for c in [c for c, v in self._codes.items() if v.get("sid") == sid]:
+                self._codes.pop(c, None)
             self._save_locked()
             path = self._history_path(sid)
             try:
@@ -650,6 +719,119 @@ class SessionStore:
             s.updated_at = time.time()
             self._save_locked()
             return True
+
+    # ---------------- 公开会话 / 邀请码 ----------------
+
+    def set_public(self, sid: str, on: bool) -> Optional[bool]:
+        """把会话设成公开 / 私有。返回**改之前**的状态（会话不存在返回 None）。"""
+        with self._lock:
+            s = self._sessions.get(sid)
+            if s is None:
+                return None
+            before = bool(s.public)
+            if before != bool(on):
+                s.public = bool(on)
+                s.updated_at = time.time()
+                self._save_locked()
+            return before
+
+    def new_code(self, sid: str, *, ttl: float = CODE_TTL,
+                 uses: int = CODE_USES, by: int = 0) -> tuple[str, dict]:
+        """给会话生成一个邀请码，返回 `(码, 记录)`；超上限时抛 `RuntimeError`。
+
+        `uses` 是**可用次数**（1 = 一次性）；`ttl <= 0` 表示不过期。
+        """
+        with self._lock:
+            if sid not in self._sessions:
+                raise RuntimeError("会话不存在")
+            self._prune_codes_locked()
+            mine = [c for c, v in self._codes.items() if v.get("sid") == sid]
+            if len(mine) >= CODE_MAX_PER_SESSION:
+                # 自己先腾地方：把最老的一个作废，而不是让用户「先撤销再用」
+                self._codes.pop(min(mine, key=lambda c: self._codes[c]["expires"]),
+                                None)
+            if len(self._codes) >= CODE_MAX_TOTAL:
+                self._codes.pop(next(iter(self._codes)), None)
+            code = generate_code()
+            while code in self._codes:          # 撞了就重摇（概率极低）
+                code = generate_code()
+            rec = {"sid": str(sid), "expires": (time.time() + float(ttl)
+                                                if float(ttl) > 0 else 0.0),
+                   "uses": max(1, int(uses)), "by": int(by)}
+            self._codes[code] = rec
+            self._save_locked()
+            return code, dict(rec)
+
+    def peek_code(self, raw: str) -> Optional[str]:
+        """看一眼邀请码指向哪个会话（**不消耗**）。无效/过期/用尽返回 None。"""
+        code = normalize_code(raw)
+        if not code:
+            return None
+        with self._lock:
+            self._prune_codes_locked()
+            rec = self._codes.get(code)
+            return str(rec.get("sid") or "") or None if rec else None
+
+    def consume_code(self, raw: str, *, user_id: int = 0) -> Optional[str]:
+        """核销一个邀请码，返回它指向的会话 id（无效时 None）。
+
+        ⚠️ 只在**真的要放行**时调用：先 `peek_code` 做类型/权限判定，
+        判定通过再 consume —— 否则一个用不上的会话会把码白吃掉。
+        """
+        code = normalize_code(raw)
+        if not code:
+            return None
+        with self._lock:
+            self._prune_codes_locked()
+            rec = self._codes.get(code)
+            if not rec:
+                return None
+            sid = str(rec.get("sid") or "")
+            left = int(rec.get("uses") or 0) - 1
+            if left > 0:
+                rec["uses"] = left
+            else:
+                self._codes.pop(code, None)
+            self._save_locked()
+            return sid or None
+
+    def codes_of(self, sid: str) -> list[tuple[str, dict]]:
+        """某会话当前有效的邀请码（按过期时间升序）。"""
+        with self._lock:
+            self._prune_codes_locked()
+            out = [(c, dict(v)) for c, v in self._codes.items()
+                   if v.get("sid") == sid]
+            out.sort(key=lambda kv: kv[1].get("expires") or 0)
+            return out
+
+    def revoke_codes(self, sid: str) -> int:
+        """作废某会话的全部邀请码，返回作废了几个。"""
+        with self._lock:
+            gone = [c for c, v in self._codes.items() if v.get("sid") == sid]
+            for c in gone:
+                self._codes.pop(c, None)
+            if gone:
+                self._save_locked()
+            return len(gone)
+
+    def code_stats(self) -> dict:
+        """诊断用：`{总数, 各会话条数}`。"""
+        with self._lock:
+            self._prune_codes_locked()
+            per: dict[str, int] = {}
+            for rec in self._codes.values():
+                sid = str(rec.get("sid") or "")
+                per[sid] = per.get(sid, 0) + 1
+            return {"total": len(self._codes), "per_session": per}
+
+    def _prune_codes_locked(self) -> None:
+        """清掉过期的码（调用方已持锁）。"""
+        now = time.time()
+        dead = [c for c, v in self._codes.items()
+                if int(v.get("uses") or 0) <= 0
+                or (float(v.get("expires") or 0) and float(v["expires"]) < now)]
+        for c in dead:
+            self._codes.pop(c, None)
 
     def guests_of(self, sid: str) -> list[int]:
         with self._lock:

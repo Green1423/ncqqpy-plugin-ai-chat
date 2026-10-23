@@ -29,7 +29,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
-from .history import Exchange
+from .history import Exchange, clean_quoted, split_quoted
 from .png import PAGE_PAD, crop_bottom_to_ink, crop_right_to_ink, crop_to_ink
 from .markdown import (FRAGMENT_WIDTHS, build_fragment_html,
                        build_inline_math_html,
@@ -158,6 +158,13 @@ def _css() -> str:
     .q > *:last-child, .a > *:last-child { margin-bottom: 0; }
     .q { background: #eef3ff; border-radius: 10px; padding: 12px 14px; }
     .a { padding: 2px 2px 0; }
+    /* 引用**普通消息**：用户输入里贴着的那段引文（没有对应的问答可渲染） */
+    .quote { margin: 8px 0 4px; padding: 8px 10px; background: #f2f3f6;
+             border-left: 3px solid #c9ccd6; border-radius: 6px; }
+    .quote-h { font-size: 12px; color: #7a7f8c; margin-bottom: 4px; }
+    .quote > *:first-child { margin-top: 0; }
+    .quote > *:last-child { margin-bottom: 0; }
+    .quote-note { margin-top: 6px; font-size: 12px; color: #8a90a0; }
     /* 引用链：主问答之上的一块灰色上下文，视觉上明确「这是上文」 */
     .ctx { margin: 10px 0 14px; padding: 10px 12px; background: #f6f6f8;
            border-left: 3px solid #c9ccd6; border-radius: 8px; }
@@ -208,16 +215,31 @@ def build_html(ex: Exchange, *, width: int = 720, session_name: str = "",
     # LaTeX 源码，而同一段回答在聊天里却是排好版的公式 —— 同一份内容两种样子。
     # 转义由 `markdown_to_html` 内部负责（它本来就是为「不可信文本进模板」写的），
     # 所以这里**不能**再 escape 一次，否则 `&lt;` 会被原样显示出来。
-    q_html = markdown_to_html(question)
+    # 引用段怎么显示，取决于被引用的是什么：
+    #   * **一轮对话**（能在本会话历史里对上）→ 由下面的「引用链」区块展示整轮，
+    #     正文里**不再重复**那段引文，只留一行指路；
+    #   * **普通消息**（对不上任何问答，比如别人插的一句）→ 没有别处能看，
+    #     就把内容原样贴进引用框里。
+    q_body, q_quoted = split_quoted(question)
+    chain_ctx = [x for x in (context or [])
+                 if isinstance(x, Exchange) and x.index != ex.index]
+    q_html = markdown_to_html(q_body)
+    if q_quoted:
+        if chain_ctx:
+            q_html += ('<div class="quote-note">↳ 引用了上文：'
+                       + "、".join(f"第 {int(x.index)} 对" for x in chain_ctx)
+                       + "（见上方的「引用链」）</div>")
+        else:
+            body = clean_quoted(q_quoted) or q_quoted
+            q_html += ('<div class="quote"><div class="quote-h">引用上文</div>'
+                       + markdown_to_html(body) + "</div>")
     a_html = markdown_to_html(answer)
 
     # 引用链（沿引用追溯出来的上文，最早在前）：每一对只给**问**与答案首段，
     # 否则一张卡片会被上文撑爆 —— 要看全文就 /aichat hget 那一对的编号。
     ctx_html = ""
-    for old_ex in (context or []):
-        if not isinstance(old_ex, Exchange) or old_ex.index == ex.index:
-            continue
-        q_prev, _ = _truncate(str(old_ex.question or ""), 240)
+    for old_ex in chain_ctx:
+        q_prev, _ = _truncate(split_quoted(old_ex.question)[0], 240)
         a_prev, _ = _truncate(str(old_ex.answer or ""), 240)
         ctx_html += (
             '<div class="ctx-item">'
@@ -252,6 +274,7 @@ def build_html(ex: Exchange, *, width: int = 720, session_name: str = "",
     <div class="title">{_esc(title)}</div>
     <div class="count">{_esc(count)}</div>
   </div>
+  {ctx_block}
   <div class="who">
     <div class="name">{_esc(ex.speaker or "（未知）")}</div>
     <div class="time">{_esc(ex.time or "")}{_esc(q_label)}</div>
@@ -259,7 +282,6 @@ def build_html(ex: Exchange, *, width: int = 720, session_name: str = "",
   <div class="q">{q_html}</div>
   <div class="ai"><div class="name">AI{_esc(a_label)}</div></div>
   <div class="a">{a_html}</div>
-  {ctx_block}
   {tool_line}
   {cut_lines}
 </div>

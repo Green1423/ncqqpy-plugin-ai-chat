@@ -470,6 +470,120 @@ def test_trace_chain():
     check("断链只剩自己", got == [4], f"{got}")
 
 
+def test_strip_stray_label():
+    """回答开头的 `[#N]`：不是真编号就剥掉（模型会模仿段落编号当排版）。"""
+    print("\n[9.965] 剥掉回答开头模仿的编号")
+    from plugins.ai_chat.history import strip_stray_label
+
+    check("对不上的编号被剥掉",
+          strip_stray_label("[#19] 应用其实特别多…", {1, 2, 9}) == "应用其实特别多…",
+          strip_stray_label("[#19] 应用其实特别多…", {1, 2, 9}))
+    check("真实编号保留（可能是在指代）",
+          strip_stray_label("[#3] 指第三段", {1, 2, 3}) == "[#3] 指第三段",
+          strip_stray_label("[#3] 指第三段", {1, 2, 3}))
+    check("句中的编号不动",
+          strip_stray_label("前面 [#3] 后面", {1}) == "前面 [#3] 后面",
+          strip_stray_label("前面 [#3] 后面", {1}))
+    check("正常回答原样返回", strip_stray_label("正常回答", {1}) == "正常回答", "")
+    check("空串不炸", strip_stray_label("", {1}) == "", "")
+
+
+def test_split_quoted():
+    """用户输入要能拆成「自己写的」与「引用段落」—— 卡片按这个决定怎么展示引用。"""
+    print("\n[9.98] 拆分正文与引用段")
+    from plugins.ai_chat.history import split_quoted
+
+    own, quoted = split_quoted("问题正文\n[引用上文] 对方引用的是上文 [#12]")
+    check("拆出正文", own == "问题正文", own)
+    check("拆出引用段", quoted.startswith("[引用上文]"), quoted)
+    check("没有引用时引用段为空", split_quoted("只是普通一句话")[1] == "",
+          split_quoted("只是普通一句话"))
+    check("空输入不炸", split_quoted("") == ("", ""), f"{split_quoted('')}")
+
+
+def test_card_quote_display():
+    """卡片里引用的展示规则：
+
+    * 引用的是**一轮对话**（能在本会话对上）→ 渲染那一轮（引用链区块），
+      正文里只留一行指路，**不重复**引文；
+    * 引用的是**普通消息**（对不上任何问答）→ 把内容原样放进引用框。
+    """
+    print("\n[9.99] 卡片里引用怎么展示")
+    from plugins.ai_chat.history import Exchange
+    from plugins.ai_chat.render import build_html
+
+    first = Exchange(index=1, question="第一问", answer="第一答",
+                     speaker="爱丽丝", time="09-30 22:15", seq=11, answer_seq=12)
+    quoted_q = ("第二问\n[引用上文] 对方引用的是上文 [#11]"
+                "（原文已在上下文中，这里不再重复）。")
+    second = Exchange(index=2, question=quoted_q, answer="第二答",
+                      speaker="爱丽丝", time="09-30 22:16", seq=13, answer_seq=14)
+
+    as_turn = build_html(second, context=[first, second])
+    check("对上对话 → 有引用链区块", 'class="ctx"' in as_turn, "")
+    check("对上对话 → 正文只留指路", "quote-note" in as_turn, "")
+    check("对上对话 → 不出现引用框", 'class="quote"' not in as_turn, "")
+
+    as_msg = build_html(second)
+    check("对不上 → 用引用框展示内容", 'class="quote"' in as_msg, "")
+    check("对不上 → 引文真的在里面", "原文已在上下文中" in as_msg, "")
+    check("对不上 → 没有引用链区块", 'class="ctx"' not in as_msg, "")
+    check("两种情况下正文都只出现一次", as_turn.count("第二问") == 1,
+          f"{as_turn.count('第二问')}")
+
+    # 引用链区块里**不再重复**被引用那一对的引文（它自己的问是干净的）
+    check("引用链区块里是那一轮的原问", "第一问" in as_turn, "")
+
+
+def test_trace_chain_by_label():
+    """引用**标签式**（`[#N]`）也要能追 —— 那正是「上文还在上下文里」的形态。
+
+    真实翻车现场（`xcpc` 会话，2026-10-23）：用户引用的是机器人上一段**回答**
+    `[#6]`，而机器人消息的 QQ id 不在任何 `Exchange.message_ids` 里（那里面只有
+    用户消息的 id），于是按 id 查必然落空 → `hget` 把它画成一个引用框、
+    引文还是「原文已在上下文中，这里不再重复」这种空话。
+    """
+    print("\n[9.96] 按标签 `[#N]` 追溯")
+    from plugins.ai_chat.history import quoted_labels, trace_chain
+
+    q1, a1 = _ask("第一问"), _ans("第一答")
+    q1.metadata["message_ids"] = [101]
+    q2, a2 = _ask("第二问\n[引用上文] 对方引用的是上文 [#2]"
+                  "（原文已在上下文中，这里不再重复）。"), _ans("第二答")
+    q2.metadata["message_ids"] = [102]
+    q3, a3 = _ask("第三问\n[引用上文] 对方引用的是上文 [#4]"
+                  "（原文已在上下文中，这里不再重复）。"), _ans("第三答")
+    q3.metadata["message_ids"] = [103]
+    # seg 是落盘时分配的（线上由 SessionStore.append 写），这里手动按顺序给上
+    msgs = [q1, a1, q2, a2, q3, a3]
+    for i, m in enumerate(msgs, 1):
+        m.seq = i
+
+    q2_text = q2.text
+    check("取出引用段里的标签", quoted_labels(q2_text) == [2],
+          f"{quoted_labels(q2_text)}")
+    check("标签只认引用段（正文里的 [#N] 不算）",
+          quoted_labels("提到 [#9] 但没引用") == [],
+          f"{quoted_labels('提到 [#9] 但没引用')}")
+    check("引用上一段**回答**也能追", trace_chain(msgs, 2) == [1, 2],
+          f"{trace_chain(msgs, 2)}")
+    check("多级标签链", trace_chain(msgs, 3) == [1, 2, 3], f"{trace_chain(msgs, 3)}")
+
+    # 标签指向自己 → 不转圈
+    q4, a4 = _ask("自引\n[引用上文] 对方引用的是上文 [#7]"
+                  "（原文已在上下文中，这里不再重复）。"), _ans("回答四")
+    q4.metadata["message_ids"] = [104]
+    loop = msgs + [q4, a4]
+    check("自引用被挡住", trace_chain(loop, 4) == [4], f"{trace_chain(loop, 4)}")
+
+    # 标签指向不存在/已被压缩吸收的段落 → 到此为止
+    q5, a5 = _ask("引用了消掉的段落\n[引用上文] 对方引用的是上文 [#99]"
+                  "（原文已在上下文中，这里不再重复）。"), _ans("回答五")
+    q5.metadata["message_ids"] = [105]
+    check("标签对不上就停", trace_chain(msgs + [q5, a5], 4) == [4],
+          f"{trace_chain(msgs + [q5, a5], 4)}")
+
+
 def test_card_with_chain():
     """历史卡片里的「引用链」：带上上文、标出段号；没有上文就不硬凑。"""
     print("\n[9.97] 历史卡片的引用链")
@@ -505,6 +619,9 @@ def main():
                test_parse_range, test_reject_range, test_parse_question_summaries,
                test_fallback_and_key, test_summarize_context, test_summary_cache,
                test_exchange_quote_meta, test_trace_chain,
+               test_trace_chain_by_label, test_strip_stray_label,
+               test_split_quoted,
+               test_card_quote_display,
                test_card_with_chain):
         try:
             fn()

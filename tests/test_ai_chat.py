@@ -751,6 +751,184 @@ async def test_group_session_is_per_group(h: Harness):
     check("私聊 attach 群会话被拒", "群聊会话" in await h.wait_reply(), "应被拒")
 
 
+async def test_public_session(h: Harness):
+    """群会话用 `/aichat new --public=true` 注册成公开会话 → 本群成员免邀请可用。
+
+    「公开」只对**群会话**有意义（私聊里只有两个人，那种场景用邀请码），所以
+    `--public` 出现在私聊里要被明确拒掉，而不是建出一个名叫公开、实际没用的会话。
+    """
+    print("\n[5a] 公开会话（群聊免邀请）")
+    h.clear()
+    # 群里建公开会话
+    await h.group("/aichat new 公开讨论 --public=true", at_bot=True,
+                  user_id=ALICE, settle=1.2)
+    text = await h.wait_reply()
+    check("建好了且说明已公开", "公开会话" in text, text[:200])
+    session = _current_session(h, user_id=ALICE, group_id=GROUP)
+    check("会话真的是公开状态", session is not None and session.public is True,
+          f"{getattr(session, 'public', None)}")
+
+    # 群里另一个人（没被邀请）直接 attach → 应当成功
+    h.clear()
+    await h.group(f"/aichat attach {session.id}", at_bot=True, user_id=BOB,
+                  settle=0.9)
+    text = await h.wait_reply()
+    check("未受邀的本群成员能直接 attach", "已切到" in text, text[:160])
+    bob = _current_session(h, user_id=BOB, group_id=GROUP)
+    check("BOB 的焦点切过去了", bob is not None and bob.id == session.id,
+          f"{getattr(bob, 'id', None)}")
+
+    # 公开状态要落盘
+    reloaded = type(h.plugin.store)(str(h.data_dir))     # 重新打开同一个数据目录
+    got = reloaded.get(session.id)
+    check("公开状态落盘", got is not None and got.public is True,
+          f"{getattr(got, 'public', None)}")
+
+    # 私有群会话仍然要邀请
+    h.clear()
+    await h.group("/aichat new 私有讨论", at_bot=True, user_id=ALICE, settle=1.0)
+    private = _current_session(h, user_id=ALICE, group_id=GROUP)
+    check("默认建的是私有会话", private is not None and private.public is False,
+          f"{getattr(private, 'public', None)}")
+    h.clear()
+    await h.group(f"/aichat attach {private.id}", at_bot=True, user_id=BOB,
+                  settle=0.9)
+    text = await h.wait_reply()
+    check("私有群会话照旧被拒", "需被邀请" in text or "没有公开" in text, text[:160])
+    check("拒绝时给出两条出路",
+          "邀请码" in text and "/aichat invite" in text, text[:220])
+
+    # 私聊里 --public 直接拒掉
+    h.clear()
+    await h.private("/aichat new 私聊公开 --public=true", user_id=ALICE, settle=0.9)
+    text = await h.wait_reply()
+    check("私聊不能用 --public", "只对**群会话**有意义" in text or "群会话" in text,
+          text[:200])
+    check("私聊失败时提示用邀请码", "邀请码" in text, text[:220])
+    check("私聊没建出会话",
+          _current_session(h, user_id=ALICE) is None
+          or _current_session(h, user_id=ALICE).name != "私聊公开",
+          f"{getattr(_current_session(h, user_id=ALICE), 'name', None)}")
+
+
+async def test_invite_code(h: Harness):
+    """私聊会话的**邀请码**：生成、凭码加入、一次一用、过期、作废。"""
+    print("\n[5c] 邀请码（私聊会话）")
+    session = await establish(h)          # 私聊会话（ALICE 的）
+    check("拿到私聊会话", session is not None, "没建出会话")
+    h.clear()
+    await h.private(f"/aichat invite {session.id}", user_id=ALICE, settle=0.9)
+    text = await h.wait_reply()
+    check("生成了邀请码", "邀请码" in text, text[:220])
+    m = re.search(r"\*\*([A-Z0-9]{6})\*\*", text)
+    check("回执里有 6 位码", bool(m), text[:260])
+    code = m.group(1) if m else ""
+
+    # 先确认 attach **不认识**码：给的是会话命令，只提示该用 join（且不消耗码）
+    h.clear()
+    await h.private(f"/aichat attach {code}", user_id=BOB, settle=0.9)
+    text = await h.wait_reply()
+    check("attach 不认邀请码，只提示用 join",
+          "找不到会话" in text and f"/aichat join {code}" in text, text[:200])
+    check("提示之后码还在（没被吃）",
+          h.plugin.store.peek_code(code) == session.id,
+          f"{h.plugin.store.peek_code(code)}")
+    bob0 = _current_session(h, user_id=BOB)
+    check("BOB 没有被切过去", bob0 is None or bob0.id != session.id,
+          f"{getattr(bob0, 'id', None)}")
+
+    # 别人凭码 join
+    h.clear()
+    await h.private(f"/aichat join {code}", user_id=BOB, settle=1.0)
+    text = await h.wait_reply()
+    check("凭码加入成功", "已切到" in text, text[:180])
+    check("回执说明是凭邀请码加入", "邀请码" in text, text[:200])
+    bob = _current_session(h, user_id=BOB)
+    check("BOB 成为参与者", bob is not None and bob.id == session.id,
+          f"{getattr(bob, 'id', None)}")
+    check("BOB 进了受邀名单", int(BOB) in set(h.plugin.store.get(session.id).guests),
+          f"{h.plugin.store.get(session.id).guests}")
+
+    # 一次性：第二次用同一个码应当失败
+    h.clear()
+    await h.private(f"/aichat join {code}", user_id=BOB, settle=0.9)
+    text = await h.wait_reply()
+    check("码只能用一个（第二次失效）", "无效" in text or "失效" in text,
+          text[:180])
+
+    # 码要落盘：换个进程（重新打开数据目录）也还能用 —— 用户可能隔天才把码发出去
+    h.clear()
+    await h.private(f"/aichat invite {session.id}", user_id=ALICE, settle=0.8)
+    text = await h.wait_reply()
+    m3 = re.search(r"\*\*([A-Z0-9]{6})\*\*", text)
+    durable = m3.group(1) if m3 else ""
+    reopened = type(h.plugin.store)(str(h.data_dir))
+    check("邀请码落盘（重开数据目录仍有效）",
+          bool(durable) and reopened.peek_code(durable) == session.id,
+          f"{durable} → {reopened.peek_code(durable) if durable else None}")
+
+    # 作废：再生成两个，然后 --revoke 清掉
+    h.clear()
+    await h.private(f"/aichat invite {session.id}", user_id=ALICE, settle=0.8)
+    await h.wait_reply()
+    h.clear()
+    await h.private(f"/aichat invite {session.id} --revoke=true",
+                    user_id=ALICE, settle=0.9)
+    text = await h.wait_reply()
+    check("能作废未用的码", "作废" in text, text[:180])
+    check("作废后没有未用的码", not h.plugin.store.codes_of(session.id),
+          f"{h.plugin.store.codes_of(session.id)}")
+
+    # 期限：CLI 有下限（1 分钟）—— 短到几分钟的码没意义
+    h.clear()
+    await h.private(f"/aichat invite {session.id} --ttl=1s --uses=3",
+                    user_id=ALICE, settle=0.9)
+    text = await h.wait_reply()
+    m2 = re.search(r"\*\*([A-Z0-9]{6})\*\*", text)
+    check("能设时效与次数", bool(m2) and "3 次" in text, text[:220])
+    check("时效有下限（不足 1 分钟按 1 分钟）", "1 分钟" in text, text[:220])
+
+    # 真正的「过期」判定走 store 层：CLI 有下限，测不到秒级过期
+    short = h.plugin.store.new_code(session.id, ttl=0.5, uses=1)[0]
+    check("刚生成的码有效", h.plugin.store.peek_code(short) == session.id,
+          f"{h.plugin.store.peek_code(short)}")
+    await asyncio.sleep(0.7)
+    check("过期后 peek 不到", h.plugin.store.peek_code(short) is None,
+          f"{h.plugin.store.peek_code(short)}")
+
+    # uninvite 与 invite 共用同一份 Schema：缺 QQ 号时不能「顺手生成一个码」
+    h.clear()
+    await h.private(f"/aichat uninvite {session.id}", user_id=ALICE, settle=0.8)
+    text = await h.wait_reply()
+    check("uninvite 缺 QQ 号时给用法，不生成码",
+          "QQ号" in text and "邀请码：\n" not in text, text[:180])
+
+    # 会话名长得像邀请码：attach 按名字（认会话），join 按码（认码），互不串
+    h.clear()
+    await h.private("/aichat new TWX96K", user_id=ALICE, settle=1.0)
+    await h.wait_reply()
+    lookalike = _current_session(h, user_id=ALICE)
+    check("建了一个长得像码的会话", lookalike is not None
+          and lookalike.name == "TWX96K",
+          f"{getattr(lookalike, 'name', None)}")
+    h.clear()
+    await h.private("/aichat attach TWX96K", user_id=ALICE, settle=0.9)
+    text = await h.wait_reply()
+    check("attach 认的是**会话名**", "已切到" in text
+          and lookalike.id in text, text[:180])
+    h.clear()
+    await h.private("/aichat join TWX96K", user_id=ALICE, settle=0.9)
+    text = await h.wait_reply()
+    check("join 认的是**码**：没有这张码时指出那是个会话名",
+          "会话名" in text and "不是邀请码" in text, text[:200])
+
+    # 非所有者不能给别人发码
+    h.clear()
+    await h.private(f"/aichat invite {session.id}", user_id=BOB, settle=0.9)
+    text = await h.wait_reply()
+    check("非所有者不能生成码", "只有所有者" in text or "⚠️" in text, text[:180])
+
+
 async def test_invite_flow(h: Harness):
     """受邀才能参与别人的会话；且只能在**同类型**的聊天里用。"""
     print("\n[5b] 邀请流程：别人的会话要受邀才能参与")
@@ -1745,6 +1923,31 @@ async def test_recall_removes_staged(h: Harness):
     }, settle=0.5)
     state = h.plugin.buffer.peek(f"group:{GROUP}")
     check("撤回后暂存区清空", not (state.get("items")), f"{state}")
+
+
+async def test_reply_drops_mimicked_label(h: Harness):
+    """模型模仿段落编号写成 `[#99] 正文` 时，用户不该看到那串符号。"""
+    print("\n[19.55] 回答开头模仿的 [#N] 会被剥掉")
+    await establish(h)
+    h.clear()
+    h.llm.script_text = "[#99] 这是一段回答，开头那个编号不是真的。"
+    await h.private("随便问问//", settle=1.2)
+    text = await h.wait_reply()
+    check("发出去的回答没有那个编号", not text.strip().startswith("[#"),
+          text[:80])
+    check("正文还在", "这是一段回答" in text, text[:80])
+    session = _current_session(h)
+    hist = h.plugin.store.history(session.id)
+    saved = next((m.text for m in reversed(hist) if m.role == "assistant"), "")
+    check("落盘的正文也干净了", not saved.strip().startswith("[#"), saved[:80])
+
+    # 真实编号（真在指代某一段）不该被动
+    h.clear()
+    seqs = [int(m.seq) for m in hist if m.seq]
+    h.llm.script_text = f"[#{seqs[0]}] 我看到的第一段是这句"
+    await h.private("那第一段说了啥？//", settle=1.2)
+    text = await h.wait_reply()
+    check("真实编号保留（那是在指代）", f"[#{seqs[0]}]" in text, text[:80])
 
 
 async def test_hget_traces_chain(h: Harness):
@@ -3238,13 +3441,19 @@ async def test_prompt_tables_and_formulas(h=None):
     check("加粗仍是禁用项",
           "加粗" in persona and ("别用" in persona or "不要用" in persona),
           persona[:200])
-    check("代码围栏仍是禁用项", "围栏" in persona, "没提代码围栏")
-    check("标题仍是禁用项", "#" in persona, "没提标题")
+    # ⚠️ 标题、列表、代码围栏**是能渲染的**（各自单独出图，见 markdown.find_rich_blocks），
+    # 所以它们属于「可以放心用」那一类；这条断言以前写成「禁用项」是按旧行为写的，
+    # 靠示例里的 `###` 才碰巧通过 —— 现在按真实规则断言。
+    check("代码围栏属于「会渲染、可以放心用」",
+          "围栏" in persona and ("放心用" in persona or "单独渲染" in persona),
+          persona[:260])
+    check("标题/列表属于「会渲染、可以放心用」",
+          "标题" in persona and "单独渲染" in persona, persona[:260])
     check("不再说「表格原样显示成符号」这种自相矛盾的话",
           "很难看" not in persona, persona[:200])
 
     print("\n[44] 工具指引与 Markdown 模式都要跟着一致")
-    g = c.tool_guidance(web=True, markdown=False)
+    g = c.tool_guidance(web=True)
     check("工具指引提醒把结构化结果整理成表格",
           "表格" in g, g[-120:])
     check("markdown=False 时的指引也包含表格公式", "表格" in g)
@@ -4312,6 +4521,7 @@ async def main():
     for fn in (
         test_private_flow, test_group_trigger, test_command_messages_not_dialogue,
         test_session_lifecycle, test_group_session_is_per_group,
+        test_public_session, test_invite_code,
         test_invite_flow, test_shared_context,
         test_solo_session_not_marked_shared, test_wrapping,
         test_tool_calling, test_plot_tool, test_fetch_image_tool,
@@ -4324,6 +4534,7 @@ async def main():
         test_recall_removes_staged, test_detach_drops_staged, test_staging_persistence,
         test_staging_shared_across_windows, test_window_key_migration,
         test_submit_while_busy, test_terminator_waits_for_ingest,
+        test_reply_drops_mimicked_label,
         test_hget_traces_chain, test_hget_by_label,
         test_paragraph_labels, test_quote_uses_label,
         test_quote_chain_labels, test_quote_falls_back_to_text,

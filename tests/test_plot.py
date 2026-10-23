@@ -1011,23 +1011,51 @@ async def test_deliver_reply(tmp: Path):
 # ==================== 10. 提示词指引 ====================
 
 def test_guidance():
-    print("\n[10] 系统提示里的画图指引")
+    """指引与 Schema 的**分工**：Schema 讲参数与写法，指引只讲判断。
+
+    2026-10-23 精简过一轮系统提示：「三种写法自动识别」「参数方程 t_max」
+    「默认 ±10」这些**挪到了工具 Schema**（每轮随 `tools` 下发，模型照样看得到），
+    所以断言也从「提示里有」改成「Schema 里有 + 提示里只留判断」。
+    """
+    print("\n[10] 画图指引与 Schema 的分工")
     with_plot = tool_guidance(web=False, plot=True)
     without = tool_guidance(web=False, plot=False)
     check("启用时讲画图", "plot_function" in with_plot, "")
     check("关闭时不讲画图", "plot_function" not in without, "")
-    check("要求先画再说", "直接调用 plot_function" in with_plot, "")
-    # 指引改成了「三种形态自动识别」：一元函数 / 方程 / 参数方程
-    check("讲了三种形态自动识别", "自动识别" in with_plot, "")
-    check("讲了一元函数写法", "一元函数" in with_plot, "")
-    check("讲了方程写法", "方程" in with_plot and "x^2+y^2=25" in with_plot, "")
-    check("讲了参数方程写法", "参数方程" in with_plot and "cos(t)" in with_plot, "")
-    check("讲了区间参数", "x_min" in with_plot, "")
-    check("保持原有指引", "先调用工具" in with_plot, "")
-    # 与 Markdown 模式共存
-    both = tool_guidance(web=True, plot=True, markdown=True)
+    check("要求先画再说（别只用文字描述形状）",
+          "直接画" in with_plot and "文字描述形状" in with_plot, with_plot[:160])
+    check("讲了「必须同图」的场合", "必须同图" in with_plot, "")
+    check("讲了刻度只按用户要求调", "x_step" in with_plot and "刻度" in with_plot, "")
+    check("讲了压扁/裁掉的解决办法", "收窄" in with_plot, "")
+    check("保持通用那条（先调工具）", "先调用工具" in with_plot, "")
+
+    # 三种写法挪到了 Schema：从工具表里取 plot_function 的描述来断言
+    from plugins.ai_chat.tools import ToolRegistry, register_plot_tool
+    reg = ToolRegistry()
+    register_plot_tool(reg)
+    tool = reg.get("plot_function")
+    desc = tool.description
+    params = tool.parameters or {}
+    check("Schema 讲了三种写法自动识别", "自动识别" in desc, desc[:120])
+    check("Schema 讲了一元函数/方程/参数方程",
+          all(x in desc for x in ("一元函数", "方程", "参数方程")), desc[:200])
+    check("Schema 的 expression 给了圆的例子",
+          "x^2+y^2=25" in str((params.get("properties") or {})
+                              .get("expression", {}).get("description")), "")
+    check("Schema 的 t_max 讲了多圈", "4π" in str((params.get("properties") or {})
+                                                  .get("t_max", {}).get("description")), "")
+    check("Schema 的 x_step 讲了「太密/太疏」",
+          "太密" in str((params.get("properties") or {})
+                        .get("x_step", {}).get("description")), "")
+
+    # 多种能力可以叠加；Markdown 的排版要求归人格后缀（不在工具指引里重复）
+    both = tool_guidance(web=True, plot=True, image=True)
     check("三种能力可以叠加",
-          "plot_function" in both and "Markdown 模式" in both and "web_search" in both, "")
+          all(x in both for x in ("plot_function", "web_search", "fetch_image")), "")
+    from plugins.ai_chat.compaction import build_system_prompt
+    md_prompt = build_system_prompt(chat_kind="private", markdown=True)
+    check("Markdown 的排版要求在人格里（唯一 owner）",
+          "Markdown 模式" in md_prompt and "Markdown 模式" not in both, "")
 
 
 # ==================== main ====================

@@ -67,7 +67,7 @@ from .reasoning import (
     override_text, spec_from_text,
 )
 from .history import (SUMMARY_SYSTEM_PROMPT, SummaryCache, extract_exchanges,
-                      trace_chain,
+                      strip_stray_label, trace_chain,
                       fallback_summary, has_compaction, parse_question_summaries,
                       parse_range, reject_range, render_list, summarize_context,
                       summary_key)
@@ -79,8 +79,8 @@ from .search import ANYSEARCH_URL, WebClient
 from .segments import (ROLE_ASSISTANT, Message, assistant_message, tool_message,
                        user_message)
 from .store import (
-    ChatTarget, OWNER_GROUP, OWNER_USER,
-    SentReplyIndex, Session, SessionStore,
+    CODE_TTL, ChatTarget, OWNER_GROUP, OWNER_USER,
+    SentReplyIndex, Session, SessionStore, normalize_code,
 )
 from .tools import (ToolContext, ToolRegistry, register_builtin_tools,
                     register_image_tool, register_plot_tool, register_web_tools)
@@ -1079,13 +1079,22 @@ class AiChatPlugin(PluginBase):
             return True, ""
         if uid in set(session.guests):
             return True, ""
+        # 公开会话：**群归属**并且就在这个群里用 → 本群成员免邀请。
+        # 只放行「本群内」：公开是「本群公开」，不是「谁都能拿它当私聊用」。
+        if session.public and session.owner_kind == OWNER_GROUP \
+                and int(session.owner_id) == int(target.chat_id):
+            return True, ""
         if session.owner_kind == OWNER_GROUP and int(session.owner_id) == target.chat_id:
             return False, (f"会话 {session.id}「{session.name}」属于本群，"
-                           f"群成员需被邀请才能使用："
-                           f"/aichat invite {session.id} {uid}")
+                           f"但**没有公开**，群成员需被邀请才能使用："
+                           f"/aichat invite {session.id} {uid}（直接邀请你）· "
+                           f"或 /aichat invite {session.id}（生成邀请码）· "
+                           f"或所有者 /aichat public {session.id} --on=true "
+                           f"把它公开给全群")
         return False, (f"会话 {session.id}「{session.name}」归"
                        f"{session.owner_label}所有，你不在受邀名单里。"
-                       f"需所有者发 /aichat invite {session.id} {uid} 邀请你参与")
+                       f"需所有者发 /aichat invite {session.id} {uid} 邀请你，"
+                       f"或给你一个邀请码（/aichat attach <码>）")
 
     def _may_manage(self, session: Session, user_id: int) -> tuple[bool, str]:
         """谁能管理会话（改名 / 邀请 / 删除）：只有所有者。
@@ -2493,12 +2502,16 @@ class AiChatPlugin(PluginBase):
             usage.prompt_tokens += int((result.usage or {}).get("prompt_tokens") or 0)
             usage.completion_tokens += int(
                 (result.usage or {}).get("completion_tokens") or 0)
-            assistant = assistant_message(result.text, tool_calls=result.to_blocks()[len(
+            # 模型会模仿段落编号，在回答开头写一个 `[#N]` —— 不是真编号就剥掉，
+            # 否则用户看到的是一串不明所以的符号（见 `strip_stray_label`）
+            text = strip_stray_label(result.text,
+                                     {int(m.seq or 0) for m in history})
+            assistant = assistant_message(text, tool_calls=result.to_blocks()[len(
                 [b for b in result.to_blocks() if b.type == "text"]):] or None)
             history.append(assistant)
             self.store.append(session.id, assistant)
-            if result.text.strip():
-                last_text = result.text.strip()
+            if text.strip():
+                last_text = text.strip()
 
             if not result.has_tool_calls:
                 return last_text, usage
@@ -2620,8 +2633,7 @@ class AiChatPlugin(PluginBase):
                 # 配图指引同理：搜索或配图任一关掉，模型根本调不到 fetch_image
                 image=bool(self.cfg.get("web_image", {}).get("enabled", True)
                            and self.cfg["search"]["enabled"]
-                           and self.cfg["tools"]["enabled"]),
-                markdown=bool(md)),
+                           and self.cfg["tools"]["enabled"])),
             markdown=bool(md),
             # 提示里讲的编号必须与投影里真的加上的编号一致，否则模型会指着
             # 一个不存在的 `[#N]` 说话
@@ -2824,21 +2836,36 @@ class AiChatPlugin(PluginBase):
             # 列表里显示成「群 张三」会让人以为是张三的私有会话。
             owner_name = (str(target.chat_id) if owner_kind == OWNER_GROUP
                           else self._display_name(event))
+            want_public = bool(getattr(params, "public", False))
+            if want_public and owner_kind != OWNER_GROUP:
+                # 私聊里「公开」没有对象（会话就两个人用）→ 明确拒掉，
+                # 别建出一个名叫公开、实际没用的会话
+                return ("⚠️ `--public` 只对**群会话**有意义：公开 = 本群成员免邀请"
+                        "即可用。\n私聊会话要给别人用，请用邀请码："
+                        "先 /aichat new <名称> 建好，再 /aichat invite <会话>")
             session = self.store.create(
                 name=params.name.strip(), owner_kind=owner_kind, owner_id=owner_id,
                 owner_name=owner_name)
             # 记下创建者：群会话归群所有，创建者要能继续用它、管它
             # （邀请/改名/删除），否则建完就失控。私聊会话也一并记，语义统一。
             session.meta["created_by"] = int(event.user_id)
+            if want_public:
+                self.store.set_public(session.id, True)
             lines = [f"✅ 已新建会话 {session.describe()}"]
             if params.attach:
                 self.store.set_focus(target, int(event.user_id), session.id)
                 lines.append(f"已设为你在此处的当前会话（{target.label}），直接说话即可")
             else:
                 lines.append(f"未使用。用 /aichat attach {session.id} 切过去")
-            if owner_kind == OWNER_GROUP:
+            if owner_kind == OWNER_GROUP and want_public:
+                lines.append("🔓 已注册为**公开会话**：本群任何成员都可以"
+                             f"/aichat attach {session.id} 直接用，不用再逐个邀请。"
+                             "\n上下文对参与者**完全共享**（群里谁说的、它答的，"
+                             "其他参与者都看得到）。")
+            elif owner_kind == OWNER_GROUP:
                 lines.append("（本群会话：只能在本群用；"
-                             f"群成员需你 /aichat invite {session.id} <QQ号> 才能参与）")
+                             f"群成员需你 /aichat invite {session.id} <QQ号> "
+                             f"才能参与，或邀请码：/aichat invite {session.id}）")
             else:
                 lines.append("（私聊会话：只能在私聊用；"
                              f"想邀请别人一起用：/aichat invite {session.id} <QQ号>）")
@@ -3052,6 +3079,13 @@ class AiChatPlugin(PluginBase):
         async def cmd_attach(params, event: MessageEvent):
             return self._do_switch(params.session, event)
 
+        @self.register_command(f"{A}.join", schema=S.JoinSchema, permission="",
+                               scope="all",
+                               description="凭邀请码加入会话"
+                                           "（码由所有者 /aichat invite <会话> 生成）")
+        async def cmd_join(params, event: MessageEvent):
+            return self._do_join(params.code, event)
+
         @self.register_command(f"{A}.detach", schema=S.DetachSchema, permission="",
                                scope="all", description="取消你在此处的当前会话")
         async def cmd_detach(params, event: MessageEvent):
@@ -3208,7 +3242,8 @@ class AiChatPlugin(PluginBase):
         # ---- 邀请（会话所有者；群归属的会话由群主/管理员代管）----
         @self.register_command(f"{A}.invite", schema=S.InviteSchema, permission="",
                                scope="all",
-                               description="邀请某人参与你的会话（对方需自己 attach）")
+                               description="邀请参与会话：给 QQ 号=直接邀请，"
+                                           "不给=生成邀请码（可设时效/次数）")
         async def cmd_invite(params, event: MessageEvent):
             return self._do_invite(params, event, invite=True)
 
@@ -3218,7 +3253,7 @@ class AiChatPlugin(PluginBase):
             return self._do_invite(params, event, invite=False)
 
         @self.register_command(f"{A}.guests", permission="", scope="all",
-                               description="查看会话的受邀名单")
+                               description="查看会话的受邀名单与未用的邀请码")
         async def cmd_guests(packet, event: MessageEvent):
             target = self._target_of(event)
             uid = int(event.user_id)
@@ -3239,7 +3274,24 @@ class AiChatPlugin(PluginBase):
             else:
                 lines.append(f"受邀名单（{len(guests)}）："
                              + "、".join(str(g) for g in guests))
+            # 未用的邀请码也属于「谁能用这个会话」，一并列出来
+            codes = self.store.codes_of(session.id)
+            if codes:
+                import time as _time
+                lines.append(f"邀请码（{len(codes)} 个未用）：")
+                for code, rec in codes:
+                    left = int(rec.get("uses") or 0)
+                    exp = float(rec.get("expires") or 0)
+                    when = ("不过期" if not exp
+                            else f"{max(0, int(exp - _time.time())) // 3600}h "
+                                 f"{max(0, int(exp - _time.time())) % 3600 // 60}m "
+                                 f"后过期")
+                    lines.append(f"  {code} · 剩 {left} 次 · {when}")
+            if session.public:
+                lines.append("公开：已开启（本群成员免邀请即可 attach）")
             lines.append(f"邀请：/aichat invite {session.id} <QQ号>"
+                         f"（直接加人）· /aichat invite {session.id}"
+                         f"（生成邀请码）"
                          "（对方需自己 /aichat attach）")
             return "\n".join(lines)
 
@@ -3540,31 +3592,48 @@ class AiChatPlugin(PluginBase):
         return "、".join(_focus_label(k) for k in sorted(keys))
 
     def _do_switch(self, token: str, event: MessageEvent) -> str:
-        """把会话设成「这个人在这个聊天里的焦点」。
+        """把会话设成「这个人在这个聊天里的焦点」（`/aichat attach`）。
 
-        「都在哪些地方用它」由每个人各自决定：同一个人可以在群里用它、也可以在
-        自己的私聊里用它；群里别人要用，得先被邀请、再自己 attach。
+        **只认会话 id / 名称**，不认邀请码 —— 见 `_do_join`。两条命令各有唯一
+        含义，`attach TWX96K` 永远不会因为「恰好有一张同名码」而切到别的会话：
 
-        **直接切换**：这里没有 `--force` 确认，也不要求先 `/aichat detach` ——
-        切换是**覆盖焦点**，本来就不会丢任何东西；旧版本却要先拒一次、让用户加
-        `--force=true` 再来一遍，纯属多一步。
+        | 命令 | 认什么 | 典型场景 |
+        |---|---|---|
+        | `attach <会话>` | 会话 id / 名称 | 切到我本来就能用的会话 |
+        | `join <码>` | 邀请码（最后才看会话名，只为给提示） | 凭别人发的码加入 |
+
+        「都在哪些地方用它」由每个人各自决定：同一个人可以在群里用它、也可以在自己的
+        私聊里用它；群里别人要用，得先被邀请（或会话是公开的）、再自己 attach。
+
+        **直接切换**：没有 `--force` 确认，也不要求先 `/aichat detach` —— 切换是
+        **覆盖焦点**，本来就不会丢任何东西。
 
         **暂存区**：里面有未提交的分段时**照切**，分段留在原地（暂存区按「聊天
-        地址」存，不跟会话走）。所以回执里明说「N 段仍在暂存区、会并入新会话」——
-        否则用户以为切走了、结果那几段跟进了新会话。
+        地址」存，不跟会话走）。所以回执里明说「N 段仍在暂存区、会并入新会话」。
         """
         target = self._target_of(event)
         uid = int(event.user_id)
         session = self.store.resolve(token)
         if session is None:
-            return (f"找不到会话：{token}。用 /aichat list 查看；"
-                    f"新建用 /aichat new <名称>")
+            hint = ""
+            looked = normalize_code(token)
+            if looked and self.store.peek_code(looked):
+                # 长得像码、而且真有这张码：告诉用户该用哪条命令，**不消耗**
+                hint = (f"\n如果你要用的是一张**邀请码**，请发："
+                        f"/aichat join {looked}")
+            return (f"找不到会话：{token}{hint}\n"
+                    f"用 /aichat list 查看已有会话；新建用 /aichat new <名称>")
+        return self._enter_session(session, target, uid)
+
+    def _enter_session(self, session: Session, target: ChatTarget, uid: int, *,
+                       via_code: bool = False) -> str:
+        """把会话设成焦点并返回回执（`attach` 与 `join` 共用这一段）。"""
         ok, why = self._may_attach(session, target, uid)
         if not ok:
             return f"⚠️ {why}"
         existing = self._current_session(target, uid)
-        where = f"（原 {existing.id}「{existing.name}」）" if existing is not None \
-            and existing.id != session.id else ""
+        where = (f"（原 {existing.id}「{existing.name}」）"
+                 if existing is not None and existing.id != session.id else "")
         self.store.set_focus(target, uid, session.id)
         staged = len(self.buffer.peek(target.conversation_key).get("items") or [])
         shared = (session.guests or session.owner_kind == OWNER_GROUP)
@@ -3574,10 +3643,53 @@ class AiChatPlugin(PluginBase):
                 or (shared and session.owner_kind == OWNER_GROUP) else "")
         keep = (f"\nℹ️ 暂存区里还有 {staged} 段没提交的内容，"
                 f"会并入这个会话（要丢掉先 /aichat detach）" if staged else "")
-        return (f"✅ 你在此处的会话已切到 {session.id}「{session.name}」{where}"
+        via = "（凭邀请码加入）" if via_code else ""
+        return (f"✅ 你在此处的会话已切到 {session.id}「{session.name}」{where}{via}"
                 f"（{target.label}，所有者：{session.owner_label}）{note}{keep}\n"
                 f"直接说话即可开始（群里先 @我；长内容可分段发，"
                 f"最后用 {self._term_hint()} 收尾）")
+
+    def _do_join(self, code_raw: str, event: MessageEvent) -> str:
+        """`/aichat join <码>` —— 凭**邀请码**加入会话。
+
+        为什么不并进 `attach`：两者认的东西不一样，混在一起就永远说不清
+        「一个长得像邀请码的会话名」该按哪种解析。分开之后语义唯一：
+        `attach` 只认会话，`join` 只认码（码认不到时才回头看一眼是不是会话名，
+        只为把「你该用 attach」这句话说出来）。
+
+        核销顺序也有讲究：**先判定能不能用（类型/上下文），通了才 consume** ——
+        码是限次的，用不上还吃一次，用户会一脸问号。
+        """
+        target = self._target_of(event)
+        uid = int(event.user_id)
+        code = normalize_code(code_raw)
+        if not code:
+            return "用法：/aichat join <邀请码>（由会话所有者 /aichat invite <会话> 生成）"
+        sid = self.store.peek_code(code)
+        if not sid:
+            named = self.store.resolve(code_raw)
+            if named is not None:
+                return (f"「{code_raw}」是一个**会话名**，不是邀请码。\n"
+                        f"要切到它：/aichat attach {named.id}（或 /aichat attach "
+                        f"{named.name}）\n"
+                        f"要加入别人给的会话，请让对方 /aichat invite <会话> "
+                        f"生成邀请码")
+            return (f"⚠️ 邀请码 {code} 无效（可能抄错、过期或用完了）。\n"
+                    f"码里没有 0/O/1/I/L —— 检查一下这几个字符；"
+                    f"过期了让对方重新生成")
+        session = self.store.get(sid)
+        if session is None:
+            return f"⚠️ 这张码指向的会话（{sid}）已经不存在了，让对方重新生成"
+        if not self._matches_context(session, target):
+            # 不核销：类型不对就换地方再试，码留着
+            return (f"⚠️ 这个邀请码是{self._session_type_label(session)}的，"
+                    f"不能在{('群里' if target.is_group else '私聊里')}用"
+                    f"（码没有消耗，去对的地方再试）")
+        if not self.store.consume_code(code, user_id=uid):
+            return "⚠️ 邀请码已失效（过期或用完了），请让对方重新生成"
+        self.store.invite(session.id, uid)      # 码就是邀请：核销即入名单
+        self._invited_cache.pop(uid, None)
+        return self._enter_session(session, target, uid, via_code=True)
 
     def _root_description(self) -> str:
         """命令组本体的描述 —— 统一 `/help aichat` 的首屏。
@@ -3598,7 +3710,10 @@ class AiChatPlugin(PluginBase):
         at = "先 @我，" if self.cfg["trigger"].get("group_require_at") else ""
         return (f"AI 对话。"
                 f"不用命令也能对话：私聊直接说话，群里{at}长内容可分段发，"
-                f"最后用 `{shown}` 收尾。")
+                f"最后用 `{shown}` 收尾。"
+                f"\n群会话可建为**公开**（/aichat new <名称> --public=true，"
+                f"本群成员免邀请即可用）；私聊会话给别人用发**邀请码**"
+                f"（/aichat invite <会话>，对方 /aichat attach <码>）。")
 
     def _do_think(self, params, event: MessageEvent) -> str:
         """`/aichat think` —— 查看/切换思考强度。
@@ -3825,6 +3940,45 @@ class AiChatPlugin(PluginBase):
         ok, why = self._may_manage(session, uid)
         if not ok and not self.perm.is_superuser(uid):
             return f"⚠️ {why}"
+        # ⚠️ 邀请码相关的分支只在 **invite** 上生效：`uninvite` 与它共用同一个
+        # Schema，路径跑到这里会变成「取消邀请却没给 QQ 号 → 生成一个码」的荒唐事。
+        if invite and params.revoke:
+            gone = self.store.revoke_codes(session.id)
+            if not gone:
+                return f"会话 {session.id} 没有未用的邀请码"
+            return (f"🗑 已作废会话 {session.id}「{session.name}」的 {gone} 个邀请码\n"
+                    f"（已发出去的码从此无效；要重新发就再 /aichat invite "
+                    f"{session.id}）")
+
+        if invite and not params.user_id:
+            # 不带 QQ 号 = **生成邀请码**：私聊里把码发给对方，对方
+            # /aichat attach <码> 就进来了。为什么要有这条路：私聊里
+            # 「邀请」很难拿到对方的 QQ（还得先问到），而码可以随手转发，
+            # 还能过期、限次。
+            # 码是**会流出去**的东西：默认 24 小时、1 次，最长 30 天、最多 50 次。
+            # 不给「永久有效」这个选项 —— 长期授权应该用「直接邀请」而不是码。
+            ttl = int(params.ttl or 0) or int(CODE_TTL)
+            ttl = max(60, min(ttl, 30 * 86400))
+            uses = max(1, min(int(params.uses or 0) or 1, 50))
+            try:
+                code, rec = self.store.new_code(
+                    session.id, ttl=float(ttl), uses=uses, by=uid)
+            except RuntimeError as e:
+                return f"生成邀请码失败：{e}"
+            exp = ("不过期" if not rec.get("expires")
+                   else f"{ttl / 3600:.0f} 小时后过期" if ttl >= 3600
+                   else f"{ttl / 60:.0f} 分钟后过期")
+            return (f"🎟 会话 {session.id}「{session.name}」的邀请码：\n"
+                    f"    **{code}**\n"
+                    f"（{exp} · 可用 {uses} 次）\n"
+                    f"让对方直接发：/aichat join {code}\n"
+                    f"查看未用的码：/aichat guests {session.id}"
+                    f" · 全部作废：/aichat invite {session.id} --revoke=true")
+
+        if not params.user_id:
+            return (f"要取消谁的邀请？/aichat uninvite {session.id} <QQ号>\n"
+                    f"（取消全部未用的邀请码：/aichat invite {session.id} "
+                    f"--revoke=true）")
         guest = int(params.user_id)
         if guest == uid:
             return "不用邀请自己 —— 你是所有者，本来就能用"
@@ -3835,7 +3989,9 @@ class AiChatPlugin(PluginBase):
             return (f"✅ 已邀请 {guest} 参与会话 {session.id}「{session.name}」\n"
                     f"对方需**自己**执行 /aichat attach {session.id} 才会用上"
                     f"（群里或私聊都可以）\n"
-                    f"当前受邀名单：{self.store.guests_of(session.id)}")
+                    f"当前受邀名单：{self.store.guests_of(session.id)}\n"
+                    f"（不想问对方 QQ？/aichat invite {session.id} 生成"
+                    f"一次性邀请码，转发给他即可）")
         if not self.store.uninvite(session.id, guest):
             return f"{guest} 不在受邀名单里"
         return (f"✅ 已取消 {guest} 对会话 {session.id} 的邀请"

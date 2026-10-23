@@ -203,6 +203,109 @@ def extract_exchanges(messages: Iterable[Message]) -> list[Exchange]:
     return out
 
 
+#: 引用段落的标记（`main._quoted_suffix` 拼进去的那个开头）
+QUOTE_MARK = "[引用上文]"
+
+
+#: 引用段里那些「结构性」的行 —— 进卡片时要去掉，只留真正的引文内容
+_QUOTE_PREFACES = ("对方引用的那条消息内容如下：", "上面那条消息自己又引用了：",
+                   "上面那条消息自己又引用了", "对方引用的那条消息内容如下")
+
+
+def clean_quoted(quoted: str) -> str:
+    """把引用段落里的**结构行**去掉，只留引文正文（给卡片里的引用框用）。
+
+    引用段长这样（`main._quoted_suffix` 拼的）：
+
+        [引用上文] 对方引用的那条消息内容如下：
+        鲍勃：听说三楼在装修，是真的吗？
+
+    卡片里的引用框已经有「引用上文」这个标题了，再把 `[引用上文]` 和
+    「……内容如下：」原样画出来就是三重标题、纯噪声。
+    """
+    out: list[str] = []
+    for line in str(quoted or "").splitlines():
+        text = line.strip()
+        if not text:
+            out.append("")
+            continue
+        while text.startswith(QUOTE_MARK):
+            text = text[len(QUOTE_MARK):].strip()
+        if not text or any(text.startswith(x) for x in _QUOTE_PREFACES):
+            continue
+        out.append(text)
+    # 压掉连续空行与首尾空行
+    lines: list[str] = []
+    for line in out:
+        if not line and (not lines or not lines[-1]):
+            continue
+        lines.append(line)
+    return "\n".join(lines).strip()
+
+
+def split_quoted(text: str) -> tuple[str, str]:
+    """把用户输入拆成 `(自己写的部分, 引用段落)`。
+
+    引用段落**总是拼在末尾**（`main._quoted_suffix` 里 `text += suffix`），所以
+    找到第一个标记就够；用户自己写的正文里出现这个标记的概率极低，真出现了
+    也只是被当成引用段的一部分，不会丢内容。
+
+    `hget` 用它来决定引用怎么展示：引用的是**一轮对话**就渲染那一轮（引用链区块），
+    是**普通消息**就把内容原样贴进引用框 —— 两种情况的差别就是「有没有 id 能对上」。
+    """
+    body = str(text or "")
+    pos = body.find(QUOTE_MARK)
+    if pos < 0:
+        return body.strip(), ""
+    return body[:pos].strip(), body[pos:].strip()
+
+
+#: 回复**开头**的 `[#N]`（模型会模仿段落编号，把它当排版标记写出来）
+_LEADING_LABEL_RE = re.compile(r"^\s*\[#(\d+)\]\s*")
+
+
+def strip_stray_label(text: str, valid_seqs) -> str:
+    """去掉回复开头那个**不是真编号**的 `[#N]`。
+
+    为什么需要它：段落编号进了提示之后，模型会顺手在回答开头也写一个
+    `[#N]`（实测 `xcpc` 会话里出现过 `[#19] 应用其实特别多…`，而那个会话当时
+    只有 9 条消息），用户看到的就是一串不明所以的符号。
+
+    为什么只剥**开头**、且只在**编号对不上**时剥：句中写 `[#12]` 是在合法地指代
+    上文；开头写一个**真实存在**的编号，也可能是「回答 [#12] 是什么意思」这种
+    正当引用 —— 只有「开头 + 对不上任何消息」才确定是模仿排版。
+    """
+    body = str(text or "")
+    m = _LEADING_LABEL_RE.match(body)
+    if not m:
+        return body
+    try:
+        seq = int(m.group(1))
+    except (TypeError, ValueError):
+        return body
+    if seq in set(int(x) for x in (valid_seqs or ()) if x):
+        return body                      # 真在指代某一段：保留
+    return body[m.end():].lstrip()
+
+
+#: 引用段里的段落编号（`[引用上文] 对方引用的是上文 [#12]…`）
+_QUOTE_LABEL_RE = re.compile(r"\[#(\d+)\]")
+
+
+def quoted_labels(question: str) -> list[int]:
+    """从**引用段**里取出被引用的段落编号（`[#N]` 里的 N，按出现顺序去重）。"""
+    _, quoted = split_quoted(question)
+    out: list[int] = []
+    for raw in _QUOTE_LABEL_RE.findall(quoted or ""):
+        try:
+            seq = int(raw)
+        except (TypeError, ValueError):
+            continue
+        if seq > 0 and seq not in out:
+            out.append(seq)
+    return out
+
+
 def trace_chain(messages: Iterable[Message], index: int, *,
                 max_depth: int = 8) -> list[int]:
     """沿「引用」往回追溯，返回引用链上的**问答编号**（最早 → 最晚，含自己）。
@@ -211,21 +314,33 @@ def trace_chain(messages: Iterable[Message], index: int, *,
     （用户引用着上一条提问、或者模型引着上一段回答）。只看一对会缺上下文，
     所以把整条链一并渲染出来。
 
-    只认**会话历史里的线索**（`metadata.reply_to` → 另一对的消息 id），
-    不联网：`get_msg` 每层要 1~5 秒（框架节流），而这里只做本地映射。
-    找不到（老消息没记 reply_to、或上文已被压缩吸收）就到此为止 ——
-    「追溯不到」比「编一段上文」诚实。
+    两类线索都认，**都只查本地**（`get_msg` 每层要 1~5 秒，是框架节流）：
 
-    环用 `seen` 挡住；`max_depth` 兜底（正常对话不会绕那么远）。
+    | 引用形态 | 线索 | 例 |
+    |---|---|---|
+    | 标签式（上文还在上下文里） | 引用段里的 `[#N]` → 消息 `seq` | `[引用上文] 对方引用的是上文 [#6]（…）` |
+    | 文本式（贴了原文） | `metadata.reply_to` → 被引消息的 QQ id | `[引用上文] 对方引用的那条消息内容如下：…` |
+
+    ⚠️ **标签式必须认**：机器人回答的 QQ 消息 id 不在任何 `Exchange.message_ids`
+    里（那里面只有用户消息的 id），所以「引用上一段回答」时按 id 查必然落空 ——
+    早先正是这样：引用 `[#6]` 却渲染成一个没头没脑的引用框。
+    标签里的 `seq` 能直接对到消息，正交。
+
+    找不到（老消息没记 reply_to、或上文已被压缩吸收）就到此为止 ——
+    「追溯不到」比「编一段上文」诚实。环用 `seen` 挡住；`max_depth` 兜底。
     """
     msgs = list(messages)
     exchanges = extract_exchanges(msgs)
     if not exchanges:
         return []
     by_msg_id: dict[int, int] = {}
+    by_seq: dict[int, int] = {}
     for ex in exchanges:
         for mid in ex.message_ids:
             by_msg_id.setdefault(int(mid), ex.index)
+        for seq in (getattr(ex, "seq", 0), getattr(ex, "answer_seq", 0)):
+            if seq:
+                by_seq.setdefault(int(seq), ex.index)
     by_index = {ex.index: ex for ex in exchanges}
 
     chain: list[int] = []
@@ -236,10 +351,17 @@ def trace_chain(messages: Iterable[Message], index: int, *,
         chain.append(cur)
         ex = by_index[cur]
         nxt = 0
-        for quoted in ex.quotes:
-            if int(quoted) in by_msg_id:
-                nxt = by_msg_id[int(quoted)]
+        # ① 标签式：引用段里的 `[#N]` 直接就是 seq
+        for seq in quoted_labels(ex.question):
+            if seq in by_seq and by_seq[seq] != ex.index:
+                nxt = by_seq[seq]
                 break
+        # ② 文本式：reply_to 是 QQ 消息 id
+        if not nxt:
+            for quoted in ex.quotes:
+                if int(quoted) in by_msg_id and by_msg_id[int(quoted)] != ex.index:
+                    nxt = by_msg_id[int(quoted)]
+                    break
         cur = nxt
     return list(reversed(chain))
 

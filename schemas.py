@@ -7,7 +7,8 @@ Schema 漂移，帮助里显示的参数也就和实际校验对不上。
 from __future__ import annotations
 
 from napcat.command import (
-    BoolField, ChoiceField, CommandSchema, IntField, QQField, StrField, VariadicField,
+    BoolField, ChoiceField, CommandSchema, DurationField, IntField, QQField, StrField,
+    VariadicField,
 )
 
 NAME_MAX = 40
@@ -20,6 +21,9 @@ class NewSchema(CommandSchema):
                     description="会话名称，之后可用名字代替 id 引用")
     attach = BoolField(default=True,
                        description="创建后是否设为当前会话")
+    public = BoolField(default=False,
+                       description="（仅群聊）注册为**公开会话**：本群成员"
+                                   "免邀请即可 attach；上下文对参与者完全共享")
 
 
 class AttachSchema(CommandSchema):
@@ -33,6 +37,17 @@ class AttachSchema(CommandSchema):
 
     session = StrField(required=True, max_length=NAME_MAX,
                        description="会话 id 或名称")
+
+
+class JoinSchema(CommandSchema):
+    """凭**邀请码**加入会话（码由会话所有者 `/aichat invite <会话>` 生成）。
+
+    与 `attach` 分开是刻意的：`attach` 只认会话 id/名称，`join` 只认码 ——
+    否则「一个长得像邀请码的会话名」永远说不清该按哪种解析。
+    """
+
+    code = StrField(required=True, max_length=32,
+                    description="邀请码（6 位字母数字，没有 0/O/1/I/L）")
 
 
 class DetachSchema(CommandSchema):
@@ -225,8 +240,20 @@ class ConfigSchema(CommandSchema):
 
 
 class InviteSchema(CommandSchema):
-    """邀请 / 取消邀请某人参与会话。"""
+    """邀请参与会话：直接邀请某人，或生成**邀请码**（不带 QQ 号时）。
+
+    邀请码用于「不方便直接给 QQ 号」的场景（私聊里把码发给对方，对方
+    `/aichat attach <码>` 就进来了），而且**会过期**、可限次。
+    """
 
     session = StrField(required=True, max_length=NAME_MAX,
                        description="会话 id 或名称（必须是你的）")
-    user_id = QQField(required=True, description="被邀请/被取消的 QQ 号")
+    user_id = QQField(required=False,
+                      description="被邀请的 QQ 号；**不给就生成邀请码**")
+    ttl = DurationField(default=0,
+                        description="邀请码有效期（如 12h / 2d；最长 30 天，"
+                                    "默认 24 小时）")
+    uses = IntField(default=0,
+                    description="邀请码可用次数（默认 1 次，最多 50 次）")
+    revoke = BoolField(default=False,
+                       description="作废这个会话所有未用的邀请码")
