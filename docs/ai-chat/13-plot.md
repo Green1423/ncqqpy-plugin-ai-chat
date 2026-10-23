@@ -6,7 +6,7 @@
 用户说「画个图看看」「这个函数长什么样」「画出 y=x²-4」，模型调 `plot_function`
 把**坐标系 + 曲线**画成一张图发回来。
 
-```
+```text
 plot_function(expression="\frac{\sin x}{x}", x_min=-10, x_max=10)
 plot_function(expression="x^2+y^2=25", x_min=-6, x_max=6)     # 方程（圆）
 plot_function(expression="x=\cos(t), y=\sin(t)")             # 参数方程
@@ -91,7 +91,7 @@ plot_function(expression="x=\cos(t), y=\sin(t)")             # 参数方程
 
 ### 多条曲线画在同一张图（`expressions`）
 
-```
+```text
 plot_function(expressions=["2*x+1", "-x+3"])
 ```
 
@@ -104,7 +104,7 @@ plot_function(expressions=["2*x+1", "-x+3"])
 
 ### 坐标轴省略（断轴）
 
-```
+```text
 plot_function(expression="sin(x)+1000", omit_y="0..999")
 ```
 

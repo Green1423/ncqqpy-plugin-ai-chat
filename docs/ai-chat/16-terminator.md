@@ -1,6 +1,6 @@
 # 十六、结束符
 
-> 文档索引：[docs/README.md](https://github.com/Green1423/ncqqpy/blob/main/docs/README.md) · 上级：[ai_chat 插件](README.md) · 上一章：[网图配图（`fetch_image`）](15-images.md) · 下一章：[持久化与并发](17-persistence.md)
+> 文档索引：[docs/README.md](https://github.com/Green1423/ncqqpy/blob/main/docs/README.md) · 上级：[ai_chat 插件](README.md) · 上一章：[网图配图（`fetch_image`）](15-images.md) · 下一章：[实现参考](https://github.com/Green1423/ncqqpy/blob/main/docs/reference/ai-chat/README.md)
 
 
 **结束符的语义是「这一大段提交上去」**，不是「这一条消息发完了」。
@@ -9,7 +9,7 @@
 最后发一个结束符把它们**按顺序拼成一整段**交给模型。拼接是**直接按换行拼**、
 **不加任何序号**：
 
-```
+```text
 用户：帮我画个图           ← 暂存
 用户：y=sin(x)+1000，      ← 暂存
 用户：x、y 每格 1 个单位    ← 暂存
@@ -47,7 +47,7 @@
 `private:<uid>@group:<gid>` —— 同一个人在「主私聊」和「群小窗」里打字会落到
 **两个不同的暂存区**。线上 `staging.json` 里就明明白白躺着同一个人的两个键：
 
-```
+```text
 private:100000005@group:100000002   2 段
 private:100000005                   4 段
 ```

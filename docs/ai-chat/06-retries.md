@@ -3,7 +3,7 @@
 > 文档索引：[docs/README.md](https://github.com/Green1423/ncqqpy/blob/main/docs/README.md) · 上级：[ai_chat 插件](README.md) · 上一章：[上下文压缩](05-compaction.md) · 下一章：[思考强度（reasoning effort）](07-reasoning.md)
 
 
-```
+```text
 "llm": { "max_retries": 2, "retry_backoff": 1.5, "retry_max_wait": 8.0 }
 ```
 
@@ -43,17 +43,17 @@
 重试用尽后，光甩一句 `LlmError: TimeoutError` 等于没说：用户不知道是网断了、
 额度没了，还是自己的问题太难。`_failure_hint()` 按**是哪种超时**给不同的建议：
 
-```
+```text
 ⚠️ AI 对话出错（E-4c19）：PluginTimeoutError: 超过单次调用总时长上限 270s（已生成 1200 字正文）
 （超过单次 270 秒的上限（没有再重试：同样的输入再跑一遍还是同样的时间）；先把已经生成的部分发给你了。这类问题拆小一点问更快，也可以调大 ai_chat.llm.timeout）
 ```
 
-```
+```text
 ⚠️ AI 对话出错（E-4c19）：PluginTimeoutError: 流式读取停滞 60s（上游不再吐数据，已生成 0 字正文）
 （上游 60 秒没吐任何数据，已重试 2 次，像是它那边卡住了。再发一次通常就好；连续出现就把 ai_chat.llm.stall_timeout 调大）
 ```
 
-> 文案由框架的 `ErrorReporter` 渲染（`napcat/errors.py`）：**群里会 @ 出错时提问的
+> 文案由框架统一渲染：**群里会 @ 出错时提问的
 > 那个人**，括号里是稳定错误编号 —— 用户报编号、`grep` 日志就能定位。
 > 早先那句固定的 `error_prefix` 前缀已经退役（同一类失败在别处会以别的写法出现、
 > 没有编号、也不 @ 人），现在全框架只有一套错误文案。
@@ -86,24 +86,9 @@
 带在 `LlmError.partial` 里**，`_run_turn` 会把它发出去（前面加一句「以下是已经
 生成的部分」），而不是让用户白等一场空。
 
-实现上（`llm._chat_stream`）：
+其它行为：
 
-* 自己攒行缓冲解析 `data:` 行，**不用** `async for line in resp.content` ——
-  aiohttp 的行迭代有 64KB 行长上限（`LineTooLong`），而工具调用的 `arguments`
-  分片、长公式都可能超；半行、`event:`、心跳注释、`[DONE]` 都在 `SseBuffer` 里处理；
-* 工具调用是**按 `index` 累加分片**（`arguments` 常常被切成好几片，实测第一片
-  甚至只有 `""`），最后统一走 `_parse_arguments`；
-* `stream_options.include_usage` 让上游在最后一个 chunk 里带上 `usage` ——
-  否则流式拿不到 token 用量，`/aichat current` 与日志里的统计会突然变 0；
-* 端点如果忽略 `stream`、直接回普通 JSON（Content-Type 不是 `event-stream`），
-  就退回原来的 JSON 解析 —— 所以「开流式」不会因为端点不认就整条路废掉；
-* `timeout` 同时作为 socket 层的硬上限（`timeout + 15`）兜底，防的是「判据逻辑
-  写漏了 → 永久挂住」。
-
-> 为什么之前是 90 秒：那时 `timeout` 是「掐断判据」。流式之后它降级成兜底，
-> 所以默认提到 **270** —— 本部署的网关自己会在 300 秒回 504，留在它下面才能
-> 在掐断时把半截正文交出来（而不是收到一页 HTML 错误）。
->
-> 回归：`test_sse_parse`（纯解析）、`test_llm_stream_cutoff`（起一个本地 aiohttp
-> 假上游，覆盖正常流 / 非 SSE 回退 / 停滞 / 总时长四种）、
-> `test_partial_reply_on_cutoff`（半截真的发给用户）。
+- 上游不支持流式（忽略 `stream`、直接返回普通 JSON）时，自动退回非流式请求，
+  不会因为端点不认流式就整条失败；
+- `timeout` 之外还有一层更宽的硬上限兜底，避免任何情况下永久挂起；
+- 掐断、超时、格式错误都会把**已经生成的部分**发给用户，并附一句说明。

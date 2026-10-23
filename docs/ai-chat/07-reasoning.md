@@ -58,7 +58,7 @@
 
 ## 7.4 命令
 
-```
+```text
 /aichat think                      查看当前生效值 + 会发的 payload
 /aichat think high                 只改当前会话
 /aichat think 8k                   思考预算
@@ -169,6 +169,6 @@
 `ConfigManager` 只在启动时读一次文件。自己改自己（`/aichat think --global_=true`
 之类）会同时更新内存与文件；但**手工编辑文件**后需要：
 
-```
+```text
 /aichat reload --confirm=true       # 超级用户 · 仅私聊
 ```
