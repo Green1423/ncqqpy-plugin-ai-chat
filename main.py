@@ -4074,7 +4074,7 @@ class AiChatPlugin(PluginBase):
                      + ("（会话级）" if self._session_reasoning(session) else "（默认）")
                      + f" · 压缩摘要 {self.compaction_reasoning.spec_for(self.llm.model).label()}")
         # 掐断判据：流式之后「卡死」和「想得久」是两回事，用户排查超时时必须先
-        # 知道现在用的是哪一套（详见 docs/ai-chat.md §5.2.2）
+        # 知道现在用的是哪一套（详见 docs/plugins/ai-chat/05-compaction.md §5.2.2）
         if self.llm.stream:
             lines.append(f"掐断：流式 · 停滞 {self.llm.stall_timeout:.0f}s 判卡死 · "
                          f"单次总上限 {self.llm.timeout:.0f}s")

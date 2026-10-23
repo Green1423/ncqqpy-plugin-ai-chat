@@ -1,6 +1,6 @@
 """命令参数 Schema。
 
-约定（来自 `docs/plugin-dev.md` §4.3.1）：用法行**不手写**，全部由 Schema
+约定（来自 `docs/plugin-dev/04-commands.md` §4.3.1）：用法行**不手写**，全部由 Schema
 经 `napcat.build_usage()` 生成，`<>` = 必填、`[]` = 可选。手写用法行会和
 Schema 漂移，帮助里显示的参数也就和实际校验对不上。
 """

@@ -167,7 +167,7 @@ git clone https://github.com/Green1423/ncqqpy-plugin-ai-chat plugins/ai_chat
 | `（无）` | 全部配置都在 config.json → plugins.ai_chat；LLM key、搜索 key 等也在这里 |
 
 
-详细文档：[`docs/ai-chat.md`](docs/ai-chat.md)。
+详细文档：[`docs/ai-chat/README.md`](docs/ai-chat/README.md)。
 ## 测试
 
 ```bash
