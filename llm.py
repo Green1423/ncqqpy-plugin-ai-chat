@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -270,6 +271,36 @@ class _StreamAcc:
             finish_reason=self.finish, usage=dict(self.usage),
             raw={"stream": True, "chunks": self.chunks,
                  "reasoning_chars": sum(len(x) for x in self.reasoning)})
+
+
+def resolve_secret(raw: str) -> tuple[str, str]:
+    """把配置里的密钥写法解析成真密钥，返回 `(密钥, 错误说明)`。
+
+    支持三种写法：
+
+    | 写法 | 含义 |
+    |---|---|
+    | `sk-xxx` | 字面量（老配置，照旧可用）|
+    | `env:AICHAT` | 从**环境变量** `AICHAT` 读（推荐：密钥不进配置文件）|
+    | `${AICHAT}` | 同上，shell 风格别名 |
+
+    环境变量缺失时返回 `("", "原因")` 而不是抛异常 —— 调用方要把这句话变成
+    用户看得懂的回执（「环境变量 AICHAT 未设置」），而不是一个 traceback。
+    """
+    text = str(raw or "").strip()
+    if not text:
+        return "", "没有配置 api_key"
+    name = ""
+    if text.startswith("env:"):
+        name = text[4:].strip()
+    elif text.startswith("${") and text.endswith("}"):
+        name = text[2:-1].strip()
+    if not name:
+        return text, ""
+    value = os.environ.get(name, "").strip()
+    if not value:
+        return "", (f"环境变量 {name} 未设置（配置里写的是 env:{name}）")
+    return value, ""
 
 
 class LlmClient:

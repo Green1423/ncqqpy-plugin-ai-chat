@@ -61,7 +61,9 @@ from .compaction import (
     WrappingConfig, build_system_prompt, sanitize_history, tool_guidance,
 )
 from .custom_tools import register_config_tools
-from .llm import LlmClient, err_text
+from .capability import CapabilityCache, supports as capability_supports
+from .llm import LlmClient, err_text, resolve_secret
+from .media import KIND_LABELS, MediaItem, MediaStore, parse_markers
 from .reasoning import (
     DIALECTS, LEVELS, VALIDATION_HINT, ReasoningPolicy, ReasoningSpec,
     override_text, spec_from_text,
@@ -83,7 +85,8 @@ from .store import (
     SentReplyIndex, Session, SessionStore, normalize_code,
 )
 from .tools import (ToolContext, ToolRegistry, register_builtin_tools,
-                    register_image_tool, register_plot_tool, register_web_tools)
+                    register_image_tool, register_plot_tool, register_skill_tools,
+                    register_web_tools)
 from .webimg import WebImageService
 from . import schemas as S
 
@@ -132,6 +135,26 @@ DEFAULT_CONFIG: dict = {
     # ---- 网图配图（工具 fetch_image）----
     # 让模型能把网上的图片**配在回复里**发给用户（QQ 直接显示成图片）。
     # 依赖 `search.enabled`（下载复用搜索那套 HTTP 客户端与 SSRF 闸）。
+    # 多模态（用户发来的图片/视频/语音）：
+    #   image/audio 开不开这一类**输入**；能不能真用还得看模型（探测结果见
+    #   `data/capabilities.json`，换模型自动重探）。
+    #   `keep_files` 是本地缓存的媒体数量上限，`max_bytes` 是单条媒体的下载上限，
+    #   `max_side` 是图片缩到的最长边（多模态接口对尺寸敏感）。
+    # 别的插件注册的技能（`@self.register_skill(...)`，见 napcat.skills）。
+    #   enabled=false 全关；allow 非空时只接名单；deny 排除名单。
+    "skills": {
+        "enabled": True,
+        "allow": [],
+        "deny": [],
+    },
+    "multimodal": {
+        "enabled": True,
+        "image": True,
+        "audio": True,
+        "max_bytes": 4194304,
+        "max_side": 1568,
+        "keep_files": 200,
+    },
     "web_image": {
         "enabled": True,
         "max_bytes": 8 * 1024 * 1024,   # 单张上限（超过就拒绝，不发半张图）
@@ -328,6 +351,16 @@ def deep_merge(base: dict, override: dict) -> dict:
 
 # ==================== 插件 ====================
 
+class _EmptySkills:
+    """空技能表：进程里的框架还没有技能通道时的占位（见 `_build_tools`）。"""
+
+    def list(self, *, exclude: Optional[str] = None) -> list:
+        return []
+
+    def get(self, name: str):
+        return None
+
+
 class AiChatPlugin(PluginBase):
     name = "ai_chat"
     version = "1.0.0"
@@ -409,6 +442,8 @@ class AiChatPlugin(PluginBase):
         #: 没有它的话 `_schedule_submit` 会**静默丢掉**这次提交：用户发了内容又发了
         #: 结束符，却什么都不发生（不回答、不报错），看起来就是机器人死了（实测复现）。
         self._pending_submit: set[str] = set()
+        #: 密钥解析失败的原因（`env:AICHAT` 没设时给用户一句人话）
+        self._key_error: str = ""
         #: 「这条会话正在消化一条消息」的计数（按 `conversation_key`）。
         #: ⚠️ 从收到消息到内容落进暂存区之间要 await 若干次 `get_msg`，而框架给
         #: **每次** API 调用都加了 `api_delay`（线上 1~5 秒）—— 引用一条消息、再追
@@ -432,6 +467,16 @@ class AiChatPlugin(PluginBase):
         #: 网图配图服务：下载 + 魔数校验 + 落盘白名单（同 plots 那套规矩）
         self.webimg = WebImageService(cfg=dict(self.cfg.get("web_image") or {}),
                                       logger=self.logger, data_dir=self._data_dir)
+        #: 多模态（用户发来的图片/视频/语音）：落地、编号、编码成 content part
+        mm = dict(self.cfg.get("multimodal") or {})
+        self.media = MediaStore(
+            self._data_dir,
+            max_bytes=int(mm.get("max_bytes") or 4 * 1024 * 1024),
+            max_side=int(mm.get("max_side") or 1568),
+            keep_files=int(mm.get("keep_files") or 200))
+        #: 「这模型收不收图片/音频」的探测结果（按 base_url+model 缓存）
+        self.capabilities = CapabilityCache(
+            os.path.join(self._data_dir, "capabilities.json"), logger=self.logger)
 
         if not self.llm.enabled:
             self.logger.warning(
@@ -459,6 +504,24 @@ class AiChatPlugin(PluginBase):
                 register_image_tool(self.tools)
         register_config_tools(self.tools, self.cfg["tools"].get("custom") or [],
                               logger=self.logger)
+        # 别的插件注册的技能（`@self.register_skill(...)`，见 `napcat.skills`）：
+        # 每轮动态读，所以热重载/卸载的插件不会留下死工具
+        skills = getattr(self, "skills", None)
+        if skills is None:
+            # 框架加了 `napcat.skills`，但**框架代码要重启进程**才生效；
+            # 热重载只换插件代码。这时绝不能崩：对话是主功能，技能是锦上添花。
+            self.logger.warning(
+                "[ai_chat] 当前进程里的框架没有技能表（napcat.skills）——"
+                "技能工具暂不提供，重启进程（systemctl restart ncqqpy）后生效")
+            register_skill_tools(
+                self.tools, skills=_EmptySkills(),
+                cfg=lambda: {"enabled": False}, logger=self.logger)
+            return
+        register_skill_tools(
+            self.tools, skills=skills,
+            # 传取值函数而不是快照：配置改了（含热重载）立刻生效
+            cfg=lambda: self.cfg.get("skills") or {},
+            logger=self.logger)
 
         @self.on_message()
         async def _on_any_message(event: MessageEvent):
@@ -759,8 +822,11 @@ class AiChatPlugin(PluginBase):
         直接断言 `_build_llm().stream`（见 `test_llm_stream_wiring`）。
         """
         llm = self.cfg["llm"]
+        key, why = resolve_secret(llm.get("api_key", ""))
+        # 记下「为什么没密钥」—— 用户看到的是回执里那句话，不是 traceback
+        self._key_error = why
         return LlmClient(
-            base_url=llm["base_url"], api_key=llm["api_key"], model=llm["model"],
+            base_url=llm["base_url"], api_key=key, model=llm["model"],
             max_tokens=llm["max_tokens"], temperature=llm["temperature"],
             timeout=llm["timeout"], stream=bool(llm.get("stream", True)),
             stall_timeout=llm.get("stall_timeout", 60),
@@ -1495,6 +1561,25 @@ class AiChatPlugin(PluginBase):
             # 引用内容在**剥完结束符之后**才拼上去（见 _extract_text_async 的说明）
             text += await self._quoted_suffix(event, session)
 
+            # ---- 多模态：这条消息里的语音 ----
+            # 语音**总是**传给模型（一轮里所有语音一起发，视为一条对话），所以
+            # 到达时就落地编号。图片不在这里下载：按规则，图片必须由用户
+            # `/aichat mark` 显式标记（见 `_do_mark`）—— 见 `docs/.../17-multimodal.md`。
+            picked: list = []
+            media_items = await self._ingest_media(event, session)
+            if media_items:
+                # 取不到的媒体也要留标号（否则模型不知道「这儿本来有张图」），
+                # 但补一句「未取到」—— 免得它对着一个空标号编内容
+                marks = []
+                for m in media_items:
+                    if not m.marker():
+                        continue
+                    marks.append(m.marker() if m.ok
+                                 else f"{m.marker()}（未取到）")
+                if marks:
+                    text = (text.rstrip() + "\n" + " ".join(marks)).strip()
+                media = ""      # 已经有真媒体了，不要再写「（其中含图片，未读取）」
+
             # 服务范围（白名单）—— 与权限等级无关，不做超级用户豁免。
             # ⚠️ 必须放在「是不是命令」的判定**之后**：管理服务范围本身的命令
             # （`/aichat add`/`del`/`targets` 等）必须能在未开通的私聊里执行，否则会死锁 ——
@@ -1530,7 +1615,7 @@ class AiChatPlugin(PluginBase):
                 return
 
             self._stage(target, event, body, explicit_finish=finished, media=media,
-                        md=md_mode)
+                        md=md_mode, media_items=media_items, media_pick=picked)
         finally:
             self._end_ingest(ingest_key)
 
@@ -1568,6 +1653,125 @@ class AiChatPlugin(PluginBase):
     _QUOTE_CHAIN_MAX = 3
     #: 用 **标号** 指代的链最多追几层（不联网、不花钱，可以给得宽一点）
     _QUOTE_LABEL_MAX = 10
+
+    # ---------------- 多模态 ----------------
+
+    async def _ingest_media(self, event: MessageEvent,
+                            session: Optional[Session] = None) -> list:
+        """把这条消息里的图片/视频/语音**落地并编号**（失败也返回物件，带原因）。
+
+        编号是**会话内**自增的（`session.meta["media_seq"]`），并且随消息的
+        `metadata["media"]` 落盘 —— 所以「[图#3]」在任何时候（重启、压缩后）
+        都指同一张图。模型只看到标号，要不要真的把字节传过去由
+        `metadata["media_pick"]` / 引用关系决定（见 `compaction.project`）。
+        """
+        message = getattr(event, "message", None)
+        if not isinstance(message, list) or not self.media:
+            return []
+        items: list = []
+        for seg in message:
+            if not isinstance(seg, dict):
+                continue
+            kind = str(seg.get("type") or "")
+            # 只有语音在这里落地；图片走 `/aichat mark`（未标记的一律不下载）
+            if kind != "record":
+                continue
+            data = seg.get("data") or {}
+            url = str(data.get("url") or data.get("file") or "")
+            if not url:
+                continue
+            num = 0
+            if session is not None:
+                meta = session.meta if isinstance(session.meta, dict) else {}
+                num = int(meta.get("media_seq") or 0) + 1
+                meta["media_seq"] = num
+                self.store.touch(session.id)      # 编号也要落盘
+            item = await self.media.fetch(url, kind, num=num, session=session)
+            items.append(item)
+            if not item.ok and self.cfg.get("log_verbose"):
+                self.logger.info("[ai_chat] 媒体落地失败（%s #%s）：%s",
+                                 kind, num, item.note)
+        return items
+
+    @staticmethod
+    def _media_capability_note(caps: dict) -> str:
+        """告诉模型「这一轮你到底能看到/听到什么」。
+
+        为什么要说：媒体默认只给**标号**（`[图#3]`），字节按需才传。模型不知道
+        哪些标号背后真有图，容易瞎猜「图里是…」；能力探测结果也直接影响它该不该
+        承认「我看不到」。这段话只在真有媒体能力时才出现，不然占 token。
+        """
+        can_img = bool(caps.get("image"))
+        can_audio = bool(caps.get("record"))
+        if not can_img and not can_audio:
+            return ("这个模型**不能看图片、也不能听语音**：消息里的 `[图#N]`、"
+                    "`[视频#N]`、`[语音#N]` 只是占位标号，你看不到里面的内容。"
+                    "需要图里的信息时，请让用户用文字描述，或说明你看不到 —— "
+                    "不要假装看到了。")
+        bits = ["这个模型支持："]
+        bits.append("图片输入（标号 `[图#N]`）" if can_img else "**不支持**图片输入")
+        bits.append("语音输入（标号 `[语音#N]`）" if can_audio else "**不支持**语音输入")
+        text = "，".join(bits) + "。"
+        text += ("图片/视频**只有**用户点名（`[图#N]`）或被引用的那几条会被真的传给你，"
+                 "其余只有标号 —— 看不到就直接说看不到，不要猜。")
+        return text
+
+    def _media_to_include(self, media_meta: list, picks: list, *, session: Session,
+                          meta: dict, caps: dict) -> list[tuple[str, int]]:
+        """算「这一轮真的要把哪些媒体交给模型」，返回 `[(kind, num)]`。
+
+        规则（用户定的，见 docs §17）：
+
+        * **图片**：只有 `/aichat mark` 标记过的才传（`picks` 里就是它们）；
+          引用一条含图的消息**不会**自动传 —— 没标记就是没标记。
+        * **语音**：到达时落地、**全部**传（一轮里所有语音一起发，视为一条对话）。
+        * 模型收不了的那一路一律不传：传了只会 400/500，不如只留标号，
+          让模型如实说「我看不到/听不到」。
+
+        视频整条路径已删（OpenAI 协议里没有标准视频 part）。
+        """
+        wanted: list[tuple[str, int]] = []
+        by_num = {}
+        for m in media_meta:
+            if not isinstance(m, dict):
+                continue
+            try:
+                by_num[(str(m.get("kind") or ""), int(m.get("num") or 0))] = m
+            except (TypeError, ValueError):
+                continue
+        for pair in picks or []:
+            try:
+                kind, num = str(pair[0]), int(pair[1])
+            except (TypeError, ValueError, IndexError):
+                continue
+            if (kind, num) in by_num:
+                wanted.append((kind, num))
+        # 语音：全部（不筛）
+        for kind, num in by_num:
+            if kind == "record" and num > 0:
+                wanted.append((kind, num))
+        out: list[tuple[str, int]] = []
+        for pair in wanted:
+            key = "record" if pair[0] == "record" else "image"
+            if not caps.get(key):
+                continue
+            if pair not in out:
+                out.append(pair)
+        return out
+
+    async def _capabilities(self, llm) -> dict:
+        """本轮模型收不收图片/音频（探测结果带缓存；探测不出来就按不支持走）。"""
+        mm = self.cfg.get("multimodal") or {}
+        if not bool(mm.get("enabled", True)):
+            return {"image": False, "record": False}
+        out = {"image": False, "record": False}
+        if bool(mm.get("image", True)):
+            out["image"] = await capability_supports(
+                llm, self.capabilities, "image")
+        if bool(mm.get("audio", True)):
+            out["record"] = await capability_supports(
+                llm, self.capabilities, "record")
+        return out
 
     async def _extract_text_async(self, event: MessageEvent,
                                   session: Optional[Session] = None,
@@ -1698,9 +1902,13 @@ class AiChatPlugin(PluginBase):
                 own = self._own_message(cur)
                 if own is None:
                     # 别人的图/语音：读不到内容，但**不能因此丢掉用户的问题** ——
-                    # 留一句提示占住引文的位置，用户写的正文照常提交
-                    out.append(f"\n[引用上文] 对方引用的是一条{media}"
-                               f"（暂不支持多模态，读不到里面的内容）。")
+                    # 留一句提示占住引文的位置，用户写的正文照常提交。
+                    # 措辞要跟当前规则一致：图片**不会**因为被引用就传过来，
+                    # 得 `/aichat mark`；历史语音不重传。
+                    hint = (f"引用它不会自动传给我：让用户引用这条并发 "
+                            f"/aichat mark 我才能看到" if media == "图片"
+                            else "历史语音不重传，这一条我听不到")
+                    out.append(f"\n[引用上文] 对方引用的是一条{media}（{hint}）。")
                     break
                 text = (f"（这是机器人自己发的{media}，"
                         f"以下是它当时生成的原文）\n{own.text}")
@@ -1789,13 +1997,104 @@ class AiChatPlugin(PluginBase):
             elif stype in self._MEDIA_SEGMENTS and not media:
                 media = self._MEDIA_LABELS.get(stype, "多媒体内容")
         body = "".join(parts).strip()
+        note = self._media_note(media) if media else ""
         if body:
             # 同时带图带字：正文可用，把图的存在说清楚（不丢信息也不越界）
-            note = f"（其中含{media}，未读取）" if media else ""
             return (f"{sender}：{body}{note}" if sender else f"{body}{note}"), "", nested
         if media:
             return "", media, nested
         return "", "", nested
+
+    async def _do_mark(self, params, event: MessageEvent) -> str:
+        """`/aichat mark [序号]` —— 标记**引用消息里的图片**，让模型能看到它。
+
+        规则（用户定的）：
+
+        * 图片**不下载、不编号、不传**，直到这一步；
+        * 引用里只有一张 → 不用给序号；多张 → 用序号挑（从 1 数起）；
+        * 标完回一个标号（`[图#3]`），**下一条提问**会把它一起交给模型；
+        * 引用的那条里没有图片 → 明说，别让用户以为标上了。
+
+        为什么编号在这里分配而不是消息到达时：绝大多数图跟问题无关，
+        到达就下载既费流量又费存储；而且「编号」对用户的意义是「我要用这张」。
+        """
+        target = self._target_of(event)
+        uid = int(event.user_id)
+        reply_id = self._reply_message_id(event)
+        if not reply_id:
+            return ("要标记哪张图？**引用**一条含图片的消息，再发 /aichat mark。\n"
+                    "（例：长按那张图 → 引用 → 发送 /aichat mark）")
+        session = self._session_for(target, event)
+        if session is None:
+            return "这个聊天还没有会话：先 /aichat new <名称> 建一个"
+        datas, meta = await self._quoted_message_data(reply_id)
+        if not datas:
+            return (f"读不到被引用的消息（{reply_id}）—— 可能已被撤回或删除")
+        pics = [d for d in datas
+                if isinstance(d, dict) and str(d.get("type") or "") == "image"]
+        if not pics:
+            return ("被引用的消息里**没有图片**。要让我看图，请引用**带图的那条**"
+                    "再发 /aichat mark。")
+        want = int(getattr(params, "index", 0) or 0)
+        if want <= 0:
+            if len(pics) > 1:
+                return (f"被引用的消息里有 **{len(pics)} 张图**，请指定第几张：\n"
+                        f"/aichat mark 1 ～ /aichat mark {len(pics)}")
+            want = 1
+        if want > len(pics):
+            return f"被引用的消息里只有 {len(pics)} 张图，没有第 {want} 张"
+        seg = pics[want - 1]
+        data = seg.get("data") or {}
+        url = str(data.get("url") or data.get("file") or "")
+        if not url:
+            return "这张图没有可下载的地址（QQ 没给 url）—— 可以重发一次再标"
+        num = int(session.meta.get("media_seq") or 0) + 1
+        session.meta["media_seq"] = num
+        self.store.touch(session.id)
+        item = await self.media.fetch(url, "image", num=num, session=session)
+        if not item.ok:
+            return f"⚠️ 这张图取不到：{item.note}\n（可以重发一次，或换一张）"
+        record = item.to_dict()
+        record["marker"] = item.marker()      # 只有标记、没正文时用它拼正文
+        self.buffer.add_mark(target.conversation_key, record)
+        return (f"🎯 已标记 {item.marker()}（{item.size // 1024 or 1}KB）\n"
+                f"下一条提问会把它一起交给模型 —— 直接问「这张图里是什么」就行。\n"
+                f"（临时标记：提交一次后失效；要再看得重新标记）")
+
+    async def _quoted_message_data(self, message_id: int):
+        """读被引用消息的**原始段**（`[(段, 发送者)]` 与消息元数据）。
+
+        优先用会话历史里的记录（本地、快）；历史里没有才 `get_msg` ——
+        框架给每次 API 调用加了 1~5 秒节流，能省一次是一次。
+        """
+        message = self._own_message(int(message_id))
+        if message is not None:
+            return list((message.metadata or {}).get("segments") or []), {}
+        try:
+            got = await self.client.api.get_msg(message_id=int(message_id))
+        except Exception:  # noqa: BLE001 - 读不到就是读不到，由调用方给话术
+            return [], {}
+        if isinstance(got, dict) and "data" in got and isinstance(got["data"], dict):
+            got = got["data"]
+        if not isinstance(got, dict):
+            return [], {}
+        raw = got.get("message")
+        datas = raw if isinstance(raw, list) else []
+        return datas, got
+
+    @staticmethod
+    def _media_note(media: str) -> str:
+        """正文里那句「这儿有个媒体，但我看不到」。
+
+        图片必须由用户 `/aichat mark` 显式标记才会被下载和传过去（按需，不默认
+        全传），所以这里不只是说「未读取」，还要**告诉用户怎么让它被看到** ——
+        否则用户只会觉得「机器人瞎了」。
+        """
+        if media in ("图片", "图片/表情"):
+            return ("（含一张图片，未标记：引用这条消息并发送 /aichat mark 我才能看到它）")
+        if media == "语音":
+            return "（含一条语音）"
+        return f"（其中含{media}，未读取）"
 
     def _extract_text(self, event: MessageEvent) -> str:
         """把消息段转成给模型看的文本（只支持文字；其它类型转成说明）。"""
@@ -1913,7 +2212,9 @@ class AiChatPlugin(PluginBase):
             await asyncio.sleep(0.1)
 
     def _stage(self, target: ChatTarget, event: MessageEvent, body: str, *,
-               explicit_finish: bool, media: str = "", md: bool = False) -> None:
+               explicit_finish: bool, media: str = "", md: bool = False,
+               media_items: Optional[list] = None,
+               media_pick: Optional[list] = None) -> None:
         trigger = self.cfg["trigger"]
         item = {
             "user_id": int(event.user_id),
@@ -1933,6 +2234,10 @@ class AiChatPlugin(PluginBase):
             "group_id": int(event.group_id) if event.group_id else 0,
             # 这一段的引用目标是不是多媒体（提交时才回绝，见 _extract_text_async）
             "media": media,
+            #: 这条消息自带的媒体（图片/视频/语音），已落地并编好号
+            "media_items": [m.to_dict() for m in (media_items or [])],
+            #: 用户**自己写的**标号（`[图#3]`），要真正传给模型的那几张
+            "media_pick": [[k, int(n)] for k, n in (media_pick or [])],
             # 这一段是不是用 `//md` 提交的（Markdown 模式：回答渲染成图片）
             "md": bool(md),
         }
@@ -1963,12 +2268,16 @@ class AiChatPlugin(PluginBase):
             # 内容永远卡在暂存区里，直到用户再按一次提交键）。
             self._pending_submit.add(key)
             return
+        # ⚠️ 顺序：**先**取 marks，再 take()。`take()` 弹的是整份状态
+        # （items + marks 一起），先 take 的话标记就跟着没了 —— 实测：
+        # `/aichat mark` 明明记上了，提交时 compose 拿到的 marks 是 0。
+        marks = self.buffer.marks(key)
         items = self.buffer.take(key)
-        if not items:
+        if not items and not marks:
             return
         self._inflight.add(key)
         task = asyncio.get_event_loop().create_task(
-            self._submit_guarded(target, items))
+            self._submit_guarded(target, items, marks=marks))
         self._tasks.add(task)
         task.add_done_callback(self._tasks.discard)
 
@@ -1985,9 +2294,9 @@ class AiChatPlugin(PluginBase):
         texts = [t for t in texts if t]
         return "\n".join(texts)
 
-    def _compose_meta(self, items: list[dict]) -> dict:
-        first = items[0]
-        last = items[-1]
+    def _compose_meta(self, items: list[dict], *, marks: Optional[list] = None) -> dict:
+        first = items[0] if items else {}
+        last = items[-1] if items else {}
         return {
             "user_id": int(last.get("user_id") or 0),
             "nickname": str(last.get("nickname") or ""),
@@ -2006,11 +2315,20 @@ class AiChatPlugin(PluginBase):
             "parts": len(items),
             # 本次输入是否 Markdown 模式：任一段带了 md 就算
             "md": any(bool(it.get("md")) for it in items),
+            # 本轮自带的多媒体（语音在到达时落地）+ `/aichat mark` 标好的图片
+            "media": ([m for it in items for m in (it.get("media_items") or [])]
+                      + [m for m in (marks or []) if isinstance(m, dict)]),
+            #: 要真传给模型的媒体：**标记过的图片** + 全部语音（见 `_media_to_include`）
+            "media_pick": [["image", int(m.get("num") or 0)]
+                           for m in (marks or []) if isinstance(m, dict)],
+            #: 只有标记、没有文字时，正文就是标号本身
+            "marks_only": not any(str(it.get("text") or "").strip() for it in items),
         }
 
     # ---------------- 一轮对话 ----------------
 
-    async def _submit_guarded(self, target: ChatTarget, items: list[dict]) -> None:
+    async def _submit_guarded(self, target: ChatTarget, items: list[dict], *,
+                              marks: Optional[list] = None) -> None:
         key = target.conversation_key
         try:
             # ⚠️ 引用的是图片/语音时**不再整轮回绝**。用户要的是「把能提交的
@@ -2019,9 +2337,18 @@ class AiChatPlugin(PluginBase):
             # 而不是把整条输入扔掉。原来那样做，用户问「这张图里是什么」会被直接
             # 打回，连问题都没进模型。
             text = self._compose_input(items)
-            if not text:
+            # 只有标记、没有文字也算一次提交（用户可能就想「把这张图给它看」）
+            marks = list(marks or [])
+            if not text and not marks:
                 return
-            meta = self._compose_meta(items)
+            meta = self._compose_meta(items, marks=marks)
+            if marks:
+                # 标号写进正文：模型这一轮就能用 `[图#1]` 指代它，用户也看得见编号
+                # （只发了 /aichat mark 就提交时，正文就是这几个标号）
+                sign = " ".join(str(m.get("marker") or "") for m in marks
+                                if m.get("marker"))
+                if sign:
+                    text = (f"{text.rstrip()}\n{sign}" if text.strip() else sign)
             event = _FakeEvent(target, meta, text)
             session = self._session_for(target, event)
             if session is None:
@@ -2060,6 +2387,15 @@ class AiChatPlugin(PluginBase):
                         meta: dict) -> None:
         """执行一轮：追加用户消息 → 模型/工具循环 → 发送回复。"""
         started = time.time()
+        # 这一轮要**真的**传给模型哪些媒体：
+        #   ① 用户点名的标号（`[图#3]`）
+        #   ② 引用到的消息里的媒体（「引用这张图」= 我要你看着它回答）
+        #   ③ 语音：全传（用户的要求：语音视为一条对话，不做筛选）
+        # 再按模型能力过滤 —— 模型收不了的类型，只留标号、不传字节。
+        caps = await self._capabilities(self.llm)
+        media_meta: list = [m for m in (meta.get("media") or []) if isinstance(m, dict)]
+        include = self._media_to_include(media_meta, meta.get("media_pick") or [],
+                                         session=session, meta=meta, caps=caps)
         message = user_message(
             text,
             origin=("user.group" if target.is_group else "user.private"),
@@ -2073,6 +2409,9 @@ class AiChatPlugin(PluginBase):
             # 在**本地**追上文，不必每层再付一次 get_msg（框架节流 1~5 秒）
             reply_to=int(meta.get("reply_to") or 0),
             parts=int(meta.get("parts") or 1),
+            # 这条消息自带的媒体（含编号与本地文件）与「本轮真的传了哪些」
+            media=media_meta,
+            media_include=[list(x) for x in include],
         )
         self.store.append(session.id, message)
 
@@ -2094,7 +2433,7 @@ class AiChatPlugin(PluginBase):
         system_prompt = self._system_prompt(
             target, session, meta, ctx,
             multi_user=self._is_multi_user(session, history),
-            md=bool(meta.get("md")))
+            md=bool(meta.get("md")), caps=caps)
         comp_cfg = self.cfg["compaction"]
 
         # 进模型之前先按压力压缩（不等上游报超长）
@@ -2595,7 +2934,8 @@ class AiChatPlugin(PluginBase):
 
     def _system_prompt(self, target: ChatTarget, session: Session, meta: dict,
                        ctx: ToolContext, *, multi_user: bool = False,
-                       md: bool = False) -> str:
+                       md: bool = False,
+                       caps: Optional[dict] = None) -> str:
         extra: list[str] = []
         configured = str(self.cfg["wrapping"]["system_prompt"] or "").strip()
         if configured:
@@ -2603,6 +2943,8 @@ class AiChatPlugin(PluginBase):
         # 「是否多人共用」按**历史里实际出现过几个人**判断，而不是按归属种类：
         # 共享有两个来源 —— 群归属的会话被多人用，或个人会话邀请了别人参与。
         # 只看归属会漏掉后者（那是邀请制的主要用法）。
+        if caps is not None:
+            extra.append(self._media_capability_note(caps))
         if multi_user or session.guests:
             owner = session.owner_label
             extra.append(
@@ -3078,6 +3420,12 @@ class AiChatPlugin(PluginBase):
                                description="切换你在此处的当前会话")
         async def cmd_attach(params, event: MessageEvent):
             return self._do_switch(params.session, event)
+
+        @self.register_command(f"{A}.mark", schema=S.MarkSchema, permission="",
+                               scope="all",
+                               description="标记引用里的图片，让模型能看到它")
+        async def cmd_mark(params, event: MessageEvent):
+            return await self._do_mark(params, event)
 
         @self.register_command(f"{A}.join", schema=S.JoinSchema, permission="",
                                scope="all",
@@ -4370,6 +4718,21 @@ class _StagingBuffer:
         state["items"] = state["items"][-self.max_parts * 2:]
         self.save()
         return state
+
+    def marks(self, key: str) -> list[dict]:
+        """这个聊天里**已标记、还没送出去**的媒体（`/aichat mark` 放的）。"""
+        return list((self._data.get(key) or {}).get("marks") or [])
+
+    def add_mark(self, key: str, item: dict) -> None:
+        state = self._data.setdefault(key, {"items": [], "since": time.time()})
+        marks = list(state.get("marks") or [])
+        # 同一张图（按标号认）只留一份；重复标记不该重复传
+        if any(int(m.get("num") or 0) == int(item.get("num") or 0) for m in marks):
+            return
+        marks.append(item)
+        state["marks"] = marks[-8:]              # 一次提交最多带 8 张，够用
+        state["updated"] = time.time()
+        self.save()
 
     def take(self, key: str) -> list[dict]:
         state = self._data.pop(key, None)

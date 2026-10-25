@@ -29,6 +29,7 @@ from typing import Optional
 
 from .llm import LlmClient, LlmError, err_text
 from .reasoning import override_text
+from .media import MediaItem
 from .segments import (
     BLOCK_TOOL_CALL, BLOCK_TOOL_RESULT, Message, ORIGIN_COMPACT,
     ORIGIN_USER_GROUP, ORIGIN_USER_PRIVATE, ROLE_ASSISTANT, ROLE_SYSTEM,
@@ -142,8 +143,10 @@ class DshWrapping:
                 if not rendered.strip():
                     continue
                 # 不改写原消息，只改投影结果（历史里保留原始文本）
+                content = self._label(m, rendered)
+                parts = self._media_parts(m, content)
                 out.append({"role": ROLE_USER,
-                            "content": self._label(m, rendered)})
+                            "content": parts if parts else content})
                 continue
             api = m.to_api_message()
             # 只给**有正文的对话消息**编号：`tool` 结果与「只发起工具调用」的
@@ -154,6 +157,43 @@ class DshWrapping:
                 api["content"] = self._label(m, text)
             out.append(api)
         return out
+
+    def _media_parts(self, m: Message, body: str) -> Optional[list]:
+        """把「这一轮真的选了要传」的媒体拼成 OpenAI content 数组。
+
+        规则（与 `main._media_to_include` 一致）：只有 `metadata["media_include"]`
+        里点名的媒体才附加字节；没点名的只留标号 `[图#3]` —— 模型知道「这儿有张图」，
+        但拿不到它。这是**按需**的核心：群聊里绝大多数图与问题无关，全传既贵又噪声。
+
+        历史重放用的是**当轮**的 `media_include`（落盘时固化的），所以后面再引用
+        这些消息不会「重新长出」图片 —— 上下文与当时模型看到的完全一致。
+        """
+        items = m.metadata.get("media") if isinstance(m.metadata, dict) else None
+        include = m.metadata.get("media_include") if isinstance(m.metadata, dict) else None
+        if not items or not include:
+            return None
+        wanted = set()
+        for pair in include:
+            try:
+                wanted.add((str(pair[0]), int(pair[1])))
+            except (TypeError, ValueError, IndexError):
+                continue
+        if not wanted:
+            return None
+        parts: list[dict] = [{"type": "text", "text": body}]
+        for raw in items:
+            if not isinstance(raw, dict):
+                continue
+            try:
+                key = (str(raw.get("kind") or ""), int(raw.get("num") or 0))
+            except (TypeError, ValueError):
+                continue
+            if key not in wanted:
+                continue
+            part = MediaItem.from_dict(raw).payload_part()
+            if part:
+                parts.append(part)
+        return parts if len(parts) > 1 else None
 
     def _label(self, m: Message, body: str) -> str:
         """给一段正文加 `[#N] ` 前缀（N = 该消息的会话内 seq）。

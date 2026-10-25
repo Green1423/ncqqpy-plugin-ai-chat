@@ -56,3 +56,21 @@
 只允许 http/https，强制超时。
 
 ---
+
+## 别的插件提供的技能
+
+除了上面的内置工具与 `tools.custom`，**别的插件**还能通过框架的技能通道
+（`@self.register_skill(...)`，见 [技能](https://github.com/Green1423/ncqqpy/blob/main/docs/plugin-dev/17-skills.md)）把自己的能力
+交给模型：`byrdocs` 的「搜资料」、`bupt_news` 的「通知检索 / 最近通知 / 通知详情 /
+第二课堂活动」（`bupt_news.search` / `recent` / `notice` / `activities`）等都以这种形式出现。
+
+对使用者来说它们就是普通工具：模型在对话里自己决定调不调。唯一的区别是
+**从哪来的** —— 描述前面会带提供方，例如 `[byrdocs] 在 BYR Docs 资料库里搜索…`。
+
+关掉/收窄口径：
+
+```json
+"skills": {"enabled": true, "allow": [], "deny": ["byrdocs.search"]}
+```
+
+`ai_chat` 每轮重新读技能表，所以装/卸/热重载插件之后**不用重启**。

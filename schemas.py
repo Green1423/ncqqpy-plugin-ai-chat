@@ -39,6 +39,21 @@ class AttachSchema(CommandSchema):
                        description="会话 id 或名称")
 
 
+class MarkSchema(CommandSchema):
+    """**标记引用里的图片**，让它能被模型看到。
+
+    用法：引用一条含图片的消息，然后发 `/aichat mark`。
+    引用里只有一张图时可以不带序号；多张时用序号挑（从 1 数起）。
+
+    为什么要有这个命令：多模态按需（见 docs §17）—— 不标记的图不下载、
+    不传给模型。标记完会回一个标号（`[图#3]`），下一条提问就把它一起带上。
+    """
+
+    index = IntField(default=0, min=0,
+                     description="第几张（引用里的第几张，从 1 数起；"
+                                 "只有一张时可以不给）")
+
+
 class JoinSchema(CommandSchema):
     """凭**邀请码**加入会话（码由会话所有者 `/aichat invite <会话>` 生成）。
 

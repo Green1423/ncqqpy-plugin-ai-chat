@@ -100,6 +100,8 @@ class ToolRegistry:
     def __init__(self, logger=None) -> None:
         self.logger = logger
         self._tools: dict[str, Tool] = {}
+        #: 动态工具来源（见 `set_provider`）
+        self._provider = None
 
     # ---- 注册 ----
 
@@ -134,6 +136,28 @@ class ToolRegistry:
     def names(self) -> list[str]:
         return sorted(self._tools)
 
+    # ---- 动态来源（别的插件注册的技能）----
+
+    def set_provider(self, provider) -> None:
+        """挂一个**动态工具来源**：`provider(ctx) -> list[Tool]`。
+
+        为什么是"每轮重算"而不是"加载时快照"：提供技能的插件会热重载、
+        会被禁用/卸载 —— 快照下来的工具会指向已经死掉的 handler（调用时才炸，
+        模型只会看到一句莫名其妙的异常）。
+        """
+        self._provider = provider
+
+    def dynamic(self, ctx: ToolContext) -> list[Tool]:
+        if self._provider is None:
+            return []
+        try:
+            got = self._provider(ctx)
+        except Exception as e:  # noqa: BLE001 - 技能表坏了也不能让整轮对话失败
+            if self.logger:
+                self.logger.warning("[ai_chat] 技能列表取用失败: %r", e)
+            return []
+        return [t for t in got or [] if isinstance(t, Tool)]
+
     # ---- 可见性 ----
 
     def visible(self, ctx: ToolContext) -> list[Tool]:
@@ -144,6 +168,16 @@ class ToolRegistry:
             if t.group_only and not ctx.in_group:
                 continue
             if t.requires_moderation and not (ctx.can_moderate or ctx.is_superuser):
+                continue
+            if t.superuser_only and not ctx.is_superuser:
+                continue
+            out.append(t)
+        # 动态工具（别的插件的技能）：同名以内置为准，避免技能盖掉内置工具
+        taken = {t.name for t in out}
+        for t in self.dynamic(ctx):
+            if t.name in taken or t.name in self._tools:
+                continue
+            if t.group_only and not ctx.in_group:
                 continue
             if t.superuser_only and not ctx.is_superuser:
                 continue
@@ -159,7 +193,12 @@ class ToolRegistry:
         """执行工具。返回 `(结果文本, 是否失败)` —— **永不抛异常**。"""
         tool = self._tools.get(name)
         if tool is None:
-            return (f"没有名为 `{name}` 的工具。可用工具：{', '.join(self.names())}", True)
+            # 也可能是别的插件注册的技能（动态工具）
+            tool = next((t for t in self.dynamic(ctx) if t.name == name), None)
+        if tool is None:
+            avail = self.names() + [t.name for t in self.dynamic(ctx)]
+            return (f"没有名为 `{name}` 的工具。可用工具：{', '.join(sorted(avail))}",
+                    True)
         # 二次权限校验：模型可能被诱导去调用调用者无权使用的工具
         if tool.group_only and not ctx.in_group:
             return (f"工具 `{name}` 只能在群聊里使用。", True)
@@ -189,6 +228,80 @@ def _fmt_time(ts: datetime) -> str:
     weekdays = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"]
     return (f"{ts.strftime('%Y-%m-%d %H:%M:%S')} "
             f"{weekdays[ts.weekday()]}（时区 {ts.strftime('%Z') or '本地'}）")
+
+
+#: 技能结果的上限 —— 与内置工具同一个量级（模型读不动更长的东西）
+SKILL_MAX_CHARS = 3000
+
+
+def register_skill_tools(reg: ToolRegistry, *, skills, cfg: dict,
+                         logger=None) -> None:
+    """把**别的插件注册的技能**接成工具（`napcat.skills`）。
+
+    提供方在自己的插件里 `@self.register_skill(...)`；这里只负责「读出来、
+    包成工具、调用时把结果/异常变成文本」。谁提供、提供什么，ai_chat 一概
+    不关心 —— 这正是这条通道存在的意义：加一个能力不用改 ai_chat。
+
+    过滤（`skills.*` 配置）：
+
+    * `enabled=false` → 一个都不接；
+    * `allow`（非空）→ 只接名单里的；
+    * `deny` → 名单里的不接（`allow` 优先，两个都给就按 allow 走）。
+    """
+    def provider(ctx):
+        # `cfg` 可以是**取值函数**：配置会热重载（`/aichat` 改设置、config.json
+        # 被编辑），注册时拷一份字典就等于把开关钉死在加载那一刻
+        conf = cfg() if callable(cfg) else cfg
+        conf = conf if isinstance(conf, dict) else {}
+        if not bool(conf.get("enabled", True)):
+            return []
+        allow = [str(x) for x in (conf.get("allow") or [])]
+        deny = {str(x) for x in (conf.get("deny") or [])}
+        out = []
+        for skill in skills.list(exclude="ai_chat"):
+            if allow and skill.name not in allow:
+                continue
+            if not allow and skill.name in deny:
+                continue
+            out.append(_skill_tool(skill, logger=logger))
+        return out
+
+    reg.set_provider(provider)
+
+
+def _skill_tool(skill, *, logger=None) -> Tool:
+    """技能 → 工具。名字用 `plugin_skill`（OpenAI 只允许字母数字下划线连字符）。"""
+
+    async def handler(ctx, **_ignored):
+        from napcat.skills import SkillContext, call_skill
+        args = dict(_ignored)
+        sctx = SkillContext(
+            caller="ai_chat", user_id=int(ctx.user_id or 0),
+            group_id=int(ctx.group_id or 0), is_group=bool(ctx.in_group),
+            session_id=str(ctx.session_id or ""),
+            is_superuser=bool(ctx.is_superuser),
+            is_admin=bool(ctx.can_moderate))
+        try:
+            text = await call_skill(skill, args, sctx)
+        except Exception as e:  # noqa: BLE001 - 技能失败要变成模型能读的一句话
+            if logger:
+                logger.warning("[ai_chat] 技能 %s 执行失败: %r", skill.name, e)
+            # 抛出去而不是直接返回字符串：`ToolRegistry.call` 会把异常变成
+            # 「工具执行异常：…」并把 `failed` 标上 —— 混在正常结果里会让
+            # 上层把一次失败当成一次成功（统计、重试判据都会错）
+            raise RuntimeError(
+                f"技能 {skill.name} 执行失败：{err_text(e)}"
+                f"（可以换个说法重试，或告诉用户这个功能暂时不可用）") from e
+        if len(text) > SKILL_MAX_CHARS:
+            text = text[:SKILL_MAX_CHARS] + "…（结果过长，已截断）"
+        return text or "（技能返回空结果）"
+
+    return Tool(
+        name=skill.tool_name,
+        description=(f"[{skill.plugin}] {skill.description}".strip()),
+        parameters=(skill.parameters or {"type": "object", "properties": {}}),
+        handler=handler,
+    )
 
 
 def register_builtin_tools(reg: ToolRegistry) -> None:

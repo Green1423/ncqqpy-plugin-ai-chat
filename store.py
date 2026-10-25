@@ -525,6 +525,15 @@ class SessionStore:
             self._save_locked()
             return True
 
+    def touch(self, sid: str) -> None:
+        """会话的 `meta` 被就地改过 → 落一次盘（`media_seq` 这类计数器靠它）。"""
+        with self._lock:
+            s = self._sessions.get(sid)
+            if s is None:
+                return
+            s.updated_at = time.time()
+            self._save_locked()
+
     def set_role(self, sid: str, role: str) -> bool:
         """设置 / 清除会话的角色设定（空串 = 清除）。"""
         with self._lock:

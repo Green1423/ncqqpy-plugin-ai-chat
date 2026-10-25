@@ -26,6 +26,7 @@
 | [`/md`：把上一条 AI 回复转成图片](14-md-image.md) |
 | [网图配图（`fetch_image`）](15-images.md) |
 | [结束符](16-terminator.md) |
+| [多模态（图片 / 视频 / 语音）](17-multimodal.md) |
 
 ## 开发与实现参考
 

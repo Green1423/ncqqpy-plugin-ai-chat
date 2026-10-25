@@ -1,6 +1,6 @@
 # 十六、结束符
 
-> 文档索引：[docs/README.md](https://github.com/Green1423/ncqqpy/blob/main/docs/README.md) · 上级：[ai_chat 插件](README.md) · 上一章：[网图配图（`fetch_image`）](15-images.md) · 下一章：[实现参考](https://github.com/Green1423/ncqqpy/blob/main/docs/reference/ai-chat/README.md)
+> 文档索引：[docs/README.md](https://github.com/Green1423/ncqqpy/blob/main/docs/README.md) · 上级：[ai_chat 插件](README.md) · 上一章：[网图配图（`fetch_image`）](15-images.md) · 下一章：[多模态（图片 / 视频 / 语音）](17-multimodal.md)
 
 
 **结束符的语义是「这一大段提交上去」**，不是「这一条消息发完了」。

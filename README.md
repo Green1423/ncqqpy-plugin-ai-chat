@@ -50,6 +50,19 @@ git clone https://github.com/Green1423/ncqqpy-plugin-ai-chat plugins/ai_chat
       "compaction": "off"
     }
   },
+  "skills": {
+    "enabled": true,
+    "allow": [],
+    "deny": []
+  },
+  "multimodal": {
+    "enabled": true,
+    "image": true,
+    "audio": true,
+    "max_bytes": 4194304,
+    "max_side": 1568,
+    "keep_files": 200
+  },
   "web_image": {
     "enabled": true,
     "max_bytes": 8388608,

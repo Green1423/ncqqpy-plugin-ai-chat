@@ -1925,6 +1925,204 @@ async def test_recall_removes_staged(h: Harness):
     check("撤回后暂存区清空", not (state.get("items")), f"{state}")
 
 
+async def test_skill_tools(h: Harness):
+    """别的插件注册的技能 → 模型能当工具调用（`napcat.skills` 通道）。"""
+    print("\n[19.4] 技能通道：别的插件的能力给模型用")
+    await establish(h)
+    # 模拟「byrdocs 在自己的插件里注册了 search」
+    from napcat.skills import SkillContext as Sctx
+    hits = []
+
+    @h.plugin.skills.decorator("byrdocs", "search", description="搜 BYR Docs 资料",
+                               parameters={"type": "object",
+                                           "properties": {"query": {"type": "string"}},
+                                           "required": ["query"]})
+    async def search(args, ctx: Sctx):
+        hits.append((args.get("query"), ctx.user_id, ctx.caller))
+        return "1. 线性代数期末（EXAM · 2MB）"
+
+    h.clear()
+    def responder(messages, tools):
+        if not any(m.get("role") == "tool" for m in messages):
+            return StubResult(text="", tool_calls=[StubCall(
+                "byrdocs_search", {"query": "线代"}, "t1")])
+        return StubResult(text="有，编号 1")
+    h.llm.responder = responder
+    await h.private("有没有线代真题？//", settle=1.6)
+    text = await h.wait_reply()
+    check("模型能拿到技能工具", h.llm.requests and any(
+        t.get("function", {}).get("name") == "byrdocs_search"
+        for t in (h.llm.requests[-1].get("tools") or [])), "工具表里没有 byrdocs_search")
+    check("技能被真的调用了", hits == [("线代", ALICE, "ai_chat")], f"{hits}")
+    check("技能结果喂回模型", "线性代数期末" in h.llm.last_user_content()
+          or any("线性代数期末" in str(m.get("content"))
+                 for m in h.llm.requests[-1]["messages"]), "模型没看到结果")
+    check("最终回复正常", "编号 1" in text, text[:80])
+
+    # 配置关掉 → 工具表里不该出现
+    h.plugin.cfg["skills"]["enabled"] = False
+    h.clear()
+    h.llm.responder = None
+    h.llm.script_text = "好的"
+    await h.private("再来一次//", settle=1.2)
+    await h.wait_reply()
+    check("skills.enabled=false 时不暴露", not any(
+        t.get("function", {}).get("name") == "byrdocs_search"
+        for t in (h.llm.requests[-1].get("tools") or [])), "关掉后还在")
+    h.plugin.cfg["skills"]["enabled"] = True
+
+
+async def test_media_gating(h: Harness):
+    """多模态「按需」规则：**只有 /aichat mark 标记过的图片**才传给模型。
+
+    用户定的规矩：引用一张图**不算**标记 —— 没标记就是没标记；
+    语音则总是全传（一轮所有语音一起发，视为一条对话）。
+    """
+    print("\n[19.5] 媒体门控（标记才传）")
+    session = await establish(h)
+    png = TMP_DIR / "gate.png"
+    from PIL import Image
+    Image.new("RGB", (32, 32), (200, 20, 20)).save(png)
+    item = {"kind": "image", "num": 1, "path": str(png), "mime": "image/png",
+            "size": png.stat().st_size, "ok": True, "note": ""}
+    voice = {"kind": "record", "num": 2, "path": str(png), "mime": "audio/wav",
+             "size": 100, "ok": True, "note": ""}
+    caps = {"image": True, "record": True}
+
+    marked = h.plugin._media_to_include([item, voice], [["image", 1]],
+                                        session=session, meta={}, caps=caps)
+    check("标记过的图会传", ("image", 1) in marked, f"{marked}")
+    check("语音总是全传", ("record", 2) in marked, f"{marked}")
+
+    bare = h.plugin._media_to_include([item, voice], [], session=session,
+                                      meta={}, caps=caps)
+    check("没标记的图不传（同一条消息里也不传）",
+          [x for x in bare if x[0] == "image"] == [], f"{bare}")
+    check("没标记时语音照传", ("record", 2) in bare, f"{bare}")
+
+    # 引用一张图**不**自动传（这是这次改动的核心）
+    quoted = plugin_module("segments").user_message(
+        "之前那张图", origin="user.private", user_id=1, media=[item])
+    h.plugin.store.append(session.id, quoted)
+    h.plugin.sent_reply.add([999001], session.id, int(quoted.seq or 0))
+    got_q = h.plugin._media_to_include([], [], session=session,
+                                       meta={"reply_to": 999001}, caps=caps)
+    check("引用图片不算标记（不自动传）", got_q == [], f"{got_q}")
+
+    blind = h.plugin._media_to_include([item, voice], [["image", 1]],
+                                       session=session, meta={},
+                                       caps={"image": False, "record": False})
+    check("模型看不了 → 一个都不传", blind == [], f"{blind}")
+
+
+async def test_mark_command(h: Harness):
+    """`/aichat mark`：引用一张图 → 编号 + 回执；下一条提问把它交给模型。"""
+    print("\n[19.51] /aichat mark 标记引用里的图片")
+    session = await establish(h)
+    png = TMP_DIR / "mark.png"
+    from PIL import Image
+    Image.new("RGB", (40, 40), (30, 90, 220)).save(png)
+    raw = png.read_bytes()
+
+    async def fake_download(url):
+        return raw
+
+    h.plugin.media._download = fake_download          # 不联网
+    # 探测会真发 HTTP，而套件里的 LLM 是桩 —— 直接喂缓存（走的是同一条代码路径：
+    # supports() 先看缓存，命中就不探测）
+    from plugins.ai_chat.capability import CapabilityCache as _CC
+    key = _CC.key(h.plugin.llm.base_url, h.plugin.llm.model)
+    h.plugin.capabilities.put(key, "image", state="yes")
+    # 造一条「带图片的引用消息」：QQ id 999111，内容是 image 段
+    h.msg_lookup[999111] = {
+        "message_id": 999111, "message_type": "private",
+        "sender": {"user_id": ALICE, "nickname": "爱丽丝"},
+        "message": [{"type": "image",
+                     "data": {"url": "http://x/pic.png", "file": "pic.png"}}],
+    }
+
+    # 没引用就发命令 → 提示要先引用
+    h.clear()
+    await h.private("/aichat mark", settle=0.9)
+    text = await h.wait_reply()
+    check("没引用时提示怎么用", "引用" in text, text[:140])
+
+    # 引用那张图再标
+    h.clear()
+    await h.private("/aichat mark", with_reply=999111, settle=1.2)
+    text = await h.wait_reply()
+    import re as _re
+    m = _re.search(r"\[图#(\d+)\]", text)
+    check("回执里给了标号", bool(m), text[:160])
+    check("回执说明下一步", "下一条提问" in text or "一起交给模型" in text, text[:200])
+    num = int(m.group(1)) if m else 0
+    check("标号写进了会话（可再次引用）",
+          int((h.plugin.store.get(session.id).meta or {}).get("media_seq") or 0) >= num,
+          f"{num}")
+
+    # 下一条提问 → 请求里出现 image part
+    h.clear()
+    h.llm.script_text = "这是一张蓝色的图。"
+    await h.private("这张图什么颜色？//", settle=1.4)
+    await h.wait_reply()
+    req = h.llm.requests[-1]["messages"]
+    parts = None
+    for m_ in req:
+        if m_.get("role") == "user" and isinstance(m_.get("content"), list):
+            parts = m_["content"]
+    check("请求里带上了图片 part",
+          bool(parts) and any(p.get("type") == "image_url" for p in parts),
+          f"{str(parts)[:120]}")
+    check("文本段里也有标号",
+          bool(parts) and any(f"[图#{num}]" in p.get("text", "") for p in parts),
+          f"{str(parts)[:160]}")
+    check("标记用掉就失效（暂存区不留）",
+          h.plugin.buffer.marks(f"private:{ALICE}") == [], "标记还在")
+
+    # 只有一张时不用给序号；多张时必须给
+    h.msg_lookup[999222] = {
+        "message_id": 999222, "message_type": "private",
+        "sender": {"user_id": ALICE, "nickname": "爱丽丝"},
+        "message": [{"type": "image", "data": {"url": "http://x/a.png"}},
+                    {"type": "image", "data": {"url": "http://x/b.png"}}],
+    }
+    h.clear()
+    await h.private("/aichat mark", with_reply=999222, settle=1.1)
+    text = await h.wait_reply()
+    check("多张时要指定第几张", "请指定第几张" in text or "张图" in text, text[:160])
+    h.clear()
+    await h.private("/aichat mark 2", with_reply=999222, settle=1.2)
+    text = await h.wait_reply()
+    check("指定序号能标上", "[图#" in text, text[:160])
+
+    # 引用的那条没有图 → 明说
+    h.msg_lookup[999333] = {
+        "message_id": 999333, "message_type": "private",
+        "sender": {"user_id": ALICE, "nickname": "爱丽丝"},
+        "message": [{"type": "text", "data": {"text": "只是文字"}}],
+    }
+    h.clear()
+    await h.private("/aichat mark", with_reply=999333, settle=1.0)
+    text = await h.wait_reply()
+    check("没有图时明说", "没有图片" in text, text[:140])
+
+
+async def test_media_capability_note(h: Harness):
+    """能力说明：模型得知道自己能不能看到图/听到语音（否则会瞎猜图里有什么）。"""
+    print("\n[19.52] 能力说明")
+    from plugins.ai_chat.main import AiChatPlugin
+    note = AiChatPlugin._media_capability_note
+    blind = note({"image": False, "record": False})
+    check("都不能 → 明说看不到", "不能看图片" in blind, blind[:80])
+    check("都不能 → 警告别假装", "不要假装" in blind or "不要猜" in blind, blind[:120])
+    both = note({"image": True, "record": True})
+    check("都能 → 说明两种标号", "图片输入" in both and "语音输入" in both, both[:100])
+    check("都能 → 说明只有点名的才传", "点名" in both, both[:140])
+    only_img = note({"image": True, "record": False})
+    check("只有图 → 语音标为不支持", "不支持**语音" in only_img or "不支持语音" in only_img,
+          only_img[:120])
+
+
 async def test_reply_drops_mimicked_label(h: Harness):
     """模型模仿段落编号写成 `[#99] 正文` 时，用户不该看到那串符号。"""
     print("\n[19.55] 回答开头模仿的 [#N] 会被剥掉")
@@ -2369,8 +2567,10 @@ async def test_reply_media_submits_text(h: Harness):
               f"calls={h.llm.calls}")
         seen = h.llm.last_user_content()
         check(f"引用{label}：用户的问题在里面", "这个怎么说" in seen, seen)
+        # 提示要跟**当前规则**一致：图片得 /aichat mark 才会传；历史语音不重传
+        expect = "mark" if label == "图片" else "听不到"
         check(f"引用{label}：引文位置有一句提示",
-              "暂不支持多模态" in seen and label in seen, seen)
+              expect in seen and label in seen, seen)
 
     # 只引用一张图、自己一个字都不写：也要提交（提示就是全部内容）
     h.clear()
@@ -2382,7 +2582,7 @@ async def test_reply_media_submits_text(h: Harness):
     await h.group("//", at_bot=True, with_reply=500009, settle=1.2)
     check("只引用图、不写字也会提交", h.llm.calls == 1, f"calls={h.llm.calls}")
     check("提交内容就是那句提示",
-          "暂不支持多模态" in h.llm.last_user_content(),
+          "mark" in h.llm.last_user_content(),
           h.llm.last_user_content())
 
     # 读不到引文（撤回/接口失败）也不能静默吞掉整轮
@@ -2551,7 +2751,7 @@ async def test_quote_ai_image(h: Harness):
     await h.private("这张呢？//", with_reply=other, settle=1.2)
     seen2 = h.llm.last_user_content()
     check("别人的图：内容读不到，但用户的问题照常提交",
-          "这张呢" in seen2 and "暂不支持多模态" in seen2, seen2)
+          "这张呢" in seen2 and "/aichat mark" in seen2, seen2)
 
 
 async def test_reply_index_survives_reload(h: Harness):
@@ -4534,6 +4734,7 @@ async def main():
         test_recall_removes_staged, test_detach_drops_staged, test_staging_persistence,
         test_staging_shared_across_windows, test_window_key_migration,
         test_submit_while_busy, test_terminator_waits_for_ingest,
+        test_skill_tools, test_media_gating, test_mark_command, test_media_capability_note,
         test_reply_drops_mimicked_label,
         test_hget_traces_chain, test_hget_by_label,
         test_paragraph_labels, test_quote_uses_label,
