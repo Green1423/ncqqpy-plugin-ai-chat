@@ -1926,50 +1926,130 @@ async def test_recall_removes_staged(h: Harness):
 
 
 async def test_skill_tools(h: Harness):
-    """别的插件注册的技能 → 模型能当工具调用（`napcat.skills` 通道）。"""
-    print("\n[19.4] 技能通道：别的插件的能力给模型用")
+    """技能 = **委派**：AI 把活交给插件，插件自己回消息，AI 不说话也不转述。"""
+    print("\n[19.4] 技能通道：委派给插件，AI 不接话")
     await establish(h)
-    # 模拟「byrdocs 在自己的插件里注册了 search」
     from napcat.skills import SkillContext as Sctx
     hits = []
 
-    @h.plugin.skills.decorator("byrdocs", "search", description="搜 BYR Docs 资料",
+    @h.plugin.skills.decorator("byrdocs", "search", description="搜 BYR Docs",
                                parameters={"type": "object",
                                            "properties": {"query": {"type": "string"}},
                                            "required": ["query"]})
     async def search(args, ctx: Sctx):
-        hits.append((args.get("query"), ctx.user_id, ctx.caller))
-        return "1. 线性代数期末（EXAM · 2MB）"
+        hits.append((args.get("query"), ctx.user_id, ctx.caller, callable(ctx.send)))
+        await ctx.send("📚 找到 1 条：线性代数期末")
+        return ""
 
     h.clear()
     def responder(messages, tools):
         if not any(m.get("role") == "tool" for m in messages):
             return StubResult(text="", tool_calls=[StubCall(
                 "byrdocs_search", {"query": "线代"}, "t1")])
-        return StubResult(text="有，编号 1")
+        return StubResult(text="（不该出现：委派后 AI 不说话）")
     h.llm.responder = responder
-    await h.private("有没有线代真题？//", settle=1.6)
-    text = await h.wait_reply()
+    await h.private("有没有线代真题？//", settle=1.8)
+
     check("模型能拿到技能工具", h.llm.requests and any(
         t.get("function", {}).get("name") == "byrdocs_search"
-        for t in (h.llm.requests[-1].get("tools") or [])), "工具表里没有 byrdocs_search")
-    check("技能被真的调用了", hits == [("线代", ALICE, "ai_chat")], f"{hits}")
-    check("技能结果喂回模型", "线性代数期末" in h.llm.last_user_content()
-          or any("线性代数期末" in str(m.get("content"))
-                 for m in h.llm.requests[-1]["messages"]), "模型没看到结果")
-    check("最终回复正常", "编号 1" in text, text[:80])
+        for t in (h.llm.requests[-1].get("tools") or [])), "工具表里没有")
+    check("技能被真的调用（且拿到了 send）",
+          hits == [("线代", ALICE, "ai_chat", True)], f"{hits}")
+    texts = [reply_text(r) for r in h.replies if reply_text(r).strip()]
+    check("插件自己回了一条", any("线性代数期末" in t for t in texts), f"{texts}")
+    check("AI 没有额外接话", len(texts) == 1, f"{texts}")
 
-    # 配置关掉 → 工具表里不该出现
     h.plugin.cfg["skills"]["enabled"] = False
     h.clear()
     h.llm.responder = None
     h.llm.script_text = "好的"
-    await h.private("再来一次//", settle=1.2)
-    await h.wait_reply()
+    await h.private("再来一次//", settle=1.6)
     check("skills.enabled=false 时不暴露", not any(
         t.get("function", {}).get("name") == "byrdocs_search"
         for t in (h.llm.requests[-1].get("tools") or [])), "关掉后还在")
     h.plugin.cfg["skills"]["enabled"] = True
+
+
+async def test_voice_transcribed(h: Harness):
+    """语音**默认转给 AI**：转写结果直接进正文，模型不用"听"。"""
+    print("\n[19.35] 语音默认转写后交给模型")
+    await establish(h)
+    h.plugin.asr = plugin_module("asr").Transcriber(
+        plugin_module("asr").AsrOptions(command="echo 明天下午三点开会"))
+    from plugins.ai_chat.media import probe_wav
+    async def fake(url):
+        return probe_wav()
+    h.plugin.media._download = fake
+
+    h.clear()
+    base = h._msg_payload("private", "", user_id=ALICE, message_id=515151)
+    base["message"] = [{"type": "record",
+                        "data": {"url": "http://x/v.wav", "file": "v.wav"}}]
+    await h._send_raw(base, settle=1.0)
+    await h.private("//", settle=1.4)
+    await h.wait_reply()
+    seen = h.llm.last_user_content()
+    check("转写文本进了正文", "明天下午三点开会" in seen, seen[:160])
+    check("标号还在（可被引用）", "[语音#1]" in seen, seen[:160])
+    check("转写随消息落盘",
+          any("明天下午三点开会" in str((m.metadata or {}).get("media"))
+              for m in h.plugin.store.history(_current_session(h).id)),
+          "历史里没有 transcript")
+
+    # 引擎失败：标号保留，附一句「转写失败」，不能让整轮没反应
+    h.plugin.asr = plugin_module("asr").Transcriber(
+        plugin_module("asr").AsrOptions(command="sh -c 'exit 7'"))
+    h.clear()
+    base2 = h._msg_payload("private", "", user_id=ALICE, message_id=515152)
+    base2["message"] = [{"type": "record",
+                         "data": {"url": "http://x/w.wav", "file": "w.wav"}}]
+    await h._send_raw(base2, settle=1.0)
+    await h.private("那这个呢？//", settle=1.4)
+    await h.wait_reply()
+    seen2 = h.llm.last_user_content()
+    check("转写失败也照样提交", "那这个呢" in seen2, seen2[:160])
+    check("失败原因写在标号后面", "转写失败" in seen2, seen2[:200])
+
+
+async def test_voice_transcribed(h: Harness):
+    """语音**默认转给 AI**：转写结果直接进正文，模型不用"听"。"""
+    print("\n[19.35] 语音默认转写后交给模型")
+    await establish(h)
+    h.plugin.asr = plugin_module("asr").Transcriber(
+        plugin_module("asr").AsrOptions(command="echo 明天下午三点开会"))
+    from plugins.ai_chat.media import probe_wav
+    async def fake(url):
+        return probe_wav()
+    h.plugin.media._download = fake
+
+    h.clear()
+    base = h._msg_payload("private", "", user_id=ALICE, message_id=515151)
+    base["message"] = [{"type": "record",
+                        "data": {"url": "http://x/v.wav", "file": "v.wav"}}]
+    await h._send_raw(base, settle=1.0)
+    await h.private("//", settle=1.4)
+    await h.wait_reply()
+    seen = h.llm.last_user_content()
+    check("转写文本进了正文", "明天下午三点开会" in seen, seen[:160])
+    check("标号还在（可被引用）", "[语音#1]" in seen, seen[:160])
+    check("转写随消息落盘",
+          any("明天下午三点开会" in str((m.metadata or {}).get("media"))
+              for m in h.plugin.store.history(_current_session(h).id)),
+          "历史里没有 transcript")
+
+    # 引擎失败：标号保留，附一句「转写失败」，不能让整轮没反应
+    h.plugin.asr = plugin_module("asr").Transcriber(
+        plugin_module("asr").AsrOptions(command="sh -c 'exit 7'"))
+    h.clear()
+    base2 = h._msg_payload("private", "", user_id=ALICE, message_id=515152)
+    base2["message"] = [{"type": "record",
+                         "data": {"url": "http://x/w.wav", "file": "w.wav"}}]
+    await h._send_raw(base2, settle=1.0)
+    await h.private("那这个呢？//", settle=1.4)
+    await h.wait_reply()
+    seen2 = h.llm.last_user_content()
+    check("转写失败也照样提交", "那这个呢" in seen2, seen2[:160])
+    check("失败原因写在标号后面", "转写失败" in seen2, seen2[:200])
 
 
 async def test_media_gating(h: Harness):
@@ -1996,8 +2076,6 @@ async def test_media_gating(h: Harness):
 
     bare = h.plugin._media_to_include([item, voice], [], session=session,
                                       meta={}, caps=caps)
-    check("没标记的图不传（同一条消息里也不传）",
-          [x for x in bare if x[0] == "image"] == [], f"{bare}")
     check("没标记时语音照传", ("record", 2) in bare, f"{bare}")
 
     # 引用一张图**不**自动传（这是这次改动的核心）
@@ -2007,12 +2085,67 @@ async def test_media_gating(h: Harness):
     h.plugin.sent_reply.add([999001], session.id, int(quoted.seq or 0))
     got_q = h.plugin._media_to_include([], [], session=session,
                                        meta={"reply_to": 999001}, caps=caps)
-    check("引用图片不算标记（不自动传）", got_q == [], f"{got_q}")
+    # 引用一条含图的消息 → 图**跟着引用一起带上**（用户要的「引用获取图片」）
+    check("引用带图会把图带过来", ("image", 1) in got_q, f"{got_q}")
 
     blind = h.plugin._media_to_include([item, voice], [["image", 1]],
                                        session=session, meta={},
                                        caps={"image": False, "record": False})
     check("模型看不了 → 一个都不传", blind == [], f"{blind}")
+
+
+async def test_image_in_same_message(h: Harness):
+    """**本轮发来的图默认就传给模型** —— 用户把图配着问题发，是最自然的用法。
+
+    历史里的图仍要 `/aichat mark`（否则每条历史都塞图，token 会爆）。
+    这条边界是实测出来的：早先一律要求标记，结果用户发图问「这图案写个提示词」，
+    模型只回一句「图没收到」。
+    """
+    print("\n[19.45] 同一条消息里的图默认就传")
+    session = await establish(h)
+    png = TMP_DIR / "inline.png"
+    from PIL import Image
+    Image.new("RGB", (48, 48), (10, 120, 200)).save(png)
+    raw = png.read_bytes()
+
+    async def fake_download(url):
+        return raw
+
+    h.plugin.media._download = fake_download
+    # 能力缓存：探测会真发 HTTP，套件里直接喂结论
+    from plugins.ai_chat.capability import CapabilityCache as _CC
+    key = _CC.key(getattr(h.plugin.llm, "base_url", ""),
+                  getattr(h.plugin.llm, "model", ""))
+    h.plugin.capabilities.put(key, "image", state="yes")
+
+    h.clear()
+    base = h._msg_payload("private", "给这个图案写提示词",
+                          user_id=ALICE, message_id=616161)
+    base["message"] = [{"type": "image",
+                        "data": {"url": "http://x/pic.png", "file": "pic.png"}},
+                       {"type": "text", "data": {"text": "给这个图案写提示词"}}]
+    await h._send_raw(base, settle=1.2)
+    await h.private("//", settle=1.6)
+    await h.wait_reply()
+
+    req = h.llm.requests[-1]["messages"]
+    parts = next((m["content"] for m in req
+                  if m.get("role") == "user" and isinstance(m.get("content"), list)),
+                 None)
+    check("请求里带上了图片 part",
+          bool(parts) and any(p.get("type") == "image_url" for p in parts),
+          f"{str(parts)[:100]}")
+    check("正文里有标号", bool(parts) and any("[图#" in str(p.get("text"))
+                                              for p in parts),
+          f"{str(parts)[:160]}")
+    hist = h.plugin.store.history(session.id)
+    saved = [m for m in hist if m.role == "user"][-1]
+    check("媒体随消息落盘（含编号）",
+          bool((saved.metadata or {}).get("media")),
+          f"{(saved.metadata or {}).get('media')}")
+    check("这一轮确实把它选进了 include",
+          [["image", 1]] == (saved.metadata or {}).get("media_include"),
+          f"{(saved.metadata or {}).get('media_include')}")
 
 
 async def test_mark_command(h: Harness):
@@ -4734,7 +4867,2953 @@ async def main():
         test_recall_removes_staged, test_detach_drops_staged, test_staging_persistence,
         test_staging_shared_across_windows, test_window_key_migration,
         test_submit_while_busy, test_terminator_waits_for_ingest,
-        test_skill_tools, test_media_gating, test_mark_command, test_media_capability_note,
+        test_skill_tools, test_voice_transcribed, test_image_in_same_message,
+        test_media_gating, test_mark_command, test_media_capability_note,
+        test_reply_drops_mimicked_label,
+        test_hget_traces_chain, test_hget_by_label,
+        test_paragraph_labels, test_quote_uses_label,
+        test_quote_chain_labels, test_quote_falls_back_to_text,
+        test_multi_part_reply, test_reply_text_as_context,
+        test_reply_media_submits_text,
+        test_paging_long_reply, test_llm_error_surfaces,
+        test_quote_chain, test_quote_ai_image, test_md_command,
+        test_reply_index_survives_reload,
+        test_delete_and_rename, test_schema_error_feedback,
+        test_llm_retry, test_llm_timeout_hint, test_escaped_prefix_paste,
+        test_sse_parse, test_llm_stream_cutoff, test_partial_reply_on_cutoff,
+        test_llm_stream_wiring,
+        test_think_command, test_maxtokens_command, test_timeout_command,
+        test_plain_text_formatting,
+        test_reasoning_dialect_via_config,
+        test_config_template_seeding,
+        test_no_deferred_relative_imports, test_no_coupling_with_other_plugins,
+        test_binding_allowlist, test_binding_group_vs_private, test_binding_cooldown,
+        test_private_binding_bootstrap, test_unbound_is_silent,
+        test_unified_help,
+    ):
+        await run_case(fn, ROOT_TMP)
+
+    print(f"\n{'=' * 50}\n通过 {PASSED} / 失败 {FAILED}")
+    if FAILURES:
+        print("失败项：")
+        for f in FAILURES:
+            print(f"  - {f}")
+    return 1 if FAILED else 0
+
+
+def _ev_at():
+    from napcat.models import MessageEvent
+    return MessageEvent(
+        message_type="group", group_id=GROUP, user_id=ALICE,
+        message=[{"type": "at", "data": {"qq": str(BOT_ID)}}])
+
+
+if __name__ == "__main__":
+    sys.exit(asyncio.run(main()))
+async def test_voice_transcribed(h: Harness):
+    """语音**默认转给 AI**：转写结果直接进正文，模型不用"听"。"""
+    print("\n[19.35] 语音默认转写后交给模型")
+    await establish(h)
+    h.plugin.asr = plugin_module("asr").Transcriber(
+        plugin_module("asr").AsrOptions(command="echo 明天下午三点开会"))
+    from plugins.ai_chat.media import probe_wav
+    async def fake(url):
+        return probe_wav()
+    h.plugin.media._download = fake
+
+    h.clear()
+    base = h._msg_payload("private", "", user_id=ALICE, message_id=515151)
+    base["message"] = [{"type": "record",
+                        "data": {"url": "http://x/v.wav", "file": "v.wav"}}]
+    await h._send_raw(base, settle=1.0)
+    await h.private("//", settle=1.4)
+    await h.wait_reply()
+    seen = h.llm.last_user_content()
+    check("转写文本进了正文", "明天下午三点开会" in seen, seen[:160])
+    check("标号还在（可被引用）", "[语音#1]" in seen, seen[:160])
+    check("转写随消息落盘",
+          any("明天下午三点开会" in str((m.metadata or {}).get("media"))
+              for m in h.plugin.store.history(_current_session(h).id)),
+          "历史里没有 transcript")
+
+    # 引擎失败：标号保留，附一句「转写失败」，不能让整轮没反应
+    h.plugin.asr = plugin_module("asr").Transcriber(
+        plugin_module("asr").AsrOptions(command="sh -c 'exit 7'"))
+    h.clear()
+    base2 = h._msg_payload("private", "", user_id=ALICE, message_id=515152)
+    base2["message"] = [{"type": "record",
+                         "data": {"url": "http://x/w.wav", "file": "w.wav"}}]
+    await h._send_raw(base2, settle=1.0)
+    await h.private("那这个呢？//", settle=1.4)
+    await h.wait_reply()
+    seen2 = h.llm.last_user_content()
+    check("转写失败也照样提交", "那这个呢" in seen2, seen2[:160])
+    check("失败原因写在标号后面", "转写失败" in seen2, seen2[:200])
+
+
+async def test_skill_tools(h: Harness):
+    """别的插件注册的技能 → 模型能当工具调用（`napcat.skills` 通道）。"""
+    print("\n[19.4] 技能通道：别的插件的能力给模型用")
+    await establish(h)
+    # 模拟「byrdocs 在自己的插件里注册了 search」
+    from napcat.skills import SkillContext as Sctx
+    hits = []
+
+    @h.plugin.skills.decorator("byrdocs", "search", description="搜 BYR Docs 资料",
+                               parameters={"type": "object",
+                                           "properties": {"query": {"type": "string"}},
+                                           "required": ["query"]})
+    async def search(args, ctx: Sctx):
+        hits.append((args.get("query"), ctx.user_id, ctx.caller))
+        return "1. 线性代数期末（EXAM · 2MB）"
+
+    h.clear()
+    def responder(messages, tools):
+        if not any(m.get("role") == "tool" for m in messages):
+            return StubResult(text="", tool_calls=[StubCall(
+                "byrdocs_search", {"query": "线代"}, "t1")])
+        return StubResult(text="有，编号 1")
+    h.llm.responder = responder
+    await h.private("有没有线代真题？//", settle=1.6)
+    text = await h.wait_reply()
+    check("模型能拿到技能工具", h.llm.requests and any(
+        t.get("function", {}).get("name") == "byrdocs_search"
+        for t in (h.llm.requests[-1].get("tools") or [])), "工具表里没有 byrdocs_search")
+    check("技能被真的调用了", hits == [("线代", ALICE, "ai_chat")], f"{hits}")
+    check("技能结果喂回模型", "线性代数期末" in h.llm.last_user_content()
+          or any("线性代数期末" in str(m.get("content"))
+                 for m in h.llm.requests[-1]["messages"]), "模型没看到结果")
+    check("最终回复正常", "编号 1" in text, text[:80])
+
+    # 配置关掉 → 工具表里不该出现
+    h.plugin.cfg["skills"]["enabled"] = False
+    h.clear()
+    h.llm.responder = None
+    h.llm.script_text = "好的"
+    await h.private("再来一次//", settle=1.2)
+    await h.wait_reply()
+    check("skills.enabled=false 时不暴露", not any(
+        t.get("function", {}).get("name") == "byrdocs_search"
+        for t in (h.llm.requests[-1].get("tools") or [])), "关掉后还在")
+    h.plugin.cfg["skills"]["enabled"] = True
+
+
+async def test_media_gating(h: Harness):
+    """多模态「按需」规则：**只有 /aichat mark 标记过的图片**才传给模型。
+
+    用户定的规矩：引用一张图**不算**标记 —— 没标记就是没标记；
+    语音则总是全传（一轮所有语音一起发，视为一条对话）。
+    """
+    print("\n[19.5] 媒体门控（标记才传）")
+    session = await establish(h)
+    png = TMP_DIR / "gate.png"
+    from PIL import Image
+    Image.new("RGB", (32, 32), (200, 20, 20)).save(png)
+    item = {"kind": "image", "num": 1, "path": str(png), "mime": "image/png",
+            "size": png.stat().st_size, "ok": True, "note": ""}
+    voice = {"kind": "record", "num": 2, "path": str(png), "mime": "audio/wav",
+             "size": 100, "ok": True, "note": ""}
+    caps = {"image": True, "record": True}
+
+    marked = h.plugin._media_to_include([item, voice], [["image", 1]],
+                                        session=session, meta={}, caps=caps)
+    check("标记过的图会传", ("image", 1) in marked, f"{marked}")
+    check("语音总是全传", ("record", 2) in marked, f"{marked}")
+
+    bare = h.plugin._media_to_include([item, voice], [], session=session,
+                                      meta={}, caps=caps)
+    check("没标记时语音照传", ("record", 2) in bare, f"{bare}")
+
+    # 引用一张图**不**自动传（这是这次改动的核心）
+    quoted = plugin_module("segments").user_message(
+        "之前那张图", origin="user.private", user_id=1, media=[item])
+    h.plugin.store.append(session.id, quoted)
+    h.plugin.sent_reply.add([999001], session.id, int(quoted.seq or 0))
+    got_q = h.plugin._media_to_include([], [], session=session,
+                                       meta={"reply_to": 999001}, caps=caps)
+    check("引用图片不算标记（不自动传）", got_q == [], f"{got_q}")
+
+    blind = h.plugin._media_to_include([item, voice], [["image", 1]],
+                                       session=session, meta={},
+                                       caps={"image": False, "record": False})
+    check("模型看不了 → 一个都不传", blind == [], f"{blind}")
+
+
+async def test_image_in_same_message(h: Harness):
+    """**本轮发来的图默认就传给模型** —— 用户把图配着问题发，是最自然的用法。
+
+    历史里的图仍要 `/aichat mark`（否则每条历史都塞图，token 会爆）。
+    这条边界是实测出来的：早先一律要求标记，结果用户发图问「这图案写个提示词」，
+    模型只回一句「图没收到」。
+    """
+    print("\n[19.45] 同一条消息里的图默认就传")
+    session = await establish(h)
+    png = TMP_DIR / "inline.png"
+    from PIL import Image
+    Image.new("RGB", (48, 48), (10, 120, 200)).save(png)
+    raw = png.read_bytes()
+
+    async def fake_download(url):
+        return raw
+
+    h.plugin.media._download = fake_download
+    # 能力缓存：探测会真发 HTTP，套件里直接喂结论
+    from plugins.ai_chat.capability import CapabilityCache as _CC
+    key = _CC.key(getattr(h.plugin.llm, "base_url", ""),
+                  getattr(h.plugin.llm, "model", ""))
+    h.plugin.capabilities.put(key, "image", state="yes")
+
+    h.clear()
+    base = h._msg_payload("private", "给这个图案写提示词",
+                          user_id=ALICE, message_id=616161)
+    base["message"] = [{"type": "image",
+                        "data": {"url": "http://x/pic.png", "file": "pic.png"}},
+                       {"type": "text", "data": {"text": "给这个图案写提示词"}}]
+    await h._send_raw(base, settle=1.2)
+    await h.private("//", settle=1.6)
+    await h.wait_reply()
+
+    req = h.llm.requests[-1]["messages"]
+    parts = next((m["content"] for m in req
+                  if m.get("role") == "user" and isinstance(m.get("content"), list)),
+                 None)
+    check("请求里带上了图片 part",
+          bool(parts) and any(p.get("type") == "image_url" for p in parts),
+          f"{str(parts)[:100]}")
+    check("正文里有标号", bool(parts) and any("[图#" in str(p.get("text"))
+                                              for p in parts),
+          f"{str(parts)[:160]}")
+    hist = h.plugin.store.history(session.id)
+    saved = [m for m in hist if m.role == "user"][-1]
+    check("媒体随消息落盘（含编号）",
+          bool((saved.metadata or {}).get("media")),
+          f"{(saved.metadata or {}).get('media')}")
+    check("这一轮确实把它选进了 include",
+          [["image", 1]] == (saved.metadata or {}).get("media_include"),
+          f"{(saved.metadata or {}).get('media_include')}")
+
+
+async def test_mark_command(h: Harness):
+    """`/aichat mark`：引用一张图 → 编号 + 回执；下一条提问把它交给模型。"""
+    print("\n[19.51] /aichat mark 标记引用里的图片")
+    session = await establish(h)
+    png = TMP_DIR / "mark.png"
+    from PIL import Image
+    Image.new("RGB", (40, 40), (30, 90, 220)).save(png)
+    raw = png.read_bytes()
+
+    async def fake_download(url):
+        return raw
+
+    h.plugin.media._download = fake_download          # 不联网
+    # 探测会真发 HTTP，而套件里的 LLM 是桩 —— 直接喂缓存（走的是同一条代码路径：
+    # supports() 先看缓存，命中就不探测）
+    from plugins.ai_chat.capability import CapabilityCache as _CC
+    key = _CC.key(h.plugin.llm.base_url, h.plugin.llm.model)
+    h.plugin.capabilities.put(key, "image", state="yes")
+    # 造一条「带图片的引用消息」：QQ id 999111，内容是 image 段
+    h.msg_lookup[999111] = {
+        "message_id": 999111, "message_type": "private",
+        "sender": {"user_id": ALICE, "nickname": "爱丽丝"},
+        "message": [{"type": "image",
+                     "data": {"url": "http://x/pic.png", "file": "pic.png"}}],
+    }
+
+    # 没引用就发命令 → 提示要先引用
+    h.clear()
+    await h.private("/aichat mark", settle=0.9)
+    text = await h.wait_reply()
+    check("没引用时提示怎么用", "引用" in text, text[:140])
+
+    # 引用那张图再标
+    h.clear()
+    await h.private("/aichat mark", with_reply=999111, settle=1.2)
+    text = await h.wait_reply()
+    import re as _re
+    m = _re.search(r"\[图#(\d+)\]", text)
+    check("回执里给了标号", bool(m), text[:160])
+    check("回执说明下一步", "下一条提问" in text or "一起交给模型" in text, text[:200])
+    num = int(m.group(1)) if m else 0
+    check("标号写进了会话（可再次引用）",
+          int((h.plugin.store.get(session.id).meta or {}).get("media_seq") or 0) >= num,
+          f"{num}")
+
+    # 下一条提问 → 请求里出现 image part
+    h.clear()
+    h.llm.script_text = "这是一张蓝色的图。"
+    await h.private("这张图什么颜色？//", settle=1.4)
+    await h.wait_reply()
+    req = h.llm.requests[-1]["messages"]
+    parts = None
+    for m_ in req:
+        if m_.get("role") == "user" and isinstance(m_.get("content"), list):
+            parts = m_["content"]
+    check("请求里带上了图片 part",
+          bool(parts) and any(p.get("type") == "image_url" for p in parts),
+          f"{str(parts)[:120]}")
+    check("文本段里也有标号",
+          bool(parts) and any(f"[图#{num}]" in p.get("text", "") for p in parts),
+          f"{str(parts)[:160]}")
+    check("标记用掉就失效（暂存区不留）",
+          h.plugin.buffer.marks(f"private:{ALICE}") == [], "标记还在")
+
+    # 只有一张时不用给序号；多张时必须给
+    h.msg_lookup[999222] = {
+        "message_id": 999222, "message_type": "private",
+        "sender": {"user_id": ALICE, "nickname": "爱丽丝"},
+        "message": [{"type": "image", "data": {"url": "http://x/a.png"}},
+                    {"type": "image", "data": {"url": "http://x/b.png"}}],
+    }
+    h.clear()
+    await h.private("/aichat mark", with_reply=999222, settle=1.1)
+    text = await h.wait_reply()
+    check("多张时要指定第几张", "请指定第几张" in text or "张图" in text, text[:160])
+    h.clear()
+    await h.private("/aichat mark 2", with_reply=999222, settle=1.2)
+    text = await h.wait_reply()
+    check("指定序号能标上", "[图#" in text, text[:160])
+
+    # 引用的那条没有图 → 明说
+    h.msg_lookup[999333] = {
+        "message_id": 999333, "message_type": "private",
+        "sender": {"user_id": ALICE, "nickname": "爱丽丝"},
+        "message": [{"type": "text", "data": {"text": "只是文字"}}],
+    }
+    h.clear()
+    await h.private("/aichat mark", with_reply=999333, settle=1.0)
+    text = await h.wait_reply()
+    check("没有图时明说", "没有图片" in text, text[:140])
+
+
+async def test_media_capability_note(h: Harness):
+    """能力说明：模型得知道自己能不能看到图/听到语音（否则会瞎猜图里有什么）。"""
+    print("\n[19.52] 能力说明")
+    from plugins.ai_chat.main import AiChatPlugin
+    note = AiChatPlugin._media_capability_note
+    blind = note({"image": False, "record": False})
+    check("都不能 → 明说看不到", "不能看图片" in blind, blind[:80])
+    check("都不能 → 警告别假装", "不要假装" in blind or "不要猜" in blind, blind[:120])
+    both = note({"image": True, "record": True})
+    check("都能 → 说明两种标号", "图片输入" in both and "语音输入" in both, both[:100])
+    check("都能 → 说明只有点名的才传", "点名" in both, both[:140])
+    only_img = note({"image": True, "record": False})
+    check("只有图 → 语音标为不支持", "不支持**语音" in only_img or "不支持语音" in only_img,
+          only_img[:120])
+
+
+async def test_reply_drops_mimicked_label(h: Harness):
+    """模型模仿段落编号写成 `[#99] 正文` 时，用户不该看到那串符号。"""
+    print("\n[19.55] 回答开头模仿的 [#N] 会被剥掉")
+    await establish(h)
+    h.clear()
+    h.llm.script_text = "[#99] 这是一段回答，开头那个编号不是真的。"
+    await h.private("随便问问//", settle=1.2)
+    text = await h.wait_reply()
+    check("发出去的回答没有那个编号", not text.strip().startswith("[#"),
+          text[:80])
+    check("正文还在", "这是一段回答" in text, text[:80])
+    session = _current_session(h)
+    hist = h.plugin.store.history(session.id)
+    saved = next((m.text for m in reversed(hist) if m.role == "assistant"), "")
+    check("落盘的正文也干净了", not saved.strip().startswith("[#"), saved[:80])
+
+    # 真实编号（真在指代某一段）不该被动
+    h.clear()
+    seqs = [int(m.seq) for m in hist if m.seq]
+    h.llm.script_text = f"[#{seqs[0]}] 我看到的第一段是这句"
+    await h.private("那第一段说了啥？//", settle=1.2)
+    text = await h.wait_reply()
+    check("真实编号保留（那是在指代）", f"[#{seqs[0]}]" in text, text[:80])
+
+
+async def test_hget_traces_chain(h: Harness):
+    """`hget` 沿**引用**追溯：被引用的上文一起渲染进那张卡片。
+
+    用户要求「hget 支持追溯完整的对话（沿引用）」：单看一对问答往往缺上下文
+    （这一对是在接着上文说的），所以要把引用链上的前几对也带上。
+    """
+    print("\n[19.6] hget 沿引用追溯")
+    session = await establish(h)
+    h.clear()
+    h.llm.script_text = "第一段回答。"
+    await h.private("第一问//", settle=1.2)
+    await h.wait_reply()
+    hist = h.plugin.store.history(session.id)
+    q1 = next(m for m in reversed(hist) if m.role == "user")
+    q1_id = int((q1.metadata.get("message_ids") or [0])[0])
+    check("第一问记得自己的 QQ 消息 id", q1_id > 0, f"{q1_id}")
+    # 第二问引用第一问（在上下文里，所以连 get_msg 都不用调）
+    h.llm.script_text = "第二段回答。"
+    await h.private("第二问//", with_reply=q1_id, settle=1.2)
+    await h.wait_reply()
+    h.clear()
+    await h.private("/aichat hget 2", settle=1.5)
+    texts = [reply_text(r) for r in h.replies]
+    check("文字头提到「沿引用追溯」",
+          any("沿引用追溯" in t for t in texts), f"{texts}")
+    check("链上标出 1 → 2", any("1 → 2" in t for t in texts), f"{texts}")
+    check("文字头带总数", any("共 2 对" in t for t in texts), f"{texts}")
+    imgs = [seg for r in h.replies
+            for seg in (r["params"].get("message") or [])
+            if isinstance(seg, dict) and seg.get("type") == "image"]
+    check("出了 1 张图", len(imgs) == 1, f"{len(imgs)} 张")
+
+    # 第一对没有上文 —— 不该硬凑一段「引用链」
+    h.clear()
+    await h.private("/aichat hget 1", settle=1.3)
+    texts = [reply_text(r) for r in h.replies]
+    check("第一对不报引用链", not any("沿引用追溯" in t for t in texts), f"{texts}")
+
+
+async def test_hget_by_label(h: Harness):
+    """`hget #N`：按**段落编号**查那一对（模型回复里就是用 `[#N]` 指代上文的）。"""
+    print("\n[19.65] hget 按段落编号查")
+    session = await establish(h)
+    h.clear()
+    h.llm.script_text = "第二段回答。"
+    await h.private("第一问//", settle=1.2)
+    await h.wait_reply()
+    await h.private("第二问//", settle=1.2)
+    await h.wait_reply()
+    hist = h.plugin.store.history(session.id)
+    answers = [m for m in hist if m.role == "assistant" and (m.text or "").strip()]
+    label = int(answers[-1].seq or 0)
+    check("第二条回答有编号", label > 0, f"{label}")
+
+    h.clear()
+    await h.private(f"/aichat hget #{label}", settle=1.4)
+    texts = [reply_text(r) for r in h.replies]
+    check("按编号查到的是第 2 对", any("第 2 对" in t for t in texts), f"{texts}")
+    check("文字头标出「答」的段落编号",
+          any(f"答 [#{label}]" in t for t in texts), f"{texts}")
+
+    h.clear()
+    await h.private("/aichat hget #99999", settle=1.0)
+    texts = [reply_text(r) for r in h.replies]
+    check("编号查不到时说清楚", any("找不到标号" in t for t in texts), f"{texts}")
+
+
+async def test_paragraph_labels(h: Harness):
+    """请求里每条**文本段落**带 `[#N]` 编号（N = 会话内 seq），系统提示讲清含义。
+
+    编号是「引用用标号代替原文」的前提：没有编号就没法指代，只能重抄。
+    """
+    print("\n[19.8] 段落编号 [#N]")
+    await establish(h)
+    h.clear()
+    # 第一轮让模型调一次工具 —— 否则「工具结果不加编号」是条空断言
+    # （这个坑真的踩过：代码把 `tool` 也编上了号，用例却因为没有工具调用而全绿）
+    def responder(messages, tools):
+        if not any(m["role"] == "tool" for m in messages):
+            return StubResult(text="", tool_calls=[StubCall(
+                "get_current_time", {}, "t1")])
+        return StubResult(text="第一答")
+
+    h.llm.responder = responder
+    await h.private("第一问//", settle=1.5)
+    h.llm.responder = None
+    h.llm.script_text = "第二答"
+    await h.private("第二问//", settle=1.2)
+
+    msgs = h.llm.requests[-1]["messages"]
+    users = [m["content"] for m in msgs if m.get("role") == "user"]
+    assists = [m["content"] for m in msgs if m.get("role") == "assistant"]
+    session = _current_session(h)
+    hist = h.plugin.store.history(session.id)
+    want_users = [int(m.seq or 0) for m in hist if m.role == "user" and m.seq]
+    check("用户消息带编号", all(u.startswith("[#") for u in users), f"{users}")
+    check("编号就是会话 seq",
+          [int(u[2:u.index("]")]) for u in users] == want_users,
+          f"{[u[:8] for u in users]} vs seq={want_users}")
+    # 只发起工具调用的那条 assistant content 为空 → 不编号（也没法编号）
+    said = [a for a in assists if a.strip()]
+    check("有正文的回答都带编号",
+          bool(said) and all(a.startswith("[#") for a in said), f"{assists}")
+    check("只发起工具调用的那条不加编号", "" in assists, f"{assists}")
+    tool_msgs = [m for m in msgs if m.get("role") == "tool"]
+    check("这一轮真的产生了工具结果（否则下面的断言是空转）",
+          bool(tool_msgs), f"{[m.get('role') for m in msgs]}")
+    check("工具结果不加编号",
+          all(not str(m.get("content") or "").startswith("[#") for m in tool_msgs),
+          f"{[m.get('content') for m in tool_msgs]}")
+    check("系统提示里说明了编号",
+          "[#N]" in h.llm.requests[-1]["messages"][0]["content"],
+          h.llm.requests[-1]["messages"][0]["content"][:200])
+
+
+async def test_quote_uses_label(h: Harness):
+    """引用上文时：文本还在上下文里 → 只给 `[#N]`，**不重抄原文**、也不调 get_msg。"""
+    print("\n[19.9] 引用在上文里 → 用标号代替原文")
+    session = await establish(h)
+    h.clear()
+    h.llm.script_text = "这是要被引用的那段回答。"
+    await h.private("讲一下椭圆//", settle=1.2)
+    answered = h.replies  # noqa: F841 - 只为确保上一轮真的答完
+    hist = h.plugin.store.history(session.id)
+    bot_msg = next(m for m in reversed(hist) if m.role == "assistant")
+    label = int(bot_msg.seq or 0)
+    check("回答有 seq（可被编号）", label > 0, f"{label}")
+    # 让机器人自己那条也能被「按 QQ 消息 id 认出来」
+    sent_id = 950001
+    h.plugin.sent_reply.add([sent_id], session.id, label)
+    h.msg_lookup[sent_id] = {
+        "message_id": sent_id, "message_type": "private",
+        "sender": {"user_id": BOT_ID, "nickname": "测试机器人"},
+        "message": [{"type": "text", "data": {"text": "这是要被引用的那段回答。"}}],
+    }
+    h.clear()
+    before = len(h.calls)
+    h.llm.script_text = "好的，接着说。"
+    await h.private("那它的焦点呢？//", with_reply=sent_id, settle=1.3)
+    seen = h.llm.last_user_content()
+    check(f"用标号指代 [#{label}]", f"[#{label}]" in seen, seen)
+    check("没有重抄原文", "这是要被引用的那段回答" not in seen, seen)
+    check("用户的问题还在", "那它的焦点呢" in seen, seen)
+    gets = [c for c in h.calls[before:] if c.get("action") == "get_msg"]
+    check("不再为这次引用调 get_msg（省掉 1~5 秒节流）", not gets, f"{gets}")
+
+
+async def test_quote_chain_labels(h: Harness):
+    """链式引用：被引用的那条自己也引用了上文 → 两个标号都要带出来。"""
+    print("\n[19.95] 链式引用（引用的引用）")
+    session = await establish(h)
+    h.clear()
+    # 造两条历史消息：m1 是普通回答；m2 是一条**引用着 m1** 的用户输入
+    h.llm.script_text = "第一段回答。"
+    await h.private("第一问//", settle=1.2)
+    hist = h.plugin.store.history(session.id)
+    first = next(m for m in reversed(hist) if m.role == "assistant")
+    first_label = int(first.seq or 0)
+    q1 = next(m for m in reversed(hist) if m.role == "user")
+    q1_label = int(q1.seq or 0)
+    # 让 q1 也「可被按 QQ id 认出」，并把它的 reply_to 指向更早的一条
+    q1.metadata.setdefault("message_ids", []).append(961001)
+    h.plugin.store.replace_history(session.id, h.plugin.store.history(session.id))
+    # 第二层：另一条消息引用 q1（q1 自己又引用着 first）
+    h.msg_lookup[961001] = {
+        "message_id": 961001, "message_type": "private",
+        "sender": {"user_id": ALICE, "nickname": "爱丽丝"},
+        "message": [{"type": "text", "data": {"text": "第一问"}}],
+    }
+    q1.metadata["reply_to"] = 950001
+    # 第二环指向的是一条**机器人回答**：要能被按消息 id 认出来，得先进索引
+    # （线上由 `_remember_sent` 在发送后写入）
+    h.plugin.sent_reply.add([950001], session.id, first_label)
+    h.msg_lookup[950001] = {
+        "message_id": 950001, "message_type": "private",
+        "sender": {"user_id": BOT_ID, "nickname": "测试机器人"},
+        "message": [{"type": "text", "data": {"text": "第一段回答。"}}],
+    }
+    h.clear()
+    h.llm.script_text = "第二段回答。"
+    await h.private("继续//", with_reply=961001, settle=1.3)
+    seen = h.llm.last_user_content()
+    check("第一层用标号", f"[#{q1_label}]" in seen, seen)
+    check("第二层（引用的引用）也用标号", f"[#{first_label}]" in seen, seen)
+    check("两段原文都没重抄",
+          "第一问" not in seen and "第一段回答" not in seen, seen)
+
+
+async def test_quote_falls_back_to_text(h: Harness):
+    """引用的上文**已不在上下文里**时，退回贴原文（老行为）。"""
+    print("\n[19.97] 引用不在上下文里 → 贴原文")
+    await establish(h)
+    h.clear()
+    h.msg_lookup[970001] = {
+        "message_id": 970001, "message_type": "private",
+        "sender": {"user_id": BOB, "nickname": "鲍勃"},
+        "message": [{"type": "text", "data": {"text": "很久以前的一条消息"}}],
+    }
+    h.llm.script_text = "收到。"
+    await h.private("这个怎么理解？//", with_reply=970001, settle=1.3)
+    seen = h.llm.last_user_content()
+    check("原文被贴进来了", "很久以前的一条消息" in seen, seen)
+    check("带上发送人", "鲍勃" in seen, seen)
+    check("没有凭空编标号", "[#" not in seen.split("对方")[-1] if "对方" in seen
+          else True, seen)
+
+
+async def test_terminator_waits_for_ingest(h: Harness):
+    """结束符要先**等**那条还在读引用的消息落进暂存区，不能直接说「暂存区是空的」。
+
+    线上复现（2026-10-09 21:40，用户截图）：21:40:36 发「重试 + 引用」，
+    21:40:38 发 `#`，机器人回「暂存区是空的」—— 因为读引用要走 `get_msg`，
+    而框架给每次 API 调用加了 `api_delay`（线上 1~5 秒），内容 21:40:39 才进
+    暂存区。用户那一按白费了，内容还卡在暂存区里等着下一次 `#`。
+    """
+    print("\n[19.7] 结束符要等「还在读引用」的内容")
+    await establish(h)
+    h.clear()
+    qid = 880001
+    h.msg_lookup[qid] = {
+        "message_id": qid, "message_type": "private",
+        "sender": {"user_id": ALICE, "nickname": "爱丽丝"},
+        "message": [{"type": "text", "data": {"text": "被引用的历史问题"}}],
+    }
+    h.msg_delay = 0.8          # 读引用要 0.8 秒 → 结束符一定先到
+    try:
+        h.llm.script_text = "好的，这是重试后的回答。"
+        await h.private("重试", with_reply=qid, settle=0.05)   # 故意不等它消化完
+        await h.private("//", settle=1.6)                     # 紧接着按结束符
+        await h.wait_reply()
+        texts = [reply_text(r) for r in h.replies]
+        check("没有回「暂存区是空的」",
+              not any("暂存区是空的" in t for t in texts), f"{texts}")
+        seen = h.llm.last_user_content()
+        check("内容确实提交给了模型", "重试" in seen, seen)
+        check("引用内容也在", "被引用的历史问题" in seen, seen)
+    finally:
+        h.msg_delay = 0.0
+
+    # 反证：把这个「等一等」拿掉，同样的时序**确实**会误报 —— 说明这条用例
+    # 不是摆设（改坏了会红）。顺手也解释了线上那句「暂存区是空的」是怎么来的。
+    h.clear()
+    h.msg_delay = 0.8
+    real_wait = h.plugin._await_pending_content
+
+    async def _no_wait(key):
+        return []
+
+    h.plugin._await_pending_content = _no_wait
+    try:
+        await h.private("再试一次", with_reply=qid, settle=0.05)
+        await h.private("//", settle=1.2)
+        texts = [reply_text(r) for r in h.replies]
+        check("去掉等待后确实会误报「暂存区是空的」",
+              any("暂存区是空的" in t for t in texts), f"{texts}")
+    finally:
+        h.plugin._await_pending_content = real_wait
+        # 那半截内容这时**卡在暂存区里**（正是线上那段的处境）—— 等它消化完再清掉，
+        # 否则清早了、它随后落进来，会把后面那条「真的没内容」的用例带偏。
+        key = f"private:{ALICE}"
+        for _ in range(40):
+            if not h.plugin._ingesting.get(key):
+                break
+            await asyncio.sleep(0.1)
+        h.plugin.buffer.take(key)
+        h.msg_delay = 0.0
+
+    # 反例：真的什么都没发时，还是要照实说「暂存区是空的」
+    h.clear()
+    await h.private("//", settle=0.8)
+    text = await h.wait_reply()
+    check("真的没内容时照实回绝", "暂存区是空的" in text, text)
+
+
+async def test_submit_while_busy(h: Harness):
+    """上一轮还在回答时用户按提交键 —— **不能静默吞掉**。
+
+    用户截图报过：「发了内容、又发了结束符，却收到『暂存区是空的：先发内容』」。
+    底下其实是两个 bug 叠在一起：
+
+    ① `_schedule_submit` 撞上 inflight 时直接 `return`，**既不提交也不记下来** ——
+       用户发的内容永远卡在暂存区，后台连一行日志都没有（看起来就是机器人死了）。
+       现在用一个 `_pending_submit` 标记，本轮跑完立刻补提交。
+    ② 只发结束符时一律回「暂存区是空的」，可内容其实**早就收到、正在回答** ——
+       用户以为白发了一遍，于是又按一次，正好撞上这句误导的话。
+    ③ 顺带：只按提交键时不再往暂存区塞一个**空段**（空段会让 `parts` 多算一段，
+       模型会收到一个空段）。
+    """
+    print("\n[17] 回答期间提交：不能吞掉、也不能误导")
+    await establish(h)
+    key = f"private:{ALICE}"
+    orig_chat = h.llm.chat
+
+    async def slow_chat(messages, **kw):
+        await asyncio.sleep(0.8)
+        return await orig_chat(messages, **kw)
+
+    h.llm.chat = slow_chat
+    try:
+        h.clear()
+        await h.private("第一段//", settle=0.15)
+        # 桩模型是慢的（0.8s），所以这里看的是「已经进入回答」而不是调用次数 ——
+        # 调用次数要等桩模型 sleep 完才涨，判它会假失败
+        check("第一段已提交、正在回答", key in h.plugin._inflight,
+              f"inflight={sorted(h.plugin._inflight)}")
+
+        # 第一轮还在跑：再发一段内容 + 结束符
+        await h.private("第二段内容", settle=0.15)
+        await h.private("//", settle=0.15)
+        # 只在结束符上按一次：不能往暂存区塞空段
+        staged = [it.get("text") for it in
+                  (h.plugin.buffer.peek(key).get("items") or [])]
+        check("只按结束符不会塞空段", all(str(t).strip() for t in staged),
+              f"暂存区={staged!r}")
+
+        await asyncio.sleep(2.2)              # 等第一轮跑完 + 补提交
+        check("暂存区已清空（补提交生效）",
+              not (h.plugin.buffer.peek(key).get("items")),
+              f"残留={h.plugin.buffer.peek(key)}")
+        check("第二段真的提交给了模型", h.llm.calls >= 2, f"calls={h.llm.calls}")
+        seen = h.llm.last_user_content()
+        check("模型看到的是第二段内容", "第二段内容" in seen, seen)
+        check("第二段没有被标成多段、也没有序号",
+              _unlabeled(seen).strip() == "第二段内容", seen)
+
+        # 回答期间再按一次结束符：回执要说明「正在回答」，不能说「暂存区是空的」
+        h.clear()
+        await h.private("第三段//", settle=0.15)
+        await h.private("//", settle=0.35)
+        texts = " ".join(str(r) for r in h.replies)
+        check("回答期间按结束符：提示是「正在回答」",
+              "正在回答" in texts, texts[:200])
+        check("回答期间按结束符：不再说「暂存区是空的」",
+              "暂存区是空的" not in texts, texts[:200])
+        await asyncio.sleep(1.6)
+    finally:
+        h.llm.chat = orig_chat
+
+
+async def test_staging_persistence(h: Harness):
+    print("\n[16] 暂存区落盘（重启不丢）")
+    await establish(h)
+    h.clear()
+    await h.group("重启前的一段话", at_bot=True, message_id=666, settle=0.5)
+    path = h.plugin.buffer.path
+    check("暂存区文件存在", Path(path).exists(), path)
+    data = json.loads(Path(path).read_text(encoding="utf-8"))
+    check("暂存内容已落盘",
+          any("重启前的一段话" in str(it.get("text"))
+              for it in (data.get(f"group:{GROUP}") or {}).get("items", [])),
+          f"{data}")
+
+
+async def test_multi_part_reply(h: Harness):
+    print("\n[17] 长回复分段发送")
+    await establish(h)
+    h.clear()
+    long_text = "这是一段很长的回复。" * 200
+    h.llm.script_text = long_text
+    try:
+        await h.private("来段长的//", settle=1.6)
+        await asyncio.sleep(0.6)
+        check("长回复被拆成多条", len(h.replies) >= 2, f"条数={len(h.replies)}")
+        joined = "".join(reply_text(r) for r in h.replies)
+        check("分段后内容不丢", joined.count("这是一段很长的回复。") == 200,
+              f"实际 {joined.count('这是一段很长的回复。')} 段")
+        check("每条都在配额内",
+              all(len(reply_text(r)) <= 1200 for r in h.replies),
+              f"{[len(reply_text(r)) for r in h.replies]}")
+    finally:
+        h.llm.script_text = "好的，我收到了。"
+
+
+async def test_reply_text_as_context(h: Harness):
+    print("\n[18] 引用文本消息作为上文")
+    await establish(h, group_id=GROUP)
+    h.clear()
+    # `get_msg` 桩：引用的那条是别人发的文本
+    quoted_id = 424242
+    h.msg_lookup[quoted_id] = {
+        "message_id": quoted_id, "message_type": "group",
+        "sender": {"user_id": BOB, "nickname": "鲍勃", "card": ""},
+        "message": [{"type": "text", "data": {"text": "原问题：图书馆国庆开吗？"}}],
+    }
+    # ⚠️ 断言「结束符被剥掉」：`//` 只可能出现在用户自己敲的那部分。
+    # 曾经引文被拼在结束符之前，`//` 被挤到中间，用户怎么发都不提交。
+    await h.group("那到底开不开//", at_bot=True, with_reply=quoted_id, settle=1.6)
+    seen = h.llm.last_user_content()
+    check("引用后仍能提交（结束符没被引文挤走）",
+          h.llm.calls >= 1, f"调模型 {h.llm.calls} 次")
+    check("引用的正文进了模型上下文", "图书馆国庆开吗" in seen, f"{seen!r}")
+    check("引文带发送者名", "鲍勃" in seen, f"{seen!r}")
+    check("结束符没漏进上下文", "//" not in seen, f"{seen!r}")
+    check("用户自己那句也在", "那到底开不开" in seen, f"{seen!r}")
+
+
+async def test_reply_media_submits_text(h: Harness):
+    """引用多媒体时**把能提交的文字部分提交上去**，不再整轮回绝。
+
+    原来只要引文是图片/语音，就回一句「暂不支持多模态」并丢掉整条输入 ——
+    可用户写的那个问题明明是好的（「这个怎么说？」），却被一起扔了，
+    连模型都没见到。现在那句话只是一句**提示**，落在引文的位置上。
+    """
+    print("\n[19] 引用多媒体：提交文字 + 一句提示（不回绝）")
+    await establish(h, group_id=GROUP)
+    for seg_type, label in (("image", "图片"), ("record", "语音")):
+        h.clear()
+        quoted_id = 500000 + len(seg_type)
+        h.msg_lookup[quoted_id] = {
+            "message_id": quoted_id, "message_type": "group",
+            "sender": {"user_id": BOB, "nickname": "鲍勃", "card": ""},
+            "message": [{"type": seg_type, "data": {"file": "x"}}],
+        }
+        await h.group("这个怎么说？//", at_bot=True, with_reply=quoted_id,
+                      settle=1.2)
+        check(f"引用{label}：仍然提交给模型", h.llm.calls == 1,
+              f"calls={h.llm.calls}")
+        seen = h.llm.last_user_content()
+        check(f"引用{label}：用户的问题在里面", "这个怎么说" in seen, seen)
+        # 提示要跟**当前规则**一致：图片得 /aichat mark 才会传；历史语音不重传
+        expect = "mark" if label == "图片" else "听不到"
+        check(f"引用{label}：引文位置有一句提示",
+              expect in seen and label in seen, seen)
+
+    # 只引用一张图、自己一个字都不写：也要提交（提示就是全部内容）
+    h.clear()
+    h.msg_lookup[500009] = {
+        "message_id": 500009, "message_type": "group",
+        "sender": {"user_id": BOB, "nickname": "鲍勃", "card": ""},
+        "message": [{"type": "image", "data": {"file": "x"}}],
+    }
+    await h.group("//", at_bot=True, with_reply=500009, settle=1.2)
+    check("只引用图、不写字也会提交", h.llm.calls == 1, f"calls={h.llm.calls}")
+    check("提交内容就是那句提示",
+          "mark" in h.llm.last_user_content(),
+          h.llm.last_user_content())
+
+    # 读不到引文（撤回/接口失败）也不能静默吞掉整轮
+    h.clear()
+    await h.group("读不到的那种？//", at_bot=True, with_reply=999999, settle=1.4)
+    check("引文读不到时仍然提交", h.llm.calls >= 1, f"调模型 {h.llm.calls} 次")
+    check("读不到引文有标注", "读不到" in h.llm.last_user_content(),
+          f"{h.llm.last_user_content()!r}")
+
+
+async def test_md_command(h: Harness):
+    """顶层 `/md`：把**上一条 AI 回复**转成 Markdown 图片发过来。
+
+    刻意**不带子命令**（`/md` 而不是 `/aichat md`）—— 这是日常用得最多的一句话
+    动作，值得少打几个字。它仍然受服务范围限制（走同一个守卫）。
+    """
+    print("\n[19.1] /md：把上条 AI 回复转成图片")
+    await establish(h)
+    reply_text = "## 椭圆\n\n标准椭圆 $x^2/25+y^2/9=1$。\n\n| 量 | 值 |\n| --- | --- |\n| a | 5 |"
+    h.llm.script_text = reply_text
+    h.clear()
+    await h.private("讲讲椭圆//", settle=1.4)
+    await h.wait_reply()
+
+    seen: list[str] = []
+    orig = h.plugin.renderer.render_markdown
+
+    async def spy(text, **kw):
+        seen.append(text)
+        return await orig(text, **kw)
+
+    h.plugin.renderer.render_markdown = spy
+    try:
+        h.clear()
+        await h.private("/md", settle=2.0)
+    finally:
+        h.plugin.renderer.render_markdown = orig
+
+    check("拿去渲染的正是上一条 AI 回复", seen and "标准椭圆" in seen[0],
+          f"{seen[:1]}")
+    check("Markdown 原文一字不差（不是渲染后的产物）",
+          bool(seen) and seen[0].strip() == reply_text.strip(),
+          f"{seen[:1]}")
+    pics = [m for m in h.sent
+            if any(str(seg.get("type")) == "image"
+                   for seg in (m["params"].get("message") or [])
+                   if isinstance(seg, dict))]
+    check("发出了一张图片", bool(pics), f"{[m['params'].get('message') for m in h.sent]}")
+    check("没有再调模型", h.llm.calls == 0, f"calls={h.llm.calls}")
+
+    # 再来一次：用的仍是**最后一条**（这次是新的那条）
+    h.llm.script_text = "第二条回复。"
+    h.clear()
+    await h.private("再来一条//", settle=1.2)
+    await h.wait_reply()
+    seen.clear()
+    h.plugin.renderer.render_markdown = spy
+    try:
+        await h.private("/md", settle=1.6)
+    finally:
+        h.plugin.renderer.render_markdown = orig
+    check("取的是最后一条 AI 回复", bool(seen) and "第二条回复" in seen[0],
+          f"{seen[:1]}")
+
+    # 空会话：还没有 AI 回复
+    h.clear()
+    await h.private("/aichat new 空会话", settle=0.5)
+    await h.wait_reply()
+    h.clear()
+    await h.private("/md", settle=1.0)
+    text = await h.wait_reply()
+    check("还没回复过时给一句说明", "还没有" in text, text)
+
+
+async def test_quote_chain(h: Harness):
+    """引用要能**沿菊花链往上读**：被引用的那条自己也是引用别人的。
+
+    群聊里接龙式对话很常见（A 引用 B，B 引用 C），只读一层的话模型看到的是半截话。
+    """
+    print("\n[19.2] 引用支持菊花链")
+    await establish(h, group_id=GROUP)
+    h.clear()
+    # C：最底层那条
+    h.msg_lookup[700003] = {
+        "message_id": 700003, "message_type": "group",
+        "sender": {"user_id": BOB, "nickname": "鲍勃", "card": ""},
+        "message": [{"type": "text", "data": {"text": "底层的原话：闭馆三天"}}],
+    }
+    # B：引用了 C
+    h.msg_lookup[700002] = {
+        "message_id": 700002, "message_type": "group",
+        "sender": {"user_id": BOB, "nickname": "鲍勃", "card": ""},
+        "message": [{"type": "reply", "data": {"id": "700003"}},
+                    {"type": "text", "data": {"text": "中间那层说"}}],
+    }
+    await h.group("那到底怎么说？//", at_bot=True, with_reply=700002, settle=1.2)
+    seen = h.llm.last_user_content()
+    check("读到被引用的那一层", "中间那层说" in seen, seen)
+    check("继续往上读到更底一层", "底层的原话" in seen, seen)
+    check("两层都标了来源", seen.count("[引用上文]") == 2, seen)
+
+    # 环：自己引用自己，不能转不出来
+    h.clear()
+    h.msg_lookup[700004] = {
+        "message_id": 700004, "message_type": "group",
+        "sender": {"user_id": BOB, "nickname": "鲍勃", "card": ""},
+        "message": [{"type": "reply", "data": {"id": "700004"}},
+                    {"type": "text", "data": {"text": "自引用"}}],
+    }
+    await h.group("环测试//", at_bot=True, with_reply=700004, settle=1.2)
+    check("自引用环不会卡住", h.llm.calls >= 1, f"calls={h.llm.calls}")
+
+
+async def test_quote_ai_image(h: Harness):
+    """引用 AI 回答里**含图片**的那条 → 用 AI 当时生成的原文替代。
+
+    Markdown 模式的整篇回答就是一张图、函数图与公式图也都是图 —— 它们在 QQ 那边
+    没有文字，`get_msg` 读回来只有「一张图片」。可那段内容本来就是我们自己生成的，
+    原文就在会话历史里（用户要求）。
+    """
+    print("\n[19.3] 引用 AI 的图片 → 用原文替代")
+    await establish(h)
+    h.clear()
+    h.llm.script_text = "标准椭圆 x²/25+y²/9=1，长半轴 5，短半轴 3。"
+    h.sent.clear()
+    await h.private("讲讲椭圆//md", settle=1.6)      # md 模式：整篇出成一张图
+    await h.wait_reply()
+
+    pics = [m for m in h.sent
+            if any(str(seg.get("type")) == "image"
+                   for seg in (m["params"].get("message") or [])
+                   if isinstance(seg, dict))]
+    check("这一轮真的发了图片", bool(pics),
+          f"{[m['params'].get('message') for m in h.sent]}")
+    if not pics:
+        return
+    pic_id = pics[0]["message_id"]
+
+    # QQ 那边读回来就是「一张图片」——没有文字
+    h.msg_lookup[pic_id] = {
+        "message_id": pic_id, "message_type": "private",
+        "sender": {"user_id": BOT_ID, "nickname": "测试机器人"},
+        "message": [{"type": "image", "data": {"file": "x.png"}}],
+    }
+    h.clear()
+    h.llm.script_text = "好的。"
+    await h.private("那张图里写的什么？//", with_reply=pic_id, settle=1.6)
+    seen = h.llm.last_user_content()
+    # 现在这段原文**还在上下文里**，所以按「引用上文用标号代替原文」的规矩
+    # 只给编号（不再重抄一遍原文，也不再贴「机器人自己发的图」的原文段）。
+    target = next((m for m in h.plugin.store.history(_current_session(h).id)
+                   if m.role == "assistant" and "长半轴 5" in (m.text or "")), None)
+    label = int(target.seq or 0) if target is not None else 0
+    check("用标号指代那条回答", label and f"[#{label}]" in seen, seen)
+    check("没有重抄原文", "长半轴 5" not in seen, seen)
+    check("这句也进了正文", "那张图里写的什么" in seen, seen)
+
+    # 别人发的图读不到内容，但用户的问题照常提交（不再整轮回绝）
+    h.clear()
+    other = 700009
+    h.msg_lookup[other] = {
+        "message_id": other, "message_type": "private",
+        "sender": {"user_id": BOB, "nickname": "鲍勃"},
+        "message": [{"type": "image", "data": {"file": "y.png"}}],
+    }
+    await h.private("这张呢？//", with_reply=other, settle=1.2)
+    seen2 = h.llm.last_user_content()
+    check("别人的图：内容读不到，但用户的问题照常提交",
+          "这张呢" in seen2 and "/aichat mark" in seen2, seen2)
+
+
+async def test_reply_index_survives_reload(h: Harness):
+    """`SentReplyIndex` 记的 `(sid, seq)` 在**重新加载历史之后**仍要能取到原文。
+
+    踩过的坑：`Message.to_dict()` 漏写 `seq`，落盘读回来的消息 seq 全是 0，
+    `SessionStore.find()` 于是**一个都对不上** —— 表现是「引用机器人自己发的
+    图片，永远只有一句『读不到』」，而用户要的是「替换成 AI 当时生成的原文」。
+    热重载一次就复现，所以它是「偶尔灵、重启后必坏」的那类 bug。
+    """
+    print("\n[19.4] 引用索引跨重载")
+    store_mod = plugin_module("store")
+    seg_mod = plugin_module("segments")
+    SessionStore, SentReplyIndex = store_mod.SessionStore, store_mod.SentReplyIndex
+    import json as _json
+    import tempfile
+
+    tmpdir = Path(tempfile.mkdtemp(prefix="reply-index-",
+                                   dir=str(ROOT / "tests" / ".test-tmp")))
+    st = SessionStore(str(tmpdir))
+    s = st.create("索引会话", owner_kind="user", owner_id=ALICE)
+    st.append(s.id, seg_mod.user_message("讲讲椭圆"))
+    ans = seg_mod.assistant_message("标准椭圆 x²/25+y²/9=1，长半轴 5。")
+    st.append(s.id, ans)
+    seq = int(ans.seq or 0)
+    check("assistant 消息拿到会话内序号", seq > 0, f"seq={seq}")
+
+    idx = SentReplyIndex(str(Path(tmpdir) / "sent_replies.json"))
+    idx.add([9001], s.id, seq)
+
+    # 等价于一次热重载 / 进程重启：全部从 jsonl 重新读
+    st2 = SessionStore(str(tmpdir))
+    got = st2.find(s.id, seq)
+    check("重载后仍能按 seq 取到原文",
+          got is not None and "标准椭圆" in (got.text or ""), f"{got}")
+    pair = SentReplyIndex(str(Path(tmpdir) / "sent_replies.json")).get(9001)
+    check("索引落盘后能读回 (sid, seq)", pair == (s.id, seq), f"{pair}")
+    got2 = st2.find(*pair) if pair else None
+    check("「消息 id → 索引 → 原文」这条链完整",
+          got2 is not None and "标准椭圆" in (got2.text or ""), f"{got2}")
+
+    # 老文件（写入时还没有 seq 字段）也要能按会话计数倒推出来
+    path = Path(tmpdir) / "sessions" / f"{s.id}.jsonl"
+    rows = [_json.loads(x) for x in path.read_text("utf-8").splitlines() if x.strip()]
+    for r in rows:
+        r.pop("seq", None)
+    path.write_text("\n".join(_json.dumps(r, ensure_ascii=False) for r in rows) + "\n",
+                    encoding="utf-8")
+    st3 = SessionStore(str(tmpdir))
+    got3 = st3.find(s.id, seq)
+    check("老 jsonl（无 seq 字段）倒推出的序号仍然正确",
+          got3 is not None and "标准椭圆" in (got3.text or ""), f"{got3}")
+    check("倒推的序号就是最后一条", int(got3.seq) == int(st3.get(s.id).message_count)
+          if got3 else False, f"{getattr(got3, 'seq', None)}")
+
+
+async def test_paging_long_reply(h: Harness):
+    print("\n[20] 超长回复自动分页")
+    await establish(h)
+    h.clear()
+    # 恰好 3000 字：按 1200 切应为 1200/1200/600 三条
+    h.llm.script_text = "分页测试。" * 600
+    try:
+        await h.private("来段超长的//", settle=2.0)
+        await asyncio.sleep(0.6)
+        lens = [len(reply_text(r)) for r in h.replies]
+        check("拆成 3 条", len(h.replies) == 3, f"条数={len(h.replies)} 长度={lens}")
+        check("每条都在 1200 以内", all(n <= 1200 for n in lens), f"{lens}")
+        check("分页后内容完整",
+              "".join(reply_text(r) for r in h.replies).count("分页测试。") == 600,
+              f"{lens}")
+        check("分页不带省略号（不是截断）",
+              not any("…" in reply_text(r) or "..." in reply_text(r)
+                      for r in h.replies), f"{lens}")
+    finally:
+        h.llm.script_text = "好的，我收到了。"
+
+
+async def test_llm_error_surfaces(h: Harness):
+    print("\n[21] LLM 失败要说人话")
+    await establish(h)
+    h.clear()
+    LlmError = plugin_module("llm").LlmError
+
+    def responder(messages, tools):
+        raise LlmError("HTTP 401: invalid api key", status=401)
+
+    h.llm.responder = responder
+    try:
+        await h.private("会失败的一轮//", settle=1.2)
+        reply = await h.wait_reply()
+        check("用户看到错误提示", "出错" in reply or "401" in reply, reply)
+        check("错误里带原因", "401" in reply, reply)
+    finally:
+        h.llm.responder = None
+
+
+async def test_llm_timeout_hint(h: Harness):
+    """上游「想太久 / 卡死」时要给一句能照做的提示，而不是光甩一个 TimeoutError。
+
+    实测：`deepseek-v4-flash` 遇到「这段 C++ 会报什么运行时错误」这类输入会连想
+    200 秒以上（4096 token 全花在思考链上、正文 0 字）。用户看到的只有
+    `LlmError: TimeoutError`，既不知道能不能重试，也不知道该改什么。
+
+    流式之后「卡死」与「只是慢」是两种失败（见 `llm._chat_stream`），提示必须分开给：
+    对真正的网络卡顿说「把问题拆小」毫无帮助。
+    """
+    print("\n[21.6] 上游超时要说人话")
+    await establish(h)
+    h.clear()
+    LlmError = plugin_module("llm").LlmError
+    cfg = h.plugin.cfg["llm"]
+    old = {k: cfg.get(k) for k in ("max_retries", "retry_backoff", "retry_max_wait",
+                                   "retry_notice")}
+    cfg.update({"max_retries": 0, "retry_backoff": 0, "retry_max_wait": 0})
+
+    def responder(messages, tools):
+        raise LlmError("超过单次调用总时长上限 270s（已生成 0 字正文）",
+                       retryable=False)
+
+    h.llm.responder = responder
+    try:
+        await h.private("一段会把它想死的问题//", settle=1.2)
+        reply = await h.wait_reply()
+        check("仍然报出错", "出错" in reply, reply)
+        check("说明是「超过上限」", "上限" in reply, reply)
+        check("给出可照做的动作（拆小 / 调 timeout）",
+              "拆小" in reply and "timeout" in reply, reply)
+    finally:
+        h.llm.responder = None
+        h.clear()
+
+    # 卡死（stall）是另一种失败：该说的是「上游没吐数据、再发一次」
+    def stalled(messages, tools):
+        raise LlmError("流式读取停滞 60s（上游不再吐数据，已生成 0 字正文）",
+                       retryable=True)
+
+    h.llm.responder = stalled
+    try:
+        await h.private("卡住的一轮//", settle=1.2)
+        reply = await h.wait_reply()
+        check("卡死提示指向 stall_timeout 而不是「拆小问题」",
+              "卡住" in reply and "stall_timeout" in reply and "拆小" not in reply,
+              reply)
+    finally:
+        h.llm.responder = None
+
+    # 别的失败（参数错）不该乱加这句 —— 提示要跟原因对得上
+    def bad_key(messages, tools):
+        raise LlmError("HTTP 401: invalid api key", status=401)
+
+    h.clear()                       # 前面几轮的回复还堆在 h.replies 里
+    h.llm.responder = bad_key
+    try:
+        await h.private("再来一次//", settle=1.2)
+        reply = await h.wait_reply()
+        check("401 不加超时提示", "上限" not in reply and "停滞" not in reply, reply)
+    finally:
+        h.llm.responder = None
+        cfg.update(old)
+
+
+async def test_escaped_prefix_paste(h: Harness):
+    """用户自己加的「转义命令前缀」反斜杠要脱掉，别原样喂给模型。
+
+    实测踩到：用户想粘一段 C++，为了不让 `#include…` 被当成命令（本部署里 `#`
+    既是命令前缀又是结束符），自己补了个反斜杠写成 `\\#include<bits/stdc++.h>`。
+    框架其实不需要这个转义（`#include<…>` 不是合法命令名，命令分发本来就静默
+    丢掉），可模型收到的是带反斜杠的代码，于是答「第一行编译不过」。
+    """
+    print("\n[21.7] 转义前缀的粘贴")
+    await establish(h)
+    h.clear()
+    h.llm.script_text = "第一行是 memset 的第三个参数用错了。"
+    # 线上结束符配的就是 `#`（`//` 会被 C++ 代码里的注释行撞上），这里照搬
+    trigger = h.plugin.cfg["trigger"]
+    old_terms = list(trigger.get("terminators") or [])
+    trigger["terminators"] = ["#"]
+    code = ("\\#include<bits/stdc++.h>\nusing namespace std;\n"
+            "int main(){return 0;}这段会报什么运行时错误#")
+    try:
+        await h.private(code, settle=1.6)
+        seen = h.llm.last_user_content()
+        check("正文里没有多余的转义反斜杠", "\\#include" not in seen, seen)
+        check("代码本身原样保留", "#include<bits/stdc++.h>" in seen, seen)
+        check("结束符已被剥掉（提交了而不是卡在暂存区）",
+              "运行时错误" in seen and not seen.rstrip().endswith("#"), seen)
+
+        # LaTeX 里的 `\#`（不在行首）不能被误伤
+        h.clear()
+        await h.private("$\\#$ 在 LaTeX 里表示什么？#", settle=1.2)
+        seen2 = h.llm.last_user_content()
+        check("行内 LaTeX 的 \\# 保持原样", "$\\#$" in seen2, seen2)
+    finally:
+        trigger["terminators"] = old_terms
+
+
+async def test_sse_parse(h: Harness):
+    """SSE 分片解析：任意位置切断、心跳注释、`[DONE]`、工具调用分片累积。"""
+    print("\n[21.8] 流式分片解析")
+    llm = plugin_module("llm")
+
+    def sse(obj) -> bytes:
+        return b"data: " + json.dumps(obj, ensure_ascii=False).encode() + b"\n"
+
+    blob = b"".join([
+        b": keep-alive\n\n",                                   # 心跳注释
+        sse({"choices": [{"delta": {"role": "assistant", "content": ""}}]}),
+        sse({"choices": [{"delta": {"reasoning_content": "想"}}]}),
+        sse({"choices": [{"delta": {"content": "你"}}]}),
+        sse({"choices": [{"delta": {"content": "好"}}]}),
+        sse({"choices": [{"delta": {"tool_calls": [
+            {"index": 0, "id": "c1", "type": "function",
+             "function": {"name": "now", "arguments": ""}}]}}]}),
+        sse({"choices": [{"delta": {"tool_calls": [
+            {"index": 0, "function": {"arguments": '{"a"'}}]}}]}),
+        sse({"choices": [{"delta": {"tool_calls": [
+            {"index": 0, "function": {"arguments": ":1}"}}]}}]}),
+        sse({"choices": [{"delta": {}, "finish_reason": "tool_calls"}]}),
+        sse({"choices": [{"delta": {}}], "usage": {"total_tokens": 7}}),
+        b"data: not-json\n",                                   # 半行/垃圾
+        b"data: [DONE]\n",
+    ])
+    buf = llm.SseBuffer()
+    acc = llm._StreamAcc()
+    for i in range(0, len(blob), 7):        # 每 7 字节喂一次 → 必然切断 JSON
+        for obj in buf.feed(blob[i:i + 7]):
+            acc.merge(obj)
+    for obj in buf.flush():
+        acc.merge(obj)
+    res = acc.result()
+    check("正文跨分片拼回", res.text == "你好", repr(res.text))
+    check("[DONE] 被识别", buf.done, f"{buf.done}")
+    check("垃圾行被丢掉而不是炸掉", res.finish_reason == "tool_calls",
+          res.finish_reason)
+    check("工具调用参数按 index 累积",
+          [(c.name, c.arguments) for c in res.tool_calls] == [("now", {"a": 1})],
+          f"{[(c.name, c.raw_arguments) for c in res.tool_calls]}")
+    check("usage 收到", res.usage.get("total_tokens") == 7, f"{res.usage}")
+    check("思考链单独计数（不进正文）", res.raw.get("reasoning_chars") == 1,
+          f"{res.raw}")
+
+    # 思考链吃光配额（content 为空）要说清楚，而不是回一句空话
+    acc2 = llm._StreamAcc()
+    acc2.merge({"choices": [{"delta": {"reasoning_content": "想了很久"}}]})
+    acc2.merge({"choices": [{"delta": {}, "finish_reason": "length"}]})
+    try:
+        acc2.result()
+        check("空正文要报错", False, "没有报错")
+    except llm.LlmError as e:
+        check("空正文报错并提示调大 max_tokens", "max_tokens" in str(e), str(e))
+
+
+async def test_llm_stream_cutoff(h: Harness):
+    """流式请求：正常流 / 端点不回 SSE / 上游卡死 / 超过总时长。
+
+    这组断言对应「掐断逻辑」本身 —— 它不是按总时长一刀切，而是：
+    **只要 token 还在流就一直等**（上限 `timeout`），**多久没新数据**（`stall_timeout`）
+    才是卡死判据；真被掐断时把**已经生成的部分**带在异常里（`LlmError.partial`）。
+    """
+    print("\n[21.9] 流式掐断判据")
+    from aiohttp import web
+    llm = plugin_module("llm")
+    seen_payloads: list[dict] = []
+
+    def sse(obj) -> bytes:
+        return b"data: " + json.dumps(obj, ensure_ascii=False).encode() + b"\n"
+
+    async def endpoint(request):
+        kind = request.match_info["kind"]
+        body = await request.json()
+        seen_payloads.append(body)
+        if kind == "plain":            # 端点忽略 stream，直接回 JSON
+            return web.json_response({
+                "choices": [{"message": {"content": "普通响应"},
+                             "finish_reason": "stop"}],
+                "usage": {"total_tokens": 3}})
+        resp = web.StreamResponse(headers={"Content-Type": "text/event-stream"})
+        await resp.prepare(request)
+        try:
+            await resp.write(sse({"choices": [{"delta": {"content": "前半"}}]}))
+            if kind == "stall":
+                await asyncio.sleep(3)          # 之后一个字节都不吐
+                return resp
+            if kind == "slow":
+                for _ in range(50):             # 一直在吐，但总时长的上限会先到
+                    await resp.write(sse({"choices": [{"delta": {"content": "x"}}]}))
+                    await asyncio.sleep(0.2)
+                return resp
+            await resp.write(sse({"choices": [{"delta": {"content": "后半"}}]}))
+            await resp.write(sse({"choices": [{"delta": {},
+                                               "finish_reason": "stop"}]}))
+            await resp.write(b"data: [DONE]\n")
+        except (ConnectionResetError, RuntimeError):
+            pass                                # 客户端掐断后写失败是预期的
+        return resp
+
+    app = web.Application()
+    # 四种行为各占一个前缀：客户端固定 POST `{base_url}/chat/completions`，
+    # 所以把「哪一种」放进 base_url
+    app.router.add_post("/{kind}/chat/completions", endpoint)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "127.0.0.1", 0)
+    await site.start()
+    port = site._server.sockets[0].getsockname()[1]      # noqa: SLF001
+
+    def client(kind: str, **kw):
+        return llm.LlmClient(base_url=f"http://127.0.0.1:{port}/{kind}",
+                             api_key="k", model="m", max_tokens=64, **kw)
+
+    try:
+        # ① 正常流
+        c = client("ok", stream=True, timeout=10, stall_timeout=5)
+        r = await c.chat([{"role": "user", "content": "hi"}])
+        check("流式正文拼成完整回答", r.text == "前半后半", repr(r.text))
+        check("流式请求带 stream_options",
+              seen_payloads[-1].get("stream_options", {}).get("include_usage") is True,
+              f"{seen_payloads[-1].get('stream_options')}")
+        check("流式请求 stream=true", seen_payloads[-1].get("stream") is True,
+              f"{seen_payloads[-1].get('stream')}")
+        await c.close()
+
+        # ② 端点没按 SSE 回 → 当普通 JSON 解析（不因为「开了流式」就废掉）
+        c = client("plain", stream=True, timeout=10, stall_timeout=5)
+        r = await c.chat([{"role": "user", "content": "hi"}])
+        check("端点忽略 stream 时退回 JSON 解析", r.text == "普通响应", repr(r.text))
+        await c.close()
+
+        # ③ 卡死：stall_timeout 内没有新数据 → 可重试，且带上半截
+        c = client("stall", stream=True, timeout=30, stall_timeout=0.6)
+        try:
+            await c.chat([{"role": "user", "content": "hi"}])
+            check("卡死要被掐断", False, "居然成功了")
+        except llm.LlmError as e:
+            check("报的是「停滞」而不是总超时", "停滞" in str(e), str(e))
+            check("卡死算可重试", e.retryable is True, f"{e.retryable}")
+            check("带出已生成的部分", e.partial == "前半", repr(e.partial))
+        await c.close()
+
+        # ④ 一直在吐但超过总时长 → 掐断但**不可重试**（再试也是同样的时间）
+        c = client("slow", stream=True, timeout=1.0, stall_timeout=30)
+        try:
+            await c.chat([{"role": "user", "content": "hi"}])
+            check("超过总时长要被掐断", False, "居然成功了")
+        except llm.LlmError as e:
+            check("报的是总时长上限", "上限" in str(e), str(e))
+            check("总超时不再重试", e.retryable is False, f"{e.retryable}")
+            check("总超时也带出半截", e.partial.startswith("前半"),
+                  repr(e.partial))
+        await c.close()
+    finally:
+        await runner.cleanup()
+
+
+async def test_partial_reply_on_cutoff(h: Harness):
+    """上游被掐断时把**已经生成的部分**发给用户，而不是只回一句报错。"""
+    print("\n[21.95] 掐断时先发半截")
+    await establish(h)
+    h.clear()
+    LlmError = plugin_module("llm").LlmError
+
+    def responder(messages, tools):
+        raise LlmError("超过单次调用总时长上限 270s（已生成 42 字正文）",
+                       retryable=False, partial="先讲到这里：定积分是……")
+
+    h.llm.responder = responder
+    try:
+        await h.private("一个很长的问题//", settle=1.4)
+        await h.wait_for_replies(2)          # ① 说明「被掐断了」 ② 半截正文
+        texts = [reply_text(r) for r in h.replies]
+        check("先说明上游中断了", any("已经生成的部分" in t for t in texts), f"{texts}")
+        check("半截正文也发出来了", any("定积分是" in t for t in texts), f"{texts}")
+        check("半截排在说明之后", "定积分是" in texts[-1], f"{texts}")
+    finally:
+        h.llm.responder = None
+
+
+async def test_llm_stream_wiring(h: Harness):
+    """`llm.stream` / `llm.stall_timeout` 要真的接到客户端上（不只是写进默认值）。
+
+    这类「配置项加了、代码没读」的坑在本仓库出现过好几次（`plot.unit_px`、
+    `trigger.auto_submit_seconds`），所以这里断言的是**客户端对象的属性**，
+    以及 `/aichat current` 里能看到当前用的是哪一套掐断判据。
+    """
+    print("\n[21.96] 流式配置的接线")
+    await establish(h)
+    llm_cfg = h.plugin.cfg["llm"]
+    check("默认开流式", llm_cfg.get("stream") is True, f"{llm_cfg.get('stream')}")
+    check("默认有 stall_timeout", float(llm_cfg.get("stall_timeout", 0)) == 60.0,
+          f"{llm_cfg.get('stall_timeout')}")
+    # ⚠️ `h.plugin.llm` 是测试桩，所以要问插件自己的工厂要一个**真客户端**
+    real = h.plugin._build_llm()
+    check("真客户端拿到 stream", real.stream is True, f"{real.stream}")
+    check("真客户端拿到 stall_timeout", float(real.stall_timeout) == 60.0,
+          f"{real.stall_timeout}")
+    check("真客户端拿到总时长上限", float(real.timeout) == float(llm_cfg["timeout"]),
+          f"{real.timeout}")
+    await real.close()
+
+    # 关掉流式（退回老路）时，工厂造出来的客户端与 `current` 的话术都要跟着变
+    old = llm_cfg.get("stream")
+    llm_cfg["stream"] = False
+    try:
+        real2 = h.plugin._build_llm()
+        check("关掉之后真客户端也不再流式", real2.stream is False, f"{real2.stream}")
+        await real2.close()
+        # `current` 读的是 `self.llm`（测试里是桩），所以这里同步桩上的开关
+        stub_stream = h.plugin.llm.stream
+        h.plugin.llm.stream = False
+        h.clear()
+        await h.private("/aichat current", settle=0.8)
+        text = await h.wait_reply()
+        check("current 里能看到掐断判据", "掐断" in text and "非流式" in text, text)
+        h.plugin.llm.stream = stub_stream
+    finally:
+        llm_cfg["stream"] = old
+
+    h.clear()
+    await h.private("/aichat current", settle=0.8)
+    text2 = await h.wait_reply()
+    check("流式时 current 说明停滞判据", "流式" in text2 and "停滞" in text2, text2)
+
+
+async def test_llm_retry(h: Harness):
+    """模型调用失败要**自动重试**，次数可配。
+
+    用户报过：上游 DNS 抽了一下（`Name or service not known`），那一轮就直接
+    报错结束了 —— 而这类失败下一毫秒重发就好。判据是 `LlmError.retryable`
+    （网络层异常 / 408·409·425·429 / 5xx / 上游回了看不懂的东西），
+    **4xx 不重试**：参数错、key 失效，再试一百次也是同一个结果。
+    """
+    print("\n[21.5] 模型调用失败自动重试")
+    await establish(h)
+    LlmError = plugin_module("llm").LlmError
+    cfg = h.plugin.cfg["llm"]
+    old_cfg = {k: cfg.get(k) for k in
+               ("max_retries", "retry_backoff", "retry_max_wait", "retry_notice")}
+    cfg["retry_backoff"] = 0            # 测试里别真等
+    cfg["retry_max_wait"] = 0
+
+    def flaky(n_fail, *, retryable=True, status=503):
+        """前 n 次失败，之后成功。"""
+        state = {"n": 0}
+
+        def responder(messages, tools):
+            state["n"] += 1
+            if state["n"] <= n_fail:
+                raise LlmError(f"HTTP {status}: boom", status=status,
+                               retryable=retryable)
+            return StubResult(text="重试之后成功了")
+        return state, responder
+
+    try:
+        # ① 失败两次后成功：模型被调 3 次，用户拿到正常回答
+        cfg["max_retries"] = 2
+        state, resp = flaky(2)
+        h.llm.responder = resp
+        h.clear()
+        await h.private("上游抖两下//", settle=0.4)
+        # 两条：①「正在重试」提示 ② 重试成功后的正式回答
+        await h.wait_for_replies(2, timeout=8.0)
+        reply = await h.wait_reply(index=1)
+        check("重试后成功", "重试之后成功了" in reply, reply)
+        check("一共调了 3 次（1 + 2 次重试）", state["n"] == 3, f"{state['n']}")
+        check("重试期间给过用户一句提示",
+              any("重试" in str(r) for r in h.replies),
+              f"{[str(r)[:60] for r in h.replies]}")
+
+        # ② 重试用尽：一共 1 + max_retries 次，然后把错误报给用户
+        cfg["max_retries"] = 1
+        state, resp = flaky(99)
+        h.llm.responder = resp
+        h.clear()
+        await h.private("一直失败//", settle=0.4)
+        await h.wait_for_replies(2, timeout=8.0)
+        reply = await h.wait_reply(index=1)
+        check("重试用尽后报错", "出错" in reply or "503" in reply, reply)
+        check("次数正好 1 + max_retries", state["n"] == 2, f"{state['n']}")
+
+        # ③ max_retries=0：一次都不重试
+        cfg["max_retries"] = 0
+        state, resp = flaky(99)
+        h.llm.responder = resp
+        h.clear()
+        await h.private("不许重试//", settle=1.2)
+        await h.wait_reply(index=0)
+        check("max_retries=0 就不重试", state["n"] == 1, f"{state['n']}")
+
+        # ④ 不可重试的失败（4xx）立刻放弃，别让用户白等
+        cfg["max_retries"] = 3
+        state, resp = flaky(99, retryable=False, status=401)
+        h.llm.responder = resp
+        h.clear()
+        await h.private("key 错了//", settle=1.2)
+        # 401 不可重试 → **没有**「正在重试」提示，只有错误那一条
+        reply = await h.wait_reply(index=0)
+        check("401 不重试", state["n"] == 1, f"{state['n']}")
+        check("401 的错误照常报出来", "401" in reply, reply)
+
+        # ⑤ 判据本身（用插件自己那份模块，别引第二份副本）
+        retryable = plugin_module("main")._is_retryable
+        check("网络层失败可重试",
+              retryable(LlmError("dns", retryable=True)), "")
+        check("5xx 可重试",
+              retryable(LlmError("500", status=500, retryable=True)), "")
+        check("401 不可重试", not retryable(LlmError("401", status=401)), "")
+        check("超时可重试", retryable(asyncio.TimeoutError()), "")
+    finally:
+        h.llm.responder = None
+        for k, v in old_cfg.items():
+            cfg[k] = v
+
+
+async def test_delete_and_rename(h: Harness):
+    print("\n[19] 重命名 / 删除会话")
+    await establish(h)
+    await h.private("/aichat new 临时会话", settle=0.7)
+    await h.wait_reply()
+    sid = _current_session(h).id
+
+    h.clear()
+    await h.private(f"/aichat rename {sid} 改过的名字", settle=0.7)
+    text = await h.wait_reply()
+    check("重命名成功", "已更名为" in text, text)
+    check("名字真的改了", h.plugin.store.get(sid).name == "改过的名字",
+          h.plugin.store.get(sid).name)
+
+    h.clear()
+    await h.private(f"/aichat delete {sid}", settle=0.7)
+    text = await h.wait_reply()
+    check("删除需要确认", "确认" in text and h.plugin.store.get(sid) is not None, text)
+
+    h.clear()
+    await h.private(f"/aichat delete {sid} --yes=true", settle=0.7)
+    text = await h.wait_reply()
+    check("确认后删除", h.plugin.store.get(sid) is None, text)
+
+
+async def test_schema_error_feedback(h: Harness):
+    print("\n[21] 参数写错要有提示（不能静默）")
+    await establish(h)
+    h.clear()
+    # `attach` 的会话名有长度上限（NAME_MAX）；超长会被 Schema 拒绝。
+    # （原先这里用 `--force=maybe` 试布尔解析 —— `attach` 已不再有 `--force`，
+    #  未知键值会被框架当位置参数吞掉，测不出 Schema 反馈了。）
+    await h.private("/aichat attach " + "会" * 200, settle=0.9)
+    text = await h.wait_reply()
+    check("用法不正确有明确回复（框架统一回执）", "用法不正确" in text, text[:200])
+    check("回复重定向到该子命令的帮助页",
+          "/aichat attach" in text and "位置传参：" in text, text[:400])
+
+
+async def test_reasoning_unit(h=None):
+    """思考强度的纯单元测试：解析、方言渲染、max_tokens 下界。"""
+    _r = plugin_module("reasoning")
+    ReasoningPolicy = _r.ReasoningPolicy
+    ReasoningSpec = _r.ReasoningSpec
+    parse_budget = _r.parse_budget
+    spec_from_text = _r.spec_from_text
+
+    print("\n[22] 思考强度：解析")
+    check("off/auto/inherit 都表示不干预",
+          all(spec_from_text(v).is_off for v in ("off", "auto", "inherit", "default", "-")),
+          "有不被当作不干预的")
+    check("级别归一化", spec_from_text("HIGH").level == "high"
+          and spec_from_text("max").level == "max"
+          and spec_from_text("最少").level == "minimal",
+          f"{spec_from_text('HIGH')} {spec_from_text('最少')}")
+    check("`on` 等价于开思考（medium）",
+          spec_from_text("on").level == "medium", f"{spec_from_text('on')}")
+    check("预算是数字不是级别", spec_from_text("4k").mode == "budget"
+          and spec_from_text("4k").budget == 4096, f"{spec_from_text('4k')}")
+    check("预算换算正确",
+          parse_budget("1.5k") == 1536 and parse_budget("2048 tokens") == 2048
+          and parse_budget("high") is None, "预算解析有误")
+    check("thinking:off 是显式关闭",
+          spec_from_text("thinking:off").is_off, f"{spec_from_text('thinking:off')}")
+    check("不认识的值退回不干预并留痕",
+          spec_from_text("maybe").is_off and spec_from_text("maybe").note.startswith("不认识"),
+          f"{spec_from_text('maybe')}")
+
+    print("\n[23] 思考强度：各方言渲染")
+    pol_effort = ReasoningPolicy(dialect="effort")
+    check("effort 方言发 reasoning_effort",
+          pol_effort.build_params(spec_from_text("high")) == {"reasoning_effort": "high"},
+          f"{pol_effort.build_params(spec_from_text('high'))}")
+    check("off 时什么都不发",
+          pol_effort.build_params(spec_from_text("off")) == {},
+          f"{pol_effort.build_params(spec_from_text('off'))}")
+    pol_thinking = ReasoningPolicy(dialect="thinking")
+    check("thinking 方言发 thinking.type",
+          pol_thinking.build_params(spec_from_text("high")) == {"thinking": {"type": "enabled"}},
+          f"{pol_thinking.build_params(spec_from_text('high'))}")
+    check("thinking 方言下 off 不发",
+          pol_thinking.build_params(spec_from_text("off")) == {},
+          f"{pol_thinking.build_params(spec_from_text('off'))}")
+    pol_et = ReasoningPolicy(dialect="enable_thinking")
+    check("enable_thinking 方言发布尔",
+          pol_et.build_params(spec_from_text("low")) == {"enable_thinking": True},
+          f"{pol_et.build_params(spec_from_text('low'))}")
+    check("dialect=none 永不发思考参数",
+          ReasoningPolicy(dialect="none").build_params(spec_from_text("max")) == {},
+          "none 方言仍发了字段")
+    pol_raw = ReasoningPolicy(dialect="raw", params={"chat_template_kwargs": {"thinking": True}})
+    check("raw 方言原样合并",
+          pol_raw.build_params(spec_from_text("high")) == {"chat_template_kwargs": {"thinking": True}},
+          f"{pol_raw.build_params(spec_from_text('high'))}")
+    check("thinking:* 在 effort 方言里翻译成级别（不被吞掉）",
+          pol_effort.build_params(spec_from_text("thinking:on")).get("reasoning_effort") == "high",
+          f"{pol_effort.build_params(spec_from_text('thinking:on'))}")
+
+    print("\n[24] 思考强度：max_tokens 下界与 per-model")
+    check("开思考时抬高 max_tokens（防「想完没字数回答」）",
+          pol_effort.min_max_tokens(spec_from_text("high"), 256) >= 4096,
+          f"{pol_effort.min_max_tokens(spec_from_text('high'), 256)}")
+    check("不开思考时不干预 max_tokens",
+          pol_effort.min_max_tokens(spec_from_text("off"), 256) == 256,
+          f"{pol_effort.min_max_tokens(spec_from_text('off'), 256)}")
+    check("预算模式给预算 + 余量",
+          pol_effort.min_max_tokens(spec_from_text("8k"), 512) >= 8192,
+          f"{pol_effort.min_max_tokens(spec_from_text('8k'), 512)}")
+    pol_model = ReasoningPolicy(default="off",
+                                per_model={"deepseek-v4-flash": "off", "o4-mini": "high"})
+    check("per_model 覆盖默认",
+          pol_model.spec_for("o4-mini").level == "high"
+          and pol_model.spec_for("deepseek-v4-flash").is_off
+          and pol_model.spec_for("unknown-model").is_off,
+          "per_model 未生效")
+    check("会话覆盖优先于 per_model",
+          pol_model.spec_for("o4-mini", "low").level == "low",
+          f"{pol_model.spec_for('o4-mini', 'low')}")
+
+
+async def test_think_command(h: Harness):
+    print("\n[25] /aichat think：查看与切换")
+    await establish(h)
+    h.clear()
+    await h.private("/aichat think", settle=0.9)
+    text = await h.wait_reply()
+    check("think 显示状态", "思考强度" in text and "方言" in text, text[:200])
+    check("think 显示压缩摘要那一档", "压缩摘要" in text, text[:300])
+
+    # 默认不发思考参数
+    h.clear()
+    await h.private("默认一轮//", settle=1.0)
+    await h.wait_for_replies(1)
+    check("默认不往 payload 加思考字段",
+          h.llm.last_reasoning_params == {}, f"{h.llm.last_reasoning_params}")
+
+    # 切到 high
+    h.clear()
+    await h.private("/aichat think high", settle=0.9)
+    text = await h.wait_reply()
+    check("think 切换成功", "已" in text and "reasoning_effort=high" in text, text[:200])
+
+    h.clear()
+    await h.private("现在带思考//", settle=1.0)
+    await h.wait_for_replies(1)
+    check("切换后 payload 真的带上 reasoning_effort",
+          h.llm.last_reasoning_params == {"reasoning_effort": "high"},
+          f"{h.llm.last_reasoning_params}")
+    check("会话级切换落库（能持久化）",
+          h.plugin.store.get(_current_session(h).id).meta.get("reasoning") == "high",
+          f"{h.plugin.store.get(_current_session(h).id).meta}")
+
+    # 切回 off
+    h.clear()
+    await h.private("/aichat think off", settle=0.9)
+    await h.wait_for_replies(1)
+    h.clear()
+    await h.private("再一轮//", settle=1.0)
+    await h.wait_for_replies(1)
+    check("切回 off 后不再发思考字段",
+          h.llm.last_reasoning_params == {}, f"{h.llm.last_reasoning_params}")
+
+    # 预算模式 + max_tokens 下界
+    h.clear()
+    await h.private("/aichat think 8k", settle=0.9)
+    await h.wait_for_replies(1)
+    h.clear()
+    await h.private("预算一轮//", settle=1.0)
+    await h.wait_for_replies(1)
+    check("预算模式抬高 max_tokens",
+          h.llm.last_max_tokens >= 8192, f"{h.llm.last_max_tokens}")
+
+    # 不认识的值要报错而不是静默
+    h.clear()
+    await h.private("/aichat think maybe", settle=0.9)
+    text = await h.wait_reply()
+    check("不认识的值有明确提示", "不认识" in text, text[:150])
+
+    # 全局默认（写到 config.json）
+    h.clear()
+    await h.private("/aichat think low --global_=true", settle=0.9)
+    text = await h.wait_reply()
+    check("--global_=true 改全局默认", "全局默认" in text, text[:200])
+    check("全局默认真的生效",
+          h.plugin.reasoning.spec_for(h.plugin.llm.model).level == "low",
+          f"{h.plugin.reasoning.spec_for(h.plugin.llm.model)}")
+    cfg_file = Path(h.tmp) / "config.json"
+    saved = json.loads(cfg_file.read_text(encoding="utf-8"))
+    check("全局默认写进 config.json",
+          saved["plugins"]["ai_chat"]["llm"]["reasoning"]["default"] == "low",
+          f"{saved['plugins']['ai_chat']['llm'].get('reasoning')}")
+
+
+async def test_reasoning_dialect_via_config(h: Harness):
+    print("\n[26] 换方言端点：config 驱动")
+    # 必须改**文件**再 reload：reload_config() 会重读 config.json，
+    # 只改内存里的 cfg 会被下一次重载覆盖掉（这正是它的正确行为）。
+    saved = json.loads(h.cfg_path.read_text(encoding="utf-8"))
+    saved["plugins"]["ai_chat"]["llm"]["reasoning"] = {
+        "dialect": "thinking", "default": "high"}
+    h.cfg_path.write_text(json.dumps(saved, ensure_ascii=False), encoding="utf-8")
+    # 默认的 reload_config() 不读文件（ConfigManager 只在构造时读一次）；
+    # 手工改文件要走 from_disk=True。
+    h.plugin.reload_config(from_disk=True)
+    check("from_disk=True 真的重读了文件（方言已切换）",
+          h.plugin.reasoning.dialect == "thinking", h.plugin.reasoning.dialect)
+    await establish(h)
+    h.clear()
+    await h.private("方言一轮//", settle=1.0)
+    await h.wait_for_replies(1)
+    check("thinking 方言下发的字段正确",
+          h.llm.last_reasoning_params == {"thinking": {"type": "enabled"}},
+          f"{h.llm.last_reasoning_params}")
+    check("旧配置 reasoning_effort 仍被接受",
+          h.plugin._build_reasoning_policy() is not None, "构造失败")
+    saved["plugins"]["ai_chat"]["llm"]["reasoning"] = {
+        "dialect": "effort", "default": "off"}
+    h.cfg_path.write_text(json.dumps(saved, ensure_ascii=False), encoding="utf-8")
+    h.plugin.reload_config()
+
+
+async def test_config_template_seeding(h: Harness):
+    """config.json 配置模板：补齐、不覆盖用户值、幂等、与内置默认等价。"""
+    DEFAULT_CONFIG = plugin_module("main").DEFAULT_CONFIG
+
+    print("\n[27] config.json 配置模板")
+    saved = json.loads(h.cfg_path.read_text(encoding="utf-8"))
+    section = saved["plugins"]["ai_chat"]
+
+    check("启动即把 plugins.ai_chat 段补进 config.json",
+          isinstance(section, dict) and "llm" in section, f"{sorted(section or [])}")
+    check("模板含全部顶层段",
+          set(DEFAULT_CONFIG) <= set(section), f"缺 {set(DEFAULT_CONFIG) - set(section)}")
+    leaf_default = _flatten_paths(DEFAULT_CONFIG)
+    leaf_file = _flatten_paths(section)
+    check("模板覆盖全部叶子配置项（文件即清单）",
+          set(leaf_default) <= set(leaf_file),
+          f"缺 {sorted(set(leaf_default) - set(leaf_file))[:6]}")
+
+    # 用户改过的值不能被覆盖；缺键要补上
+    saved["plugins"]["ai_chat"]["session"] = {"scope": "user"}      # 只剩一个键
+    saved["plugins"]["ai_chat"]["trigger"]["terminators"] = ["??"]   # 用户自定义
+    h.cfg_path.write_text(json.dumps(saved, ensure_ascii=False), encoding="utf-8")
+    h.plugin._cfg_root.reload()
+    wrote = h.plugin.seed_config_file()
+    after = json.loads(h.cfg_path.read_text(encoding="utf-8"))["plugins"]["ai_chat"]
+    check("补齐动作确实写了盘", wrote, "应返回 True")
+    check("用户改过的值保持不变",
+          after["trigger"]["terminators"] == ["??"]
+          and after["session"]["scope"] == "user",
+          f"{after['trigger']['terminators']} / {after['session']}")
+    check("缺键被补回默认",
+          after["session"].get("history_max_messages") == 400
+          and "name_template" in after["session"],
+          f"{after['session']}")
+    check("幂等：再补一次不写盘", h.plugin.seed_config_file() is False, "重复写了盘")
+
+    # 命令路径
+    h.clear()
+    # 先造一个缺键状态
+    reloaded = json.loads(h.cfg_path.read_text(encoding="utf-8"))
+    del reloaded["plugins"]["ai_chat"]["wrapping"]
+    h.cfg_path.write_text(json.dumps(reloaded, ensure_ascii=False), encoding="utf-8")
+    h.plugin._cfg_root.reload()
+    await h.private("/aichat config", user_id=SUPERUSER, settle=0.9)
+    text = await h.wait_reply()
+    check("config 命令补齐并回报", "已把" in text and "wrapping" in text, text[:200])
+    h.clear()
+    await h.private("/aichat config", user_id=SUPERUSER, settle=0.9)
+    text = await h.wait_reply()
+    check("已完整时回报「无需补齐」", "无需补齐" in text, text[:200])
+
+    # 非超级用户拿不到这个命令
+    h.clear()
+    await h.private("/aichat config", settle=0.8)
+    text = await h.wait_reply()
+    check("普通用户不能用 config", "未知命令" in text, text[:120])
+
+
+async def test_data_dir_resolution(h=None):
+    """data_dir 的相对基准：裸名字随插件，显式相对随 config.json 所在目录。"""
+    print("\n[29] data_dir 路径解析")
+    AiChatPlugin = plugin_module("main").AiChatPlugin
+
+    # 插件实际加载自哪个目录（测试里是临时副本，不是仓库）
+    plugin_dir = Path(plugin_module("main").__file__).resolve().parent
+
+    class _Fake:
+        # 三个方法一起挂上：_resolve_data_dir 现在复用 _resolve_relative
+        _resolve_data_dir = AiChatPlugin._resolve_data_dir
+        _resolve_relative = AiChatPlugin._resolve_relative
+        _config_dir = AiChatPlugin._config_dir
+
+        class _cfg_root:
+            _path = str(ROOT / "config.json")
+
+        def __init__(self, value):
+            self.cfg = {"data_dir": value}
+
+    check("留空 → 插件包内 data/",
+          _Fake("")._resolve_data_dir() == str(plugin_dir / "data"),
+          _Fake("")._resolve_data_dir())
+    check("裸名字 → 插件包内",
+          _Fake("data")._resolve_data_dir() == str(plugin_dir / "data"),
+          _Fake("data")._resolve_data_dir())
+    check("显式相对 → config.json 所在目录",
+          _Fake("./data/ai_chat")._resolve_data_dir() == str(ROOT / "data" / "ai_chat"),
+          _Fake("./data/ai_chat")._resolve_data_dir())
+    check("绝对路径原样使用",
+          _Fake("/tmp/abs")._resolve_data_dir() == "/tmp/abs",
+          _Fake("/tmp/abs")._resolve_data_dir())
+
+    # 同一套口径下，指到工作区任意位置的显式相对路径都必须落在 config 目录旁
+    expected = ROOT / "plugins" / "some_plugin" / "data"
+    got = _Fake("./plugins/some_plugin/data")._resolve_relative(
+        "./plugins/some_plugin/data")
+    check("显式相对路径解析到工作区（不落插件包里）",
+          got == str(expected), f"{got} != {expected}")
+
+
+
+def plugin_module(name: str):
+    """取**插件自己加载的**子模块（`napcat_plugin_ai_chat.<name>`）。
+
+    ⚠️ 别用 `from plugins.ai_chat.segments import ...`：插件是以合成包名
+    （`napcat_plugin_ai_chat`）加载的，而仓库根又在 `sys.path` 上，于是同一个
+    文件会存在**两个模块对象** —— 类不是同一个类、`isinstance` 失效，
+    更阴的是方法解析可能落到另一份副本上（实测：修好的行为在测试里看起来没生效）。
+    要断言插件的行为，就必须用它自己那份。
+    """
+    for key in (f"napcat_plugin_ai_chat.{name}", f"{PLUGIN_PKG}.{name}"):
+        if key in sys.modules:
+            return sys.modules[key]
+    # 两边都不在（回归用例会故意摘掉模块）→ 退回按仓库路径加载
+    import importlib
+    return importlib.import_module(f"{PLUGIN_PKG}.{name}")
+
+def _flatten_paths(data, prefix=""):
+    out = []
+    for k, v in (data or {}).items():
+        path = f"{prefix}{k}"
+        if isinstance(v, dict) and v:
+            out.extend(_flatten_paths(v, prefix=f"{path}."))
+        else:
+            out.append(path)
+    return out
+
+
+async def test_prompt_tables_and_formulas(h=None):
+    """提示词契约：AI 要**主动**用表格与公式（会被渲染成图片）。
+
+    这条用例盯的是「提示词自相矛盾」这类回归：人格里曾经写着
+    「`|表格|` 会原样显示成符号，很难看」—— 模型照做就不发表格，
+    出图能力等于白做。所以这里把措辞钉住。
+    """
+    c = plugin_module("compaction")
+    persona = c.DEFAULT_PERSONA
+
+    print("\n[42] 文本模式提示词：主动用表格与公式")
+    check("明确要求主动用表格", "表格" in persona and "主动用" in persona, persona[:120])
+    check("说明会被渲染成图片", "渲染成图片" in persona, "没告诉模型表格/公式会变成图")
+    check("给出表格分隔行写法（缺了就不识别）",
+          "| --- |" in persona and "分隔行" in persona, "没说分隔行")
+    check("给出行间公式定界符", "$$...$$" in persona, "没说 $$ 写法")
+    check("给出行内公式定界符", "$...$" in persona, "没说 $ 写法")
+    check("给常用 LaTeX 命令示例",
+          "\\frac" in persona and "\\sqrt" in persona, "没有 LaTeX 示例")
+    check("提醒别塞太多", "1~2 个" in persona or "别塞太多" in persona, "没提数量上限")
+
+    print("\n[43] 仍然禁止不会被渲染的 Markdown（否则用户看到一堆符号）")
+    # 断言「意图」而不是某一句原话：措辞会调整，但「不渲染的东西别用」这个意图
+    # 必须在（否则用户看到一堆星号和井号）。
+    check("加粗仍是禁用项",
+          "加粗" in persona and ("别用" in persona or "不要用" in persona),
+          persona[:200])
+    # ⚠️ 标题、列表、代码围栏**是能渲染的**（各自单独出图，见 markdown.find_rich_blocks），
+    # 所以它们属于「可以放心用」那一类；这条断言以前写成「禁用项」是按旧行为写的，
+    # 靠示例里的 `###` 才碰巧通过 —— 现在按真实规则断言。
+    check("代码围栏属于「会渲染、可以放心用」",
+          "围栏" in persona and ("放心用" in persona or "单独渲染" in persona),
+          persona[:260])
+    check("标题/列表属于「会渲染、可以放心用」",
+          "标题" in persona and "单独渲染" in persona, persona[:260])
+    check("不再说「表格原样显示成符号」这种自相矛盾的话",
+          "很难看" not in persona, persona[:200])
+
+    print("\n[44] 工具指引与 Markdown 模式都要跟着一致")
+    g = c.tool_guidance(web=True)
+    check("工具指引提醒把结构化结果整理成表格",
+          "表格" in g, g[-120:])
+    check("markdown=False 时的指引也包含表格公式", "表格" in g)
+
+    md = c.build_system_prompt(chat_kind="private", markdown=True)
+    check("Markdown 模式含人格里的表格公式指引",
+          "表格与公式要主动用" in md, "人格没带上")
+    check("Markdown 模式说明整篇可用 Markdown",
+          "整篇" in md and "Markdown 模式" in md, md[:200])
+    check("Markdown 模式不再谎称「纯文本要求作废」",
+          "纯文本排版」的要求**作废**" not in md, "说法过时了")
+
+    plain = c.build_system_prompt(chat_kind="private", markdown=False)
+    check("两种模式都带表格公式指引（能力是插件固有的）",
+          "表格与公式要主动用" in plain and "表格与公式要主动用" in md,
+          "有一边缺了")
+
+
+async def test_config_seed_unit(h=None):
+    """干净配置下的补齐不变式（不经过 Harness，避免它自己的覆写干扰断言）。
+
+    核心不变式：**补齐出来的段与内置默认深合并后逐键相等**。
+    不成立就说明「文件里写的」与「实际生效的」不是一回事 —— 那这份模板就是在骗人。
+    """
+    import tempfile
+    from napcat.config import ConfigManager
+    DEFAULT_CONFIG = plugin_module("main").DEFAULT_CONFIG
+    deep_merge = plugin_module("main").deep_merge
+    AiChatPlugin = plugin_module("main").AiChatPlugin
+
+    print("\n[28] 配置补齐不变式（干净配置）")
+    tmpdir = Path(tempfile.mkdtemp(prefix="seed-unit-", dir=str(ROOT / "tests" / ".test-tmp")))
+    path = tmpdir / "config.json"
+    path.write_text(json.dumps({"ws_url": "ws://127.0.0.1:1", "plugins": {}}),
+                    encoding="utf-8")
+    cfg = ConfigManager(str(path))
+
+    # 用插件真实的补齐实现（打桩掉它需要的 logger/cfg）
+    class _Fake:
+        config = cfg.plugin("ai_chat")
+        logger = None
+    written = AiChatPlugin.seed_config_file(_Fake())
+    check("空配置被补齐", written, "应写入")
+
+    section = json.loads(path.read_text(encoding="utf-8"))["plugins"]["ai_chat"]
+    effective = deep_merge(DEFAULT_CONFIG, section)
+    check("补齐段 ≡ 内置默认（逐键）",
+          json.dumps(effective, sort_keys=True, ensure_ascii=False)
+          == json.dumps(DEFAULT_CONFIG, sort_keys=True, ensure_ascii=False),
+          "模板与内置默认不一致")
+    check("再补一次是幂等的", AiChatPlugin.seed_config_file(_Fake()) is False,
+          "重复写盘")
+
+    # 用户值优先
+    cfg.set("plugins.ai_chat.session", {"scope": "user"})
+    cfg.set("plugins.ai_chat.llm.reasoning.default", "high")
+    AiChatPlugin.seed_config_file(_Fake())
+    after = cfg.plugin("ai_chat").all()
+    check("补齐不覆盖已有的用户值",
+          after["session"]["scope"] == "user"
+          and after["llm"]["reasoning"]["default"] == "high",
+          f"{after['session']} / {after['llm']['reasoning']}")
+    check("同段的其它缺键仍被补上",
+          after["session"].get("history_max_messages") == 400,
+          f"{after['session']}")
+
+    shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+async def test_no_deferred_relative_imports(h: Harness):
+    """回归：对话进行中不能有「函数内相对 import」。
+
+    真实故障：热重载会先把 `napcat_plugin_ai_chat*` 整个子树从 `sys.modules` 里
+    摘掉再重新导入；如果此时有函数**在调用时**才去 `from .llm import ...`，
+    Python 会重新解析父包 → `ModuleNotFoundError: No module named
+    'napcat_plugin_ai_chat'`，而它发生在一轮对话中间，用户只看到
+    「⚠️ AI 对话出错」。
+
+    这里直接复刻那一刻：把包从 `sys.modules` 里摘掉，然后跑完一整轮
+    （含工具调用 + 异常路径 + 压缩），全程不许抛异常。
+    """
+    print("\n[30] 回归：摘掉 sys.modules 后仍能跑完一轮")
+    await establish(h)
+    h.clear()
+
+    # 先让一个工具**失败**（覆盖工具异常里的 err_text 路径）
+    state = {"n": 0}
+
+    def responder(messages, tools):
+        state["n"] += 1
+        if state["n"] == 1:
+            return StubResult(text="", tool_calls=[StubCall("no_such_tool", {}, "c1")])
+        return StubResult(text="工具报错了但我还活着。")
+
+    h.llm.responder = responder
+    pkg = "napcat_plugin_ai_chat"
+    stashed = {k: v for k, v in sys.modules.items()
+               if k == pkg or k.startswith(pkg + ".")}
+    try:
+        for k in stashed:
+            sys.modules.pop(k, None)
+        await h.private("工具会失败//", settle=1.4)
+        reply = await h.wait_reply()
+        check("模块被摘掉后对话仍走通", "还活着" in reply, reply[:120])
+        check("工具失败被回喂给模型（没有炸穿）", state["n"] == 2, f"n={state['n']}")
+
+        # 压缩路径（会调用 compaction / segments，同样不能有延迟 import）
+        h.clear()
+        h.llm.responder = None
+        h.plugin.policy.max_tokens = 400
+        for i in range(4):
+            await h.private(f"填充{i}" + "内容" * 30 + "//", settle=1.0)
+            await h.wait_for_replies(i + 1)
+        check("压缩路径也没炸", h.plugin.store.get(_current_session(h).id).compact_count >= 1,
+              f"compact_count={h.plugin.store.get(_current_session(h).id).compact_count}")
+        h.plugin.policy.max_tokens = 16384
+    finally:
+        h.llm.responder = None
+        sys.modules.update(stashed)
+
+    # 静态检查：源码里不许再有「函数内相对 import」
+    offenders = []
+    for f in sorted(PLUGIN_DIR.glob("*.py")):
+        for lineno, line in enumerate(f.read_text(encoding="utf-8").splitlines(), 1):
+            stripped = line.strip()
+            if line.startswith((" ", "\t")) and (
+                    stripped.startswith("from .") or stripped.startswith("import .")):
+                offenders.append(f"{f.name}:{lineno}: {stripped}")
+    check("源码里没有函数内相对 import", not offenders, f"{offenders}")
+
+
+async def test_no_coupling_with_other_plugins(h: Harness):
+    """aichat 与 bupt_news **彻底解耦**：不读它的数据、不加载它的模块、不注册它的工具。
+
+    这条用例是「防复发」的：耦合曾经真实存在（读 `plugins/bupt_news/data/notices.jsonl`
+    + 按文件路径加载 `bupt_news.weather`），特点是**不 import 也能生效** ——
+    所以只查 import 表是查不出来的，必须连源码文本一起卡住。
+    """
+    print("\n[31] 与其它插件彻底解耦")
+    # ⚠️ 一律从**本轮 harness 的插件目录**取源码，别走 `plugin_module("main")`：
+    # `[30]` 用例会故意把包从 `sys.modules` 里摘掉，那个合成模块名随后可能被
+    # 重新填成上一轮那份**已删除临时目录**里的旧对象 —— 读源码就 FileNotFoundError。
+    pkg_dir = Path(h.cfg["plugin_dir"]) / "ai_chat"
+
+    check("不再有 _load_sibling_module（跨插件加载器已删）",
+          "_load_sibling_module" not in
+          (pkg_dir / "main.py").read_text(encoding="utf-8"),
+          "源码里还有残留")
+    check("不再有 _weather_line / _notice_records 等方法",
+          not any(hasattr(h.plugin, n) for n in
+                  ("_weather_line", "_read_notices", "_search_notices",
+                   "_get_notice", "_notice_records")),
+          f"{[n for n in dir(h.plugin) if 'notice' in n or 'weather' in n]}")
+
+    # 全包源码文本扫描：任何子模块都不许出现兄弟插件的名字
+    offenders = []
+    for src in sorted(pkg_dir.glob("*.py")):
+        text = src.read_text(encoding="utf-8")
+        for word in ("bupt_news", "buptnews"):
+            if word in text:
+                for i, line in enumerate(text.splitlines(), 1):
+                    if word in line:
+                        offenders.append(f"{src.name}:{i}: {line.strip()[:70]}")
+    check("插件源码里不再出现兄弟插件名字", not offenders, "; ".join(offenders))
+
+    # 工具表里不该再有外部知识源工具
+    names = set(h.plugin.tools.names())
+    check("不再注册通知/天气工具",
+          not (names & {"list_recent_notices", "search_notices", "get_notice",
+                        "get_weather", "list_schedules"}),
+          f"{sorted(names)}")
+    # 但内置的「自给自足」工具必须还在（解耦不能把工具削没了）
+    check("自给自足的内置工具仍在",
+          {"get_current_time", "search_history", "get_session_info"} <= names,
+          f"{sorted(names)}")
+    template = h.plugin.cfg
+    check("配置模板里不再有 notices / weather",
+          "notices" not in template and "weather" not in template,
+          f"{sorted(template)}")
+
+    # 老部署的 config.json 里那两段失效配置必须被清理掉，而不是留在文件里误导人
+    # （当年真配过：`notices.path` 指着 bupt_news 的私有数据目录）
+    cfg_path = h.cfg_path
+    on_disk = json.loads(cfg_path.read_text(encoding="utf-8"))
+    on_disk["plugins"]["ai_chat"]["notices"] = {
+        "enabled": True, "path": "./plugins/bupt_news/data", "limit": 10}
+    on_disk["plugins"]["ai_chat"]["weather"] = {"enabled": True}
+    cfg_path.write_text(json.dumps(on_disk, ensure_ascii=False), encoding="utf-8")
+
+    # 模拟一次真实启动：重读文件 →（on_load 会调）清退休段
+    h.plugin.reload_config(from_disk=True)
+    check("退休段被读进来了（模拟老部署的前置条件）",
+          h.plugin.config.get("notices") is not None,
+          f"{h.plugin.config.get('notices')!r}")
+    h.plugin.retire_config_sections()
+    h.plugin.reload_config(from_disk=True)
+    check("退休配置段已被清掉（内存）",
+          h.plugin.config.get("notices") is None
+          and h.plugin.config.get("weather") is None,
+          f"notices={h.plugin.config.get('notices')!r}")
+
+    saved_raw = json.loads(cfg_path.read_text(encoding="utf-8"))["plugins"]["ai_chat"]
+    check("退休配置段已落盘清掉（config.json 不再误导人）",
+          "notices" not in saved_raw and "weather" not in saved_raw,
+          f"{sorted(saved_raw)}")
+    # 深层退休键（hget 改单条后不再需要）也要能被清掉
+    check("深层退休键也被清掉（history.max_images_per_call）",
+          "max_images_per_call" not in (saved_raw.get("history") or {}),
+          f"{sorted((saved_raw.get('history') or {}))}")
+    check("清理后其它配置段一个没少",
+          {"llm", "session", "trigger", "reply", "tools", "binding"} <= set(saved_raw),
+          f"{sorted(saved_raw)}")
+
+
+async def test_binding_allowlist(h: Harness):
+    """服务范围：只对配置里列出的群/私聊提供服务，且与权限等级无关。"""
+    ChatTarget = plugin_module("store").ChatTarget
+    await establish(h, group_id=GROUP)
+
+    print("\n[32] 服务范围白名单")
+    plugin = h.plugin
+
+    # ---- 默认：白名单为空 + empty_means=deny → 谁都不用 ----
+    # ⚠️ 群白名单为空时会回落到框架的 `bound_groups`，所以要连它一起清掉，
+    # 才是真正的「什么都没配」。
+    saved_bound = set(h.client.groups.list_bound())
+    h.client.groups.clear()
+
+    def restore_bound():
+        h.client.groups.clear()
+        h.client.groups.bind_many(list(saved_bound))
+
+    plugin.cfg["binding"] = {"groups": [], "users": [], "empty_means": "deny",
+                             "notify_denied": True, "notify_cooldown": 0}
+    for target, uid, label in [
+        (ChatTarget("group", GROUP), ALICE, "群"),
+        (ChatTarget("private", ALICE), ALICE, "私聊"),
+        (ChatTarget("group", GROUP), SUPERUSER, "超级用户在群"),
+        (ChatTarget("private", SUPERUSER), SUPERUSER, "超级用户私聊"),
+    ]:
+        ok, why = plugin.check_access(target, uid)
+        check(f"空名单拒绝：{label}", not ok, f"allow={ok}")
+        check(f"空名单的说明提到 binding：{label}", "binding" in why, why[:80])
+
+    # ---- 配好白名单 ----
+    restore_bound()
+    plugin.cfg["binding"] = {"groups": [GROUP, OTHER_GROUP],
+                             "users": [ALICE, SUPERUSER],
+                             "empty_means": "deny",
+                             "notify_denied": True, "notify_cooldown": 0}
+    cases = [
+        (ChatTarget("group", GROUP), ALICE, True, "已绑群 + 已授权的人"),
+        (ChatTarget("group", OTHER_GROUP), BOB, True, "已绑群（group 作用域下全群可用）"),
+        (ChatTarget("group", 99999), ALICE, False, "未绑定的群"),
+        (ChatTarget("private", ALICE), ALICE, True, "已授权的私聊"),
+        (ChatTarget("private", BOB), BOB, False, "未授权的私聊"),
+    ]
+    for target, uid, want, label in cases:
+        ok, why = plugin.check_access(target, uid)
+        check(f"{label}", ok == want, f"allow={ok} want={want} why={why[:60]}")
+
+    # ---- 与权限等级无关：超级用户也不能越界 ----
+    ok, why = plugin.check_access(ChatTarget("group", 99999), SUPERUSER)
+    check("超级用户在未绑定的群里也用不了", not ok, f"allow={ok}")
+    # 小窗地址（private + 来源群）：授权与否看**这个小窗的主人**，
+    # 而不是发消息的人 —— 否则群里任何人都能借别人的小窗地址越权。
+    ok, why = plugin.check_access(ChatTarget("private", BOB, GROUP), BOB)
+    check("未授权的小窗地址被拒绝", not ok, f"allow={ok}")
+    ok, why = plugin.check_access(ChatTarget("private", ALICE, GROUP), ALICE)
+    check("已授权用户的小窗可用", ok, f"allow={ok}")
+
+    # ---- 未绑定的群 ----
+    # 注意走不了 WS：框架的 `_on_ws_event()` 在 EventBus **之前**就把未绑群的
+    # 群消息整条丢了（`GroupsBinding.is_bound`）。所以这里直接调插件入口，
+    # 验证的是插件的**第二道闸**（插件自派发 / 直接 cmds.handle 的路径）。
+    from napcat.models import MessageEvent, Sender
+
+    def group_event(text, gid, uid=BOB):
+        return MessageEvent(
+            message_type="group", group_id=gid, user_id=uid,
+            message=[{"type": "text", "data": {"text": text}}],
+            plain_text=text, message_id=1,
+            sender=Sender(user_id=uid, nickname="测试", role="member"))
+
+    check("框架层确实会丢弃未绑群的消息（这是第一道闸）",
+          not h.client.groups.is_bound(99999), "客户端认为 99999 已绑定")
+    check("框架层认可已绑群", h.client.groups.is_bound(GROUP),
+          "客户端认为 GROUP 未绑定")
+
+    h.clear()
+    plugin._denied_notice.clear()
+    await plugin._handle_message(group_event("未绑群说话//", 99999))
+    await asyncio.sleep(0.3)
+    check("未绑群：插件不回复", not h.replies, f"{h.replies}")
+    check("未绑群：插件不调模型", h.llm.calls == 0, f"calls={h.llm.calls}")
+
+    # 未绑群 + 没 @机器人：连回绝说明都不发（否则群里聊两句就被刷屏）
+    h.clear()
+    plugin._denied_notice.clear()
+    await plugin._handle_message(group_event("没@机器人//", 99999))
+    await asyncio.sleep(0.3)
+    check("未绑群且未 @ 时完全静默", not h.replies, f"{h.replies}")
+
+    # 未绑群 + @机器人：给回绝说明（命令也要回绝，且不回显命令内容）
+    h.clear()
+    plugin._denied_notice.clear()
+    ev_cmd = group_event("[@10001] /aichat current", 99999)
+    await plugin._handle_message(ev_cmd)         # 对话路径（会被命令前缀挡住）
+    await h.client.cmds.handle(ev_cmd)           # 命令路径
+    try:
+        await h.wait_for_replies(1, timeout=5.0)
+    except TimeoutError:
+        pass
+    texts = [reply_text(r) for r in h.replies]
+    check("未绑群的命令被回绝", any("没有开通" in t for t in texts), f"{texts}")
+    check("回绝不泄露命令内容", not any("ai_chat ——" in t for t in texts), f"{texts}")
+
+    # ---- 群白名单没配时，回落到框架的 bound_groups ----
+    saved_groups = plugin.cfg["binding"]["groups"]
+    try:
+        plugin.cfg["binding"]["groups"] = []
+        ok, _ = plugin.check_access(ChatTarget("group", GROUP), ALICE)
+        check("binding.groups 未配时复用框架 bound_groups", ok,
+              "应当放行（框架已绑该群）")
+        ok, _ = plugin.check_access(ChatTarget("group", 99999), ALICE)
+        check("复用兜底同样拦未绑群", not ok, "应当拒绝")
+    finally:
+        plugin.cfg["binding"]["groups"] = saved_groups
+
+    # ---- 未授权的私聊：同样回绝 ----
+    h.clear()
+    await h.private("私聊未授权//", user_id=BOB, settle=0.8)
+    texts = [reply_text(r) for r in h.replies]
+    check("未授权私聊收到回绝说明", texts and "没有开通" in texts[0], f"{texts}")
+    check("未授权私聊不调模型", h.llm.calls == 0, f"calls={h.llm.calls}")
+
+    # ---- 已绑定的目标正常服务 ----
+    h.clear()
+    await h.group("已绑群说话//", at_bot=True, user_id=ALICE, settle=1.0)
+    check("已绑群正常服务", bool(h.replies) and h.llm.calls == 1,
+          f"replies={len(h.replies)} calls={h.llm.calls}")
+
+    # ---- empty_means=allow：空名单 = 不限制（显式选择才生效）----
+    h.client.groups.clear()
+    plugin.cfg["binding"] = {"groups": [], "users": [], "empty_means": "allow",
+                             "notify_denied": True, "notify_cooldown": 0}
+    ok, _ = plugin.check_access(ChatTarget("group", 99999), ALICE)
+    check("empty_means=allow 时不再拦", ok, "应当放行")
+    ok, _ = plugin.check_access(ChatTarget("private", BOB), BOB)
+    check("empty_means=allow 对私聊同样放行", ok, "应当放行")
+    restore_bound()
+
+
+async def test_binding_group_vs_private(h: Harness):
+    """服务范围的两条独立通道：群开通 = 全群可用；私聊按人开通。"""
+    ChatTarget = plugin_module("store").ChatTarget
+
+    print("\n[33] 服务范围：群与私聊是两条独立通道")
+    plugin = h.plugin
+    saved = dict(plugin.cfg["binding"])
+    try:
+        plugin.cfg["binding"] = {"groups": [GROUP], "users": [ALICE],
+                                 "empty_means": "deny",
+                                 "notify_denied": True, "notify_cooldown": 0}
+        # 群：开通了就是全群可用（不按人过滤）—— 每人各有自己的会话
+        ok, _ = plugin.check_access(ChatTarget("group", GROUP), ALICE)
+        check("已开通群：成员可用", ok, "应当放行")
+        ok, _ = plugin.check_access(ChatTarget("group", GROUP), BOB)
+        check("已开通群：**其他人也可用**（群是整体开通）", ok,
+              "应当放行：群里每人有自己的会话")
+        # 未开通的群：谁都不行
+        ok, why = plugin.check_access(ChatTarget("group", 99999), ALICE)
+        check("未开通群：即使人在私聊白名单里也不行", not ok, f"allow={ok}")
+        check("说明指向 groups 名单", "groups" in why, why[:80])
+        # 私聊：按人开通
+        ok, _ = plugin.check_access(ChatTarget("private", ALICE), ALICE)
+        check("已开通的人：私聊可用", ok, "应当放行")
+        ok, why = plugin.check_access(ChatTarget("private", BOB), BOB)
+        check("未开通的人：私聊不行", not ok, f"allow={ok}")
+        check("说明指向 users 名单", "users" in why, why[:80])
+        # 群开通不影响私聊
+        plugin.cfg["binding"] = {"groups": [GROUP], "users": [],
+                                 "empty_means": "deny",
+                                 "notify_denied": True, "notify_cooldown": 0}
+        ok, _ = plugin.check_access(ChatTarget("group", GROUP), BOB)
+        check("群开通与私聊白名单互不影响（群仍可用）", ok, "应当放行")
+        ok, why = plugin.check_access(ChatTarget("private", BOB), BOB)
+        check("群开通不自动开放私聊", not ok, f"allow={ok}")
+    finally:
+        plugin.cfg["binding"] = saved
+
+
+async def test_binding_cooldown(h: Harness):
+    """回绝提示要有冷却，不能刷屏。"""
+    ChatTarget = plugin_module("store").ChatTarget
+
+    print("\n[34] 回绝提示冷却")
+    plugin = h.plugin
+    saved = dict(plugin.cfg["binding"])
+    try:
+        plugin.cfg["binding"] = {"groups": [], "users": [], "empty_means": "deny",
+                                 "notify_denied": True, "notify_cooldown": 600}
+        plugin._denied_notice.clear()
+        h.clear()
+        target = ChatTarget("private", BOB)
+        check("首次回绝要提示", plugin._access_denied(target, BOB), "应回绝")
+        await asyncio.sleep(0.2)
+        first = len(h.replies)
+        check("首次确实发了提示", first >= 1, f"{first}")
+        for _ in range(3):
+            plugin._access_denied(target, BOB)
+        await asyncio.sleep(0.3)
+        check("冷却期内不再重复提示", len(h.replies) == first,
+              f"{len(h.replies)} != {first}")
+
+        # notify_denied=False → 静默拒绝（不回任何话）
+        plugin.cfg["binding"]["notify_denied"] = False
+        plugin._denied_notice.clear()
+        h.clear()
+        plugin._access_denied(target, BOB)
+        await asyncio.sleep(0.3)
+        check("notify_denied=false 时静默拒绝", not h.replies, f"{h.replies}")
+    finally:
+        plugin.cfg["binding"] = saved
+
+
+async def test_state_migration(h=None):
+    """旧 state.json（含 scope + bindings 键）要能被读成新模型。"""
+    import tempfile, json as _json
+    SessionStore = plugin_module("store").SessionStore
+
+    print("\n[35] 旧状态迁移：scope → owner_kind，bindings → focus")
+    tmpdir = Path(tempfile.mkdtemp(prefix="migrate-",
+                                   dir=str(ROOT / "tests" / ".test-tmp")))
+    sdir = tmpdir / "sessions"
+    sdir.mkdir(parents=True)
+    legacy = {
+        "version": 1,
+        "seq": 2,
+        "sessions": {
+            "s0001": {"id": "s0001", "name": "老的群会话", "scope": "group",
+                      "owner_id": 30001, "owner_name": "老群", "message_count": 3},
+            "s0002": {"id": "s0002", "name": "老的私聊会话", "scope": "user",
+                      "owner_id": 20001, "owner_name": "爱丽丝", "message_count": 1},
+        },
+        # 旧键名：chat key → session id（没有 @user: 段）
+        "bindings": {"group:30001": "s0001", "private:20001": "s0002"},
+    }
+    (sdir / "state.json").write_text(_json.dumps(legacy, ensure_ascii=False),
+                                     encoding="utf-8")
+    (sdir / "s0001.jsonl").write_text(
+        _json.dumps({"role": "user", "blocks": [{"type": "text", "text": "老的"}],
+                     "metadata": {}, "ts": ""}, ensure_ascii=False) + "\n",
+        encoding="utf-8")
+
+    st = SessionStore(str(tmpdir))
+    g = st.get("s0001")
+    u = st.get("s0002")
+    check("群会话的 scope 迁移成 owner_kind=group",
+          g is not None and g.owner_kind == "group", f"{g and g.owner_kind}")
+    check("私聊会话的 scope 迁移成 owner_kind=user",
+          u is not None and u.owner_kind == "user", f"{u and u.owner_kind}")
+    check("旧记录默认没有受邀名单",
+          g is not None and g.guests == [], f"{g and g.guests}")
+    check("旧 bindings 键仍能被读到（不丢历史配置）",
+          len(st.focus_table()) == 2, f"{st.focus_table()}")
+    check("历史照旧可读", [m.text for m in st.history("s0001")] == ["老的"],
+          f"{[m.text for m in st.history('s0001')]}")
+    # 新写法写盘用的是 focus 键
+    st.set_focus(__import__("plugins.ai_chat.store", fromlist=["ChatTarget"])
+                 .ChatTarget("group", 30001), 20001, "s0001")
+    saved = _json.loads((sdir / "state.json").read_text(encoding="utf-8"))
+    check("落盘用新键名 focus", "focus" in saved, f"{sorted(saved)}")
+    check("焦点键带 user 段",
+          any("@user:20001" in k for k in saved["focus"]), f"{saved['focus']}")
+    shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+async def test_shared_context(h: Harness):
+    """同一会话下，参与者共享完全相同的上下文（含彼此说的话）。"""
+    print("\n[36] 共享会话：上下文对所有参与者一致")
+    h.clear()
+    sid = (await establish(h, user_id=ALICE, group_id=GROUP)).id
+    await h.group("Alice 开场//", at_bot=True, user_id=ALICE, settle=1.2)
+    await h.wait_for_replies(1)
+
+    # 邀请 Bob，并让他自己切过来
+    h.clear()
+    await h.group(f"/aichat invite {sid} {BOB}", at_bot=True, user_id=ALICE, settle=1.2)
+    await h.wait_for_replies(1)
+    check("邀请成功", "已邀请" in reply_text(h.replies[0]), reply_text(h.replies[0])[:120])
+    h.clear()
+    await h.group(f"/aichat attach {sid} --force=true", at_bot=True, user_id=BOB,
+                  settle=1.2)
+    text = await h.wait_reply()
+    check("attach 提示这是共用会话（上下文共享）", "共享" in text, text[:200])
+    check("两人焦点指向同一个会话",
+          _current_session(h, user_id=ALICE, group_id=GROUP).id == sid
+          and _current_session(h, user_id=BOB, group_id=GROUP).id == sid,
+          "焦点不一致")
+
+    # Bob 说话：他的请求里必须包含 Alice 之前说的话，并带说话人标注
+    h.clear()
+    await h.group("Bob 接着说//", at_bot=True, user_id=BOB, settle=1.2)
+    await h.wait_for_replies(1)
+    req = h.llm.requests[-1]["messages"]
+    user_msgs = [m["content"] for m in req if m["role"] == "user"]
+    check("共享上下文：Bob 看得到 Alice 的话",
+          any("Alice 开场" in u for u in user_msgs), f"{user_msgs}")
+    check("两人各自的话都带说话人标注",
+          any(_unlabeled(u).startswith("[用户20001]") and "Alice 开场" in u
+              for u in user_msgs)
+          and any(_unlabeled(u).startswith("[用户20002]") and "Bob 接着说" in u
+                  for u in user_msgs),
+          f"{user_msgs}")
+    check("系统提示说明会话是共用的",
+          "共享" in req[0]["content"], req[0]["content"][:400])
+
+    # Alice 说话：也应看到 Bob 的话（双向共享）
+    h.clear()
+    await h.group("Alice 又问//", at_bot=True, user_id=ALICE, settle=1.2)
+    await h.wait_for_replies(1)
+    user_msgs2 = [m["content"] for m in h.llm.requests[-1]["messages"]
+                  if m["role"] == "user"]
+    check("共享上下文：Alice 也看得到 Bob 的话",
+          any("Bob 接着说" in u for u in user_msgs2), f"{user_msgs2}")
+    check("历史是同一份（不是各自副本）",
+          [m.text for m in h.plugin.store.history(sid) if m.role == "user"]
+          == ["Alice 开场", "Bob 接着说", "Alice 又问"],
+          f"{[m.text for m in h.plugin.store.history(sid) if m.role == 'user']}")
+
+
+async def test_solo_session_not_marked_shared(h: Harness):
+    """只有自己用的会话不该被标注成共用（前缀与系统提示都别多话）。"""
+    print("\n[37] 独享会话不标共用")
+    await establish(h)
+    h.clear()
+    await h.private("我一个人说//", settle=1.2)
+    await h.wait_for_replies(1)
+    req = h.llm.requests[-1]["messages"]
+    check("独享会话不加说话人前缀",
+          not any(_unlabeled(m["content"]).startswith("[")
+                  for m in req if m["role"] == "user"),
+          f"{[m['content'] for m in req if m['role'] == 'user']}")
+    check("独享会话的系统提示不提「共用」",
+          "共享" not in req[0]["content"], req[0]["content"][:300])
+
+
+async def test_private_binding_bootstrap(h: Harness):
+    """回归：私聊白名单为空时，超级用户仍必须能开出第一条私聊。
+
+    真实故障（死锁）：服务范围管理命令只能在私聊用，而 `users` 为空 + `deny` 时
+    私聊又被服务范围挡住 —— 于是永远开不出第一条私聊，提示还叫人「联系管理员」，
+    而管理员正是执行命令的那个人。
+    """
+    print("\n[38] 私聊开通的死锁：add 必须能自举")
+    plugin = h.plugin
+    saved = dict(plugin.cfg["binding"])
+    try:
+        plugin.cfg["binding"] = {"groups": [GROUP], "users": [],
+                                 "empty_means": "deny",
+                                 "notify_denied": True, "notify_cooldown": 0}
+        plugin.config.set("binding.users", [])
+        plugin._denied_notice.clear()
+
+        # 死锁现场：私聊不可用
+        ChatTarget = plugin_module("store").ChatTarget
+        ok, _ = plugin.check_access(ChatTarget("private", SUPERUSER), SUPERUSER)
+        check("私聊白名单为空时确实用不了", not ok, "本该被拒")
+
+        # 但 bind 必须能执行（不受服务范围限制）
+        h.clear()
+        await h.private("/aichat add user", user_id=SUPERUSER, settle=1.0)
+        texts = [reply_text(r) for r in h.replies]
+        check("开通命令本身不被服务范围拦",
+              any("已开通" in t for t in texts), f"{texts}")
+        check("没有多余的「未开通」回绝", not any("⛔" in t for t in texts), f"{texts}")
+        check("第一条私聊已开通", SUPERUSER in plugin.cfg["binding"]["users"],
+              f"{plugin.cfg['binding']['users']}")
+        ok2, _ = plugin.check_access(ChatTarget("private", SUPERUSER), SUPERUSER)
+        check("开通后私聊可用", ok2, "仍被拒")
+
+        # targets 同样豁免（否则运维看不到范围）
+        h.clear()
+        await h.private("/aichat targets", user_id=SUPERUSER, settle=0.9)
+        text = await h.wait_reply()
+        check("targets 也豁免服务范围", "服务范围" in text, text[:120])
+
+        # 普通用户仍然不能用（权限层拦截，与服务范围豁免无关）
+        h.clear()
+        await h.private("/aichat add user 20002", user_id=BOB, settle=0.7)
+        check("普通用户依旧不能用 add",
+              "未知命令" in await h.wait_reply(), "不该放行")
+    finally:
+        plugin.cfg["binding"] = saved
+        plugin.config.set("binding.users", saved.get("users", []))
+
+
+
+async def test_unbound_is_silent(h: Harness):
+    """未开通的聊天**什么都不回**（连「未开通」也不提示）。
+
+    这是默认行为，且与「键缺失」等价 —— 曾经写成
+    `binding.get("notify_denied", True)`，于是老配置/精简配置因为没有这个键
+    而退回「要提示」，在别人的群里凭空冒出一条机器人消息。
+    """
+    from napcat.models import MessageEvent, Sender
+
+    print("\n[39] 未开通的聊天完全静默")
+    plugin = h.plugin
+    saved = dict(plugin.cfg["binding"])
+    try:
+        # 故意**不带** notify_denied（模拟老配置/精简配置）
+        plugin.cfg["binding"] = {"groups": [GROUP], "users": [SUPERUSER],
+                                 "empty_means": "deny"}
+        h.client.groups.clear()
+        h.client.groups.bind_many([GROUP])
+        plugin._denied_notice.clear()
+
+        def group_event(text, gid, uid):
+            return MessageEvent(
+                message_type="group", group_id=gid, user_id=uid,
+                message=[{"type": "text", "data": {"text": text}}],
+                plain_text=text, message_id=1,
+                sender=Sender(user_id=uid, nickname="测试", role="member"))
+
+        # 未开通的群：说话 / 命令 都不回（框架层本来就会丢弃未绑群的消息，
+        # 这里直接调插件入口验证第二道闸也是静默的）
+        for label, ev in (
+            ("未开通群·说话", group_event("你好//", 99999, BOB)),
+            ("未开通群·命令", group_event("[@10001] /aichat current", 99999, BOB)),
+        ):
+            h.clear()
+            plugin._denied_notice.clear()
+            await plugin._handle_message(ev)
+            await h.client.cmds.handle(ev)
+            await asyncio.sleep(0.5)
+            check(f"{label} 不回任何消息", not h.replies, f"{h.replies}")
+
+        # 未开通的私聊：说话 / 命令 都不回
+        for label, cmd in (("未开通私聊·说话", "你好//"),
+                           ("未开通私聊·命令", "/aichat current")):
+            h.clear()
+            plugin._denied_notice.clear()
+            await h.private(cmd, user_id=BOB, settle=1.0)
+            await asyncio.sleep(0.5)
+            check(f"{label} 不回任何消息", not h.replies, f"{h.replies}")
+            check(f"{label} 也不调模型", h.llm.calls == 0, f"calls={h.llm.calls}")
+
+        # 显式打开时才提示（调试用），且带冷却
+        plugin.cfg["binding"] = {"groups": [GROUP], "users": [SUPERUSER],
+                                 "empty_means": "deny",
+                                 "notify_denied": True, "notify_cooldown": 0}
+        h.clear()
+        plugin._denied_notice.clear()
+        await h.private("你好//", user_id=BOB, settle=1.0)
+        check("显式 notify_denied=true 时才提示",
+              any("没有开通" in reply_text(r) for r in h.replies), f"{h.replies}")
+
+        # 未开通不会影响已开通的地址（私聊要有自己的私聊会话）
+        plugin.cfg["binding"] = {"groups": [GROUP], "users": [SUPERUSER],
+                                 "empty_means": "deny"}
+        await establish(h, user_id=SUPERUSER)
+        h.clear()
+        await h.private("我自己用//", user_id=SUPERUSER, settle=1.2)
+        check("已开通的私聊照常服务", bool(h.replies) and h.llm.calls >= 1,
+              f"replies={len(h.replies)} calls={h.llm.calls}")
+    finally:
+        plugin.cfg["binding"] = saved
+        h.client.groups.clear()
+        h.client.groups.bind_many([GROUP, OTHER_GROUP])
+
+
+
+async def test_maxtokens_command(h: Harness):
+    print("\n[40] /aichat maxtokens：按会话改 max_tokens")
+    await establish(h)
+    h.clear()
+    await h.private("/aichat maxtokens", settle=0.9)
+    text = await h.wait_reply()
+    check("maxtokens 显示状态", "max_tokens" in text and "全局默认" in text, text[:200])
+    base = h.plugin.llm.max_tokens
+
+    h.clear()
+    await h.private("默认一轮//", settle=1.0)
+    await h.wait_for_replies(1)
+    check("默认用全局 max_tokens", h.llm.last_max_tokens == base,
+          f"{h.llm.last_max_tokens} vs {base}")
+
+    h.clear()
+    await h.private("/aichat maxtokens 2048", settle=0.9)
+    text = await h.wait_reply()
+    check("设置成功", "已" in text and "2048" in text, text[:200])
+    sid = _current_session(h).id
+    check("落库到 session.meta",
+          h.plugin.store.get(sid).meta.get("max_tokens") == 2048,
+          f"{h.plugin.store.get(sid).meta}")
+    check("状态卡标为会话设置", "会话设置" in text, text[:300])
+
+    h.clear()
+    await h.private("再来一轮//", settle=1.0)
+    await h.wait_for_replies(1)
+    check("payload 真的用 2048", h.llm.last_max_tokens == 2048,
+          f"{h.llm.last_max_tokens}")
+
+    h.clear()
+    await h.private("/aichat maxtokens 8k", settle=0.9)
+    await h.wait_for_replies(1)
+    check("8k 简写 = 8192",
+          h.plugin.store.get(sid).meta.get("max_tokens") == 8192,
+          f"{h.plugin.store.get(sid).meta}")
+
+    h.clear()
+    await h.private("/aichat maxtokens off", settle=0.9)
+    await h.wait_reply()
+    check("off 清除覆盖", "max_tokens" not in (h.plugin.store.get(sid).meta or {}),
+          f"{h.plugin.store.get(sid).meta}")
+    h.clear()
+    await h.private("清掉后一轮//", settle=1.0)
+    await h.wait_for_replies(1)
+    check("清除后回到全局", h.llm.last_max_tokens == base, f"{h.llm.last_max_tokens}")
+
+    h.clear()
+    await h.private("/aichat maxtokens 很多", settle=0.9)
+    text = await h.wait_reply()
+    check("非法值有明确提示", "不认识" in text, text[:150])
+
+    h.clear()
+    await h.private("/aichat maxtokens 10", settle=0.9)
+    text = await h.wait_reply()
+    check("低于下界被拒", "64" in text, text[:150])
+
+    h.clear()
+    await h.private("/aichat maxtokens 2048 --session=nope-xyz", settle=0.9)
+    text = await h.wait_reply()
+    check("指定不存在的会话有提示", "找不到会话" in text, text[:150])
+
+
+async def test_timeout_command(h: Harness):
+    print("\n[41] /aichat timeout：按会话改单次调用时长上限")
+    await establish(h)
+    h.clear()
+    await h.private("/aichat timeout", settle=0.9)
+    text = await h.wait_reply()
+    check("timeout 显示状态", "时长上限" in text and "全局默认" in text, text[:200])
+    check("状态卡解释 stall_timeout 与它的区别", "stall_timeout" in text, text[:400])
+    base = float(h.plugin.llm.timeout)
+
+    h.clear()
+    await h.private("默认一轮//", settle=1.0)
+    await h.wait_for_replies(1)
+    check("默认用全局 timeout", h.llm.last_timeout == base, f"{h.llm.last_timeout} vs {base}")
+
+    h.clear()
+    await h.private("/aichat timeout 600", settle=0.9)
+    text = await h.wait_reply()
+    check("设置成功", "已" in text and "600" in text, text[:200])
+    sid = _current_session(h).id
+    check("落库到 session.meta",
+          h.plugin.store.get(sid).meta.get("timeout") == 600.0,
+          f"{h.plugin.store.get(sid).meta}")
+
+    h.clear()
+    await h.private("设完再一轮//", settle=1.0)
+    await h.wait_for_replies(1)
+    check("本会话调用真的用 600", h.llm.last_timeout == 600.0, f"{h.llm.last_timeout}")
+
+    h.clear()
+    await h.private("/aichat timeout 10m", settle=0.9)
+    await h.wait_for_replies(1)
+    check("10m = 600 秒",
+          h.plugin.store.get(sid).meta.get("timeout") == 600.0,
+          f"{h.plugin.store.get(sid).meta}")
+
+    h.clear()
+    await h.private("/aichat timeout 5", settle=0.9)
+    text = await h.wait_reply()
+    check("低于下界被拒", "10" in text, text[:150])
+
+    h.clear()
+    await h.private("/aichat timeout abc", settle=0.9)
+    text = await h.wait_reply()
+    check("非法值有提示", "不认识" in text, text[:150])
+
+    h.clear()
+    await h.private("/aichat timeout off", settle=0.9)
+    await h.wait_reply()
+    check("off 清除覆盖", "timeout" not in (h.plugin.store.get(sid).meta or {}),
+          f"{h.plugin.store.get(sid).meta}")
+    h.clear()
+    await h.private("清掉后一轮//", settle=1.0)
+    await h.wait_for_replies(1)
+    check("清除后回到全局", h.llm.last_timeout == base, f"{h.llm.last_timeout}")
+
+    h.clear()
+    await h.private("/aichat timeout 600 --session=nope-xyz", settle=0.9)
+    text = await h.wait_reply()
+    check("指定不存在的会话有提示", "找不到会话" in text, text[:150])
+
+
+async def test_plain_text_formatting(h: Harness):
+    print("\n[45] 文本模式：Markdown 残留发出去前被清掉")
+    md = plugin_module("markdown")
+    cases = [
+        ("**重点**：注意", "重点：注意"),
+        ("> 引用的话", "引用的话"),
+        ("### 小标题", "小标题"),
+        ("看[文档](https://example.com/a)", "看文档（https://example.com/a）"),
+        ("用 `pip install x`", "用 pip install x"),
+        ("~~删掉~~ 和 *斜体* 和 __粗__", "删掉 和 斜体 和 粗"),
+        ("转义 \\*字面星号\\*", "转义 *字面星号*"),
+    ]
+    for src, want in cases:
+        got = md.to_plain_text(src)
+        check(f"to_plain_text({src!r})", got == want, f"{got!r} != {want!r}")
+    # 公式必须一字不动（里面的 * _ \frac 不能被当成 Markdown）
+    math_src = "公式 $a*b = c$ 和 $$\\frac{a}{b}$$ 不动"
+    check("公式整段保护", md.to_plain_text(math_src) == math_src,
+          md.to_plain_text(math_src))
+    check("分隔线换成实线", md.to_plain_text("---") == "─" * 10)
+
+    # —— 端到端：桩回一段带 Markdown 的话，文本模式下发出的必须是降噪后的 ——
+    await establish(h)
+    h.llm.script_text = "> **注意**：先看[文档](https://example.com/a)。\n用 `pip install x` 安装。"
+    h.clear()
+    await h.private("来一段//", settle=1.0)
+    await h.wait_for_replies(1)
+    text = await h.wait_reply()
+    check("发出的话里没有 ** 残留", "**" not in text, text[:200])
+    check("没有行首 > 残留", not any(ln.startswith(">") for ln in text.splitlines()), text[:200])
+    check("链接改成了 标题（url）", "文档（https://example.com/a）" in text, text[:200])
+    check("反引号去掉了", "`" not in text, text[:200])
+
+    # —— 混合路径：正文 + 行内公式（公式出图，文本部分同样要降噪）——
+    h.llm.script_text = "**重点**：看公式 $x^2$ 的结果。"
+    h.clear()
+    await h.private("再一段//", settle=1.5)
+    await h.wait_for_replies(1)
+    text = await h.wait_reply()
+    check("图文混合时文本段也降噪", "**" not in text, text[:200])
+    check("公式部分没退化成源码", "$x^2$" not in text, text[:200])
+    h.llm.script_text = "好的，我收到了。"
+
+
+async def test_unified_help(h: Harness):
+    """帮助统一走框架 `CommandManager` 的 /help，插件不再自绘一份。"""
+    from napcat.models import parse_event
+
+    print("\n[20] 统一帮助（/help）")
+    cmds = h.client.cmds
+
+    async def help_of(text, *, uid, group_id=None):
+        payload = (h._msg_payload("group", text, user_id=uid, group_id=group_id,
+                                 at_bot=True) if group_id is not None
+                   else h._msg_payload("private", text, user_id=uid))
+        res = await cmds.handle(parse_event(payload))
+        return res if isinstance(res, str) else str(res)
+
+    # ---- 子命令清单由框架从注册信息渲染（用法行来自 Schema，不是手写）----
+    text = await help_of("/help aichat", uid=SUPERUSER)
+    check("列出全部子命令",
+          all(f"/aichat {n}" in text for n in
+              ("new", "list", "attach", "detach", "current",
+               "rename", "delete", "compact", "invite", "guests", "think")),
+          text[:400])
+    check("已删除的 switch / stats 不再出现",
+          "/aichat switch" not in text and "/aichat stats" not in text, text[:400])
+    check("超级用户才看得到 targets/add/del/model/config/reload",
+          all(f"/aichat {n}" in text for n in ("targets", "add", "del",
+                                               "model", "config", "reload")),
+          text[:600])
+    check("子命令清单只给名字与介绍（不摊参数）",
+          "/aichat new" in text and "/aichat new <name>" not in text, text[:400])
+    check("子命令清单标注权限 + 作用域（但不摊参数）",
+          "[权限：" in text and "作用域：" in text and "/aichat new <name>" not in text,
+          text[:600])
+    # 权限与范围改在第三级详情行呈现
+    d_private_sub = await help_of("/help aichat add", uid=SUPERUSER)
+    check("仅私聊范围在第三级详情里标注",
+          "仅私聊" in d_private_sub and "权限：superuser" in d_private_sub,
+          d_private_sub.replace("\n", " / ")[:160])
+
+    # ---- 已删除的重复命令 ----
+    check("已删除 /aichat help（改用统一 /help）",
+          "/aichat help" not in text, text[:600])
+    check("已删除 /aichat info（与 current 重复）",
+          "/aichat info" not in text, text[:600])
+    for gone in ("/aichat help", "/aichat info"):
+        page = await help_of(gone, uid=SUPERUSER)
+        # 子命令名写错 = 用法不正确：框架重定向到命令组帮助页（列着现存的子命令）
+        check(f"{gone} 已不存在（回命令组帮助页，页里没有它）",
+              page.startswith("📖 /aichat") and gone not in page, page[:120])
+
+    # ---- 单命令详情：参数表由 Schema 生成 ----
+    detail = await help_of("/help aichat.new", uid=SUPERUSER)
+    check("详情列出参数与默认值",
+          "attach" in detail and "默认" in detail, detail[:400])
+    check("详情给出键值传参写法", "--attach=" in detail, detail[:500])
+    # 空格写法必须与点号写法等价（子命令先注册 → 父命令是框架的占位 handler）
+    detail_space = await help_of("/help aichat new", uid=SUPERUSER)
+    check("`/help aichat new` 与 `/help aichat.new` 等价",
+          detail_space == detail, detail_space[:200])
+
+    # ---- 结束符等「非命令」信息挂在命令组描述上 ----
+    check("命令组描述提到结束符", "//" in text, text[:300])
+    check("命令组描述提到服务范围", "开通" in text, text[:300])
+    check("命令组描述说明「每人各有会话 + 受邀参与」",
+          "invite" in text and "attach" in text, text[:400])
+
+    # ---- 普通用户：看不到 superuser 子命令，但看得到公开子命令 ----
+    text_user = await help_of("/help aichat", uid=BOB, group_id=GROUP)
+    check("普通用户看得到公开子命令", "/aichat new" in text_user, text_user[:300])
+    # 只看**子命令清单**里的行 —— 命令组描述里会提到 add/del/targets（那是给
+    # 超级用户看的提示），用整段文本判断会误报。
+    # 取子命令**名**（`/aichat xxx` 的第一个 token），别用子串匹配 ——
+    # 描述里出现「模型」之类的词会造成误报。
+    names_user = {ln.strip().split()[1] for ln in text_user.splitlines()
+                  if ln.strip().startswith("/aichat ") and len(ln.split()) > 1}
+    check("普通用户看得到公开子命令", {"new", "attach", "invite"} <= names_user,
+          f"{sorted(names_user)}")
+    check("普通用户看不到仅私聊的管理命令",
+          not ({"add", "del", "targets", "model", "config", "reload"} & names_user),
+          f"{sorted(names_user)}")
+    # 未开通的地址：整块命名空间都不出现
+    h.client.groups.clear()
+    saved_b = dict(h.plugin.cfg["binding"])
+    try:
+        h.plugin.cfg["binding"] = {"groups": [], "users": [], "empty_means": "deny",
+                                   "notify_denied": False, "notify_cooldown": 0}
+        t2 = await help_of("/help aichat", uid=BOB)
+        check("未开通的地址看不到命名空间", "未知命令" in t2, t2[:120])
+        t3 = await help_of("/help aichat", uid=SUPERUSER)
+        check("超级用户在未开通时仍看得到（否则无从开通）",
+              "📖 /aichat" in t3, t3[:120])
+        check("超级用户的帮助里含开通命令",
+              "/aichat add" in t3 and "/aichat targets" in t3, t3[:600])
+    finally:
+        h.plugin.cfg["binding"] = saved_b
+        h.client.groups.bind_many([GROUP, OTHER_GROUP])
+    check("普通用户看不到 model", "/aichat model" not in text_user, text_user[:400])
+
+    # ---- 未开通的地址：帮助里整块命名空间都不出现 ----
+    h.client.groups.clear()
+    plugin = h.plugin
+    saved = dict(plugin.cfg["binding"])
+    try:
+        plugin.cfg["binding"] = {"groups": [], "users": [ALICE],
+                                 "empty_means": "deny",
+                                 "notify_denied": True, "notify_cooldown": 0}
+        text_blocked = await help_of("/help", uid=BOB, group_id=99999)
+        check("未开通群的 /help 不列出 aichat", "/aichat" not in text_blocked,
+              text_blocked[:300])
+        check("未开通群问详情按「未知命令」处理",
+              "未知命令" in await help_of("/help aichat", uid=BOB, group_id=99999),
+              "应当隐藏")
+        check("别的插件的命令不受影响（/ping）",
+              "/ping" in await help_of("/help", uid=BOB),
+              "不该被牵连")
+        # 已授权私聊照旧
+        check("已授权私聊仍看得到 aichat",
+              "/aichat" in await help_of("/help", uid=ALICE), "应当可见")
+    finally:
+        plugin.cfg["binding"] = saved
+        h.client.groups.bind_many([GROUP, OTHER_GROUP])
+
+
+# ==================== 驱动 ====================
+
+#: 段落编号前缀 `[#N] `（见 compaction.WrappingConfig.number_paragraphs）。
+#: 断言「有没有说话人前缀」「有没有分段序号」时要先剥掉它 —— 那是另一件事。
+_LABEL_RE = re.compile(r"^\[#\d+\] ")
+
+
+def _unlabeled(text: str) -> str:
+    return _LABEL_RE.sub("", str(text or ""), count=1)
+
+
+async def establish(h: Harness, *, user_id=ALICE, group_id=None):
+    """建一个会话并把它设为焦点（会话不再自动创建，所以每个用例都要显式建）。
+
+    `group_id` 给了就在那个群里建**群会话**（位置决定作用地），
+    否则在私聊里建个人的私聊会话。
+    """
+    h.clear()
+    if group_id is None:
+        await h.private("/aichat new 预热会话", user_id=user_id, settle=1.0)
+    else:
+        await h.group("/aichat new 预热群会话", at_bot=True,
+                      user_id=user_id, group_id=group_id, settle=1.0)
+    try:
+        await h.wait_for_replies(1, timeout=5.0)
+    except TimeoutError:
+        pass
+    h.clear()
+    return _current_session(h, user_id=user_id, group_id=group_id)
+
+
+async def attach_to(h: Harness, sid: str, *, user_id=BOB, group_id=None):
+    """让另一个人切到指定会话（会话已存在时用；不再有自动创建兜底）。"""
+    if group_id is None:
+        await h.private(f"/aichat attach {sid} --force=true", user_id=user_id,
+                        settle=1.0)
+    else:
+        await h.group(f"/aichat attach {sid} --force=true", at_bot=True,
+                      user_id=user_id, group_id=group_id, settle=1.0)
+    try:
+        await h.wait_for_replies(1, timeout=5.0)
+    except TimeoutError:
+        pass
+    h.clear()
+
+
+def _fake_private(user_id: int):
+    _FakeEvent = plugin_module("main")._FakeEvent
+    ChatTarget = plugin_module("store").ChatTarget
+    return _FakeEvent(ChatTarget("private", user_id), {"user_id": user_id}, "")
+
+
+def _current_session(h: Harness, *, user_id=ALICE, group_id=None):
+    """这个人在这个位置（私聊 / 某个群）的当前会话。"""
+    ChatTarget = plugin_module("store").ChatTarget
+    target = (ChatTarget("group", group_id) if group_id is not None
+              else ChatTarget("private", user_id))
+    return h.plugin._current_session(target, user_id)
+
+
+ROOT_TMP = ROOT / "tests" / ".test-tmp" / "ai-chat-runs"
+
+
+async def run_case(fn, root: Path):
+    """每个用例一个**全新实例**：独立 data_dir / 会话库 / 暂存区。
+
+    共用实例会让用例互相污染（上一个用例建的会话、累计的回复条数都会影响
+    下一个用例的断言），排查成本远高于多起一次客户端。
+    """
+    tmp = Path(tempfile.mkdtemp(prefix=fn.__name__ + "-", dir=str(root)))
+    h = Harness(tmp)
+    try:
+        await h.start()
+        await fn(h)
+    except Exception as e:  # noqa: BLE001
+        import traceback
+        globals()["FAILED"] = globals()["FAILED"] + 1
+        FAILURES.append(f"{fn.__name__}: {e!r}")
+        print(f"  ❌ {fn.__name__} 抛异常: {e!r}")
+        traceback.print_exc()
+    finally:
+        try:
+            await h.stop()
+        except Exception:
+            pass
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+async def main():
+    ROOT_TMP.mkdir(parents=True, exist_ok=True)
+    # 纯单元用例（不依赖客户端）
+    await run_case(test_compaction_split_safety, ROOT_TMP)
+    await run_case(test_reasoning_unit, ROOT_TMP)
+    await run_case(test_config_seed_unit, ROOT_TMP)
+    await run_case(test_prompt_tables_and_formulas, ROOT_TMP)
+    await run_case(test_data_dir_resolution, ROOT_TMP)
+    await run_case(test_state_migration, ROOT_TMP)
+
+    for fn in (
+        test_private_flow, test_group_trigger, test_command_messages_not_dialogue,
+        test_session_lifecycle, test_group_session_is_per_group,
+        test_public_session, test_invite_code,
+        test_invite_flow, test_shared_context,
+        test_solo_session_not_marked_shared, test_wrapping,
+        test_tool_calling, test_plot_tool, test_fetch_image_tool,
+        test_fetch_page_lists_images, test_last_round_answers_without_tools,
+        test_tool_permission,
+        test_role_command, test_role_permission, test_role_persistence,
+        test_compaction,
+        test_compaction_refuses_bad_summary,
+        test_target_commands, test_session_access_guard, test_model_and_current,
+        test_recall_removes_staged, test_detach_drops_staged, test_staging_persistence,
+        test_staging_shared_across_windows, test_window_key_migration,
+        test_submit_while_busy, test_terminator_waits_for_ingest,
+        test_skill_tools, test_voice_transcribed, test_image_in_same_message,
+        test_media_gating, test_mark_command, test_media_capability_note,
         test_reply_drops_mimicked_label,
         test_hget_traces_chain, test_hget_by_label,
         test_paragraph_labels, test_quote_uses_label,

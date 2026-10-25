@@ -81,6 +81,9 @@ class Tool:
     group_only: bool = False
     requires_moderation: bool = False
     superuser_only: bool = False
+    #: **委派型**：调用它等于「把这件事交给别的插件」，由那个插件自己回消息 ——
+    #: 结果不回喂模型、AI 本轮也不说话（见 `main._model_loop` 的 `_DELEGATED`）
+    delegates: bool = False
 
     def schema(self) -> dict:
         """OpenAI `tools[]` 里的函数声明。"""
@@ -280,9 +283,23 @@ def _skill_tool(skill, *, logger=None) -> Tool:
             group_id=int(ctx.group_id or 0), is_group=bool(ctx.in_group),
             session_id=str(ctx.session_id or ""),
             is_superuser=bool(ctx.is_superuser),
-            is_admin=bool(ctx.can_moderate))
+            is_admin=bool(ctx.can_moderate),
+            # 技能自己回消息（AI 不说话），所以把「往哪儿发」交给它
+            send=None)
+        # 技能自己回消息才算「说过了」；没回就把它的返回值发出去 ——
+        # 否则用户发「帮我查查学校的通知」，插件不回、AI 也不回，等于没反应。
+        real_send = (ctx.extras or {}).get("send")
+        said = {"done": False}
+
+        async def _send(message):
+            said["done"] = True
+            if real_send is not None:
+                await real_send(message)
+        sctx.send = _send
         try:
             text = await call_skill(skill, args, sctx)
+            if not said["done"] and str(text or "").strip():
+                await _send(text)
         except Exception as e:  # noqa: BLE001 - 技能失败要变成模型能读的一句话
             if logger:
                 logger.warning("[ai_chat] 技能 %s 执行失败: %r", skill.name, e)
@@ -301,6 +318,8 @@ def _skill_tool(skill, *, logger=None) -> Tool:
         description=(f"[{skill.plugin}] {skill.description}".strip()),
         parameters=(skill.parameters or {"type": "object", "properties": {}}),
         handler=handler,
+        # 委派型：执行结果由插件自己发给用户，AI 不接话、也不转述
+        delegates=True,
     )
 
 

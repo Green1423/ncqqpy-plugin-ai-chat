@@ -7,15 +7,26 @@
 
 **图片默认拿不到，语音默认全给。** 这条不对称是刻意的：
 
-| 媒体 | 什么时候把**字节**传给模型 | 标号 |
+| 媒体 | 怎么进对话 | 标号 |
 |---|---|---|
-| 图片 | **只有 `/aichat mark` 标记过的**（引用那条消息 + 发命令） | `[图#N]` |
-| 语音 | **总是全传**：一轮里所有语音一起发，视为一条对话 | `[语音#N]` |
+| 图片（**这条消息里发的**） | 默认就下载、就传 —— 「这张图 + 这个问题」本来就是一件事 | `[图#N]` |
+| 图片（**引用别的消息**） | 引用一次就把那条消息里的图一起带上（见 17.1a） | `[图#N]` |
+| 图片（**更早、没引用的**） | 引用那条消息 + `/aichat mark` | `[图#N]` |
+| 语音 | **默认转写**：落地 → 转成文字 → 文字直接进正文（见 17.1） | `[语音#N]` |
+
+> 这条边界是**实测改出来的**：早先一律要求标记，结果用户把图案配着问题发过来
+> （「给这个图案写一份提示词」），模型只回一句「图没收到」。现在「同一条消息里的图」
+> 默认传，历史里的图才按需标记 —— 既不用每次先敲命令，也不会把几十张历史图
+> 全塞进上下文。
+
+> 为什么语音是「转文字」而不是「传音频」：qwen3.8-27b 明确拒收音频
+> （实测 400 `At most 0 audio(s) may be provided in one prompt`），塞进去整轮对话就崩。
+> 转成文字既绕开这个限制，又能进历史、被压缩、被引用。
 
 为什么图片不默认全传：多模态 token 贵，群里绝大多数图与问题无关，而「要看哪张」
 只有人知道。所以把「要不要看」变成一次显式动作。
 
-## 17.1 标记一张图：`/aichat mark`
+## 17.1a 历史里的图：`/aichat mark`
 
 ```text
 （长按那张图 → 引用 → 发送）
@@ -30,6 +41,8 @@
 （临时标记：提交一次后失效；要再看得重新标记）
 ```
 
+用于**历史里**（上一轮、几十条之前）的图 —— 同一条消息里刚发的图不需要标记，默认就传。
+
 规矩：
 
 * **必须先引用**那条含图的消息；没引用就发命令，会回一句「引用一条含图片的消息」；
@@ -42,6 +55,70 @@
 编号是**会话内**自增的（`session.meta["media_seq"]`），随消息落盘 —— 重启、
 压缩之后 `[图#3]` 仍指同一张图。编号只在**标记时**分配：到达就下载既费流量，
 而编号对用户的意义本来就是「我要用这张」。
+
+## 17.1 语音：默认转成文字交给模型
+
+QQ 语音到达时：下载 →（amr/silk 用 ffmpeg 转 16k 单声道 wav）→ **转写** → 转写文本
+拼进正文：
+
+```text
+[#7] 明天下午三点的会改到四点
+[语音#1] 明天下午三点的会改到四点
+```
+
+引擎**由配置决定，插件不绑死一家**（`asr` 段）——引擎换实现、换机器、换云端，
+插件代码都不用改：
+
+| `engine` | 跑什么 | 典型用途 |
+|---|---|---|
+| `cmd` | 一条外部命令，`{file}` 替换成 wav 路径；取 stdout **最后一行非空** | 本地 sherpa-onnx / whisper.cpp / 将来的 RKNN 版 |
+| `http` | OpenAI 风格 `/v1/audio/transcriptions`（读 `text` 字段） | 网关开了 whisper / qwen3-asr |
+| 留空 | 按配置自动选：有 `command` → cmd，有 `url` → http | —— |
+
+转写失败**不影响这轮对话**：标号后面写 `（转写失败：原因）`，模型会如实说没听清。
+
+### 本机怎么跑起来（CPU 版 Qwen3-ASR int8）
+
+```bash
+# 1) 装引擎（aarch64 + Python 3.14 有现成轮子）
+<仓库根>/venv-arm/bin/pip install sherpa-onnx
+
+# 2) 下模型（Qwen3-ASR 0.6B int8，约 700MB）
+cd /ncqqpy/plugins/ai_chat/data
+wget https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-qwen3-asr-0.6B-int8-2026-03-25.tar.bz2
+tar xvf sherpa-onnx-qwen3-asr-0.6B-int8-2026-03-25.tar.bz2
+```
+
+`config.json → plugins.ai_chat.asr`：
+
+```json
+{
+  "enabled": true,
+  "command": "sherpa-onnx-offline --qwen3-asr-conv-frontend=/ncqqpy/plugins/ai_chat/data/sherpa-onnx-qwen3-asr-0.6B-int8-2026-03-25/conv_frontend.onnx --qwen3-asr-encoder=/ncqqpy/plugins/ai_chat/data/sherpa-onnx-qwen3-asr-0.6B-int8-2026-03-25/encoder.int8.onnx --qwen3-asr-decoder=/ncqqpy/plugins/ai_chat/data/sherpa-onnx-qwen3-asr-0.6B-int8-2026-03-25/decoder.int8.onnx --qwen3-asr-tokenizer=/ncqqpy/plugins/ai_chat/data/sherpa-onnx-qwen3-asr-0.6B-int8-2026-03-25/tokenizer {file}"
+}
+```
+
+配好后先自检（**别等群里发语音才发现引擎坏了**）：
+
+```text
+/aichat asr        # 超管、私聊
+🎧 语音转写：引擎 cmd：sherpa-onnx-offline 可用（静音样本转写为 ''）
+```
+
+### 为什么不走 RKNN（NPU）
+
+2026-10-25 在本机（Rock 5B+ / RK3588）核实过：
+
+| 条件 | 现状 |
+|---|---|
+| NPU 设备节点 `/dev/rknpu*` | **不存在**（`dmesg` / `lsmod` 也没有 rknpu） |
+| RKNN 运行时 `librknnrt.so` | 没装 |
+| `rknn-toolkit-lite2` | 不在 PyPI 上；官方只给到 cp38–cp311 的轮子，本机 Python 3.14 |
+| Qwen3-ASR 权重 | **开源**（`Qwen/Qwen3-ASR-0.6B` / `1.7B`），社区也有 RK3588 转换版 |
+
+结论：**RKNN 这条路要先装 Rockchip 的 NPU 驱动 + 运行时**（系统级改动，得重启），
+之后才能谈「int8 RKNN 模型」。插件这边**已经不受影响** —— 转写引擎是可插拔的，
+RKNN 版做出来后把它填进 `asr.command` 就切过去了，不用改代码。
 
 ## 17.2 能力探测（这个模型到底收不收）
 

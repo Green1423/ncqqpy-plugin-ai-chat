@@ -50,6 +50,16 @@ git clone https://github.com/Green1423/ncqqpy-plugin-ai-chat plugins/ai_chat
       "compaction": "off"
     }
   },
+  "asr": {
+    "enabled": true,
+    "engine": "",
+    "command": "",
+    "url": "",
+    "model": "",
+    "api_key": "",
+    "timeout": 60,
+    "max_chars": 600
+  },
   "skills": {
     "enabled": true,
     "allow": [],

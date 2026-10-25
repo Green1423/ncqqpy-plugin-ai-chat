@@ -94,6 +94,8 @@ class MediaItem:
     size: int = 0                   # 字节数（缩放后）
     ok: bool = True
     note: str = ""                  # 失败/降级原因（给用户看的那句话）
+    #: 语音转写出来的文字（见 `asr.Transcriber`）—— 落进历史，模型直接读
+    transcript: str = ""
     source: str = ""                # 原始 url / file（诊断用，不落历史）
 
     @property
@@ -110,7 +112,7 @@ class MediaItem:
     def to_dict(self) -> dict:
         return {"kind": self.kind, "num": int(self.num), "path": self.path,
                 "mime": self.mime, "size": int(self.size), "ok": bool(self.ok),
-                "note": self.note}
+                "note": self.note, "transcript": self.transcript}
 
     @staticmethod
     def from_dict(d: dict) -> "MediaItem":
@@ -120,7 +122,8 @@ class MediaItem:
                          mime=str(d.get("mime") or ""),
                          size=int(d.get("size") or 0),
                          ok=bool(d.get("ok", True)),
-                         note=str(d.get("note") or ""))
+                         note=str(d.get("note") or ""),
+                         transcript=str(d.get("transcript") or ""))
 
     def describe(self) -> str:
         """一句话说明（给模型看的占位符补充说明，也是失败时的提示）。"""
@@ -182,7 +185,7 @@ class MediaStore:
             item.ok, item.note = False, "没有可下载的地址"
             return item
         try:
-            raw = await self._download(url)
+            raw = await self._fetch_bytes(url)
         except Exception as e:  # noqa: BLE001 - 网络问题不该炸掉整轮
             item.ok, item.note = False, f"下载失败：{type(e).__name__}"
             return item
@@ -237,6 +240,22 @@ class MediaStore:
             self._remember(session, item)
         self.prune()
         return item
+
+    async def _fetch_bytes(self, src: str) -> bytes:
+        """取原始字节：http(s) 下载；`file://` 或**本地已存在路径**直接读。
+
+        为什么需要后者：NapCat 给 `record` 段的常常是本地缓存文件名
+        （`xxxx.amr`），而不是 URL —— 直接当 URL 用会 `InvalidUrlClientError`，
+        线上就出现过「语音全部未取到」。
+        """
+        text = str(src or "")
+        if text.startswith("file://"):
+            text = text[len("file://"):]
+        if text and not text.startswith(("http://", "https://")) \
+                and os.path.exists(text):
+            with open(text, "rb") as f:
+                return f.read()
+        return await self._download(src)
 
     async def _download(self, url: str) -> bytes:
         import aiohttp

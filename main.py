@@ -61,6 +61,7 @@ from .compaction import (
     WrappingConfig, build_system_prompt, sanitize_history, tool_guidance,
 )
 from .custom_tools import register_config_tools
+from .asr import AsrOptions, Transcriber
 from .capability import CapabilityCache, supports as capability_supports
 from .llm import LlmClient, err_text, resolve_secret
 from .media import KIND_LABELS, MediaItem, MediaStore, parse_markers
@@ -135,6 +136,21 @@ DEFAULT_CONFIG: dict = {
     # ---- 网图配图（工具 fetch_image）----
     # 让模型能把网上的图片**配在回复里**发给用户（QQ 直接显示成图片）。
     # 依赖 `search.enabled`（下载复用搜索那套 HTTP 客户端与 SSRF 闸）。
+    # 语音转写：把 QQ 语音变成文字再交给模型（引擎由这里决定，插件不绑死一家）。
+    #   engine 空=自动（有 command→cmd，有 url→http）；none=不转写。
+    #   本地引擎示例（sherpa-onnx + Qwen3-ASR int8）：
+    #     "command": "sherpa-onnx-offline --qwen3-asr-encoder=... --qwen3-asr-decoder=...
+    #                 --tokens=... --qwen3-asr-conv-frontend=... --qwen3-asr-language=zh {file}"
+    "asr": {
+        "enabled": True,
+        "engine": "",
+        "command": "",
+        "url": "",
+        "model": "",
+        "api_key": "",
+        "timeout": 60,
+        "max_chars": 600,
+    },
     # 多模态（用户发来的图片/视频/语音）：
     #   image/audio 开不开这一类**输入**；能不能真用还得看模型（探测结果见
     #   `data/capabilities.json`，换模型自动重探）。
@@ -351,6 +367,11 @@ def deep_merge(base: dict, override: dict) -> dict:
 
 # ==================== 插件 ====================
 
+#: 「这一轮交给别的插件了」的哨兵：`_model_loop` 返回它，`_run_turn` 据它决定不说话。
+#: 用对象而不是字符串：模型自己的输出永远不可能等于这个对象。
+_DELEGATED = object()
+
+
 class _EmptySkills:
     """空技能表：进程里的框架还没有技能通道时的占位（见 `_build_tools`）。"""
 
@@ -474,6 +495,9 @@ class AiChatPlugin(PluginBase):
             max_bytes=int(mm.get("max_bytes") or 4 * 1024 * 1024),
             max_side=int(mm.get("max_side") or 1568),
             keep_files=int(mm.get("keep_files") or 200))
+        #: 语音转写（把 QQ 语音变成文字再交给模型；引擎由 `asr` 配置决定）
+        self.asr = Transcriber(AsrOptions.from_cfg(self.cfg.get("asr")),
+                               logger=self.logger)
         #: 「这模型收不收图片/音频」的探测结果（按 base_url+model 缓存）
         self.capabilities = CapabilityCache(
             os.path.join(self._data_dir, "capabilities.json"), logger=self.logger)
@@ -1567,6 +1591,11 @@ class AiChatPlugin(PluginBase):
             # `/aichat mark` 显式标记（见 `_do_mark`）—— 见 `docs/.../17-multimodal.md`。
             picked: list = []
             media_items = await self._ingest_media(event, session)
+            # 「发的这张图」和「问的问题」是同一件事 —— 默认交给模型；
+            # 只有**历史里的**图才需要 `/aichat mark`（否则用户每次都得先标记，
+            # 实测他直接把图配着问题发过来，结果模型说「图没收到」）。
+            picked = [(m.kind, m.num) for m in media_items
+                      if m.ok and m.num > 0 and m.kind == "image"]
             if media_items:
                 # 取不到的媒体也要留标号（否则模型不知道「这儿本来有张图」），
                 # 但补一句「未取到」—— 免得它对着一个空标号编内容
@@ -1574,8 +1603,13 @@ class AiChatPlugin(PluginBase):
                 for m in media_items:
                     if not m.marker():
                         continue
-                    marks.append(m.marker() if m.ok
-                                 else f"{m.marker()}（未取到）")
+                    if not m.ok:
+                        marks.append(f"{m.marker()}（未取到）")
+                    elif getattr(m, "transcript", ""):
+                        # 转写成功：标号后面直接跟文字，模型不用再去"听"
+                        marks.append(f"{m.marker()} {m.transcript}")
+                    else:
+                        marks.append(m.marker())
                 if marks:
                     text = (text.rstrip() + "\n" + " ".join(marks)).strip()
                 media = ""      # 已经有真媒体了，不要再写「（其中含图片，未读取）」
@@ -1674,12 +1708,24 @@ class AiChatPlugin(PluginBase):
                 continue
             kind = str(seg.get("type") or "")
             # 只有语音在这里落地；图片走 `/aichat mark`（未标记的一律不下载）
-            if kind != "record":
+            # 只收**用户这条消息里带的**图/语音：历史里的图要靠 `/aichat mark`
+            # （见 `_do_mark`）—— 「你问的这张」默认就该看到，「很久以前那张」
+            # 才需要显式点名。
+            if kind not in ("record", "image"):
                 continue
             data = seg.get("data") or {}
             url = str(data.get("url") or data.get("file") or "")
             if not url:
                 continue
+            # NapCat 有时只给文件名（`abcd.amr`）—— 用 get_record 换一个能取的地址
+            if not url.startswith(("http://", "https://", "file://")) \
+                    and not os.path.exists(url) and kind == "record":
+                try:
+                    info = await self.client.api.get_record(file=url)
+                    url = str(getattr(info, "url", "") or getattr(info, "file", "")
+                              or url)
+                except Exception:  # noqa: BLE001 - 换不到就按原样试，失败会记 note
+                    pass
             num = 0
             if session is not None:
                 meta = session.meta if isinstance(session.meta, dict) else {}
@@ -1687,6 +1733,14 @@ class AiChatPlugin(PluginBase):
                 meta["media_seq"] = num
                 self.store.touch(session.id)      # 编号也要落盘
             item = await self.media.fetch(url, kind, num=num, session=session)
+            if item.ok and kind == "record":
+                # **默认转给 AI**：语音先转成文字，正文里直接带上内容 ——
+                # 模型收不了音频（实测上游拒收），但文字它一定读得懂。
+                text, err = await self.asr.transcribe(item.path)
+                if text:
+                    item.transcript = text
+                elif err and err != "没有配置语音转写引擎":
+                    item.transcript = f"（转写失败：{err}）"
             items.append(item)
             if not item.ok and self.cfg.get("log_verbose"):
                 self.logger.info("[ai_chat] 媒体落地失败（%s #%s）：%s",
@@ -1746,6 +1800,20 @@ class AiChatPlugin(PluginBase):
                 continue
             if (kind, num) in by_num:
                 wanted.append((kind, num))
+        # **引用的那条里的图/语音**：引用一次就把媒体带上 —— 用户说的
+        # 「指令通过引用获取图片」，而且他那条消息的图当初压根没传过去，
+        # 光给个 `[图#1]` 编号等于没有。
+        reply_to = int(meta.get("reply_to") or 0)
+        if reply_to and session is not None:
+            quoted = self._session_message(session, reply_to)
+            for m in ((quoted.metadata or {}).get("media") or []) \
+                    if quoted is not None else []:
+                try:
+                    kind, num = str(m.get("kind") or ""), int(m.get("num") or 0)
+                except (TypeError, ValueError):
+                    continue
+                if num > 0:
+                    wanted.append((kind, num))
         # 语音：全部（不筛）
         for kind, num in by_num:
             if kind == "record" and num > 0:
@@ -2319,8 +2387,12 @@ class AiChatPlugin(PluginBase):
             "media": ([m for it in items for m in (it.get("media_items") or [])]
                       + [m for m in (marks or []) if isinstance(m, dict)]),
             #: 要真传给模型的媒体：**标记过的图片** + 全部语音（见 `_media_to_include`）
-            "media_pick": [["image", int(m.get("num") or 0)]
-                           for m in (marks or []) if isinstance(m, dict)],
+            # 要真传给模型的：①各段自带的（本轮发来的图/语音）②`/aichat mark`
+            # 标好的（历史里的图）。两边都收，别把任一边覆盖掉。
+            "media_pick": ([list(p) for it in items
+                            for p in (it.get("media_pick") or [])]
+                           + [["image", int(m.get("num") or 0)]
+                              for m in (marks or []) if isinstance(m, dict)]),
             #: 只有标记、没有文字时，正文就是标号本身
             "marks_only": not any(str(it.get("text") or "").strip() for it in items),
         }
@@ -2450,6 +2522,11 @@ class AiChatPlugin(PluginBase):
         try:
             reply_text, usage = await self._model_loop(
                 target, session, ctx, system_prompt, history, usage)
+            if reply_text is _DELEGATED:
+                # 这一轮交给别的插件了：它自己回消息，AI 什么都不说
+                if self.cfg.get("log_verbose"):
+                    self.logger.info("[ai_chat] 本轮委派给插件技能，AI 不回复")
+                return
         except Exception as e:  # noqa: BLE001 - 失败要让用户看见原因
             # 上游/工具失败的统一出口（框架 ErrorReporter）：日志带错误编号，
             # 用户拿到「分类 + 短原因 + 编号」，群里还会 @ 提问的人 —— 以前这里
@@ -2483,8 +2560,11 @@ class AiChatPlugin(PluginBase):
         if self.cfg.get("log_verbose"):
             self.logger.info("[ai_chat] 会话 %s 完成：%s", session.id, usage.summary())
         pending = self.buffer.peek(target.conversation_key)
-        if pending.get("items"):
-            # 对话进行期间又来了新段落 → 提示结束符还在等（否则用户以为没反应）
+        # ⚠️ 只有「还在等结束符」时才提示。连发多条各带结束符时，后几条**已经**
+        # 触发提交（进了 `_pending_submit`），这时再说「发结束符继续」就是错的：
+        # 用户照做会多出一轮空提交（实测报过）。
+        if pending.get("items") and \
+                target.conversation_key not in self._pending_submit:
             await self._send(target, MessageChain().text(
                 "（刚才那段已回复；暂存区里还有 %d 段新内容，发结束符继续）"
                 % len(pending["items"])))
@@ -2855,6 +2935,25 @@ class AiChatPlugin(PluginBase):
             if not result.has_tool_calls:
                 return last_text, usage
 
+            # ★ 委派型工具（别的插件的技能）：结果由那个插件自己发给用户，
+            #   AI 既不接话也不转述 —— 用户要的是「插件干活」，不是「AI 复述」。
+            delegated = [c for c in result.tool_calls
+                         if (self.tools.get(c.name) or
+                             next((t for t in self.tools.dynamic(ctx)
+                                   if t.name == c.name), None))]
+            delegated = [t for t in delegated if getattr(
+                self.tools.get(t.name) or next(
+                    (d for d in self.tools.dynamic(ctx) if d.name == t.name), None),
+                "delegates", False)]
+            if delegated:
+                for call in delegated:
+                    try:
+                        await self.tools.call(call.name, call.arguments or {}, ctx)
+                    except Exception as e:  # noqa: BLE001 - 技能失败由它自己报
+                        self.logger.warning("[ai_chat] 技能 %s 调用失败: %r",
+                                            call.name, e)
+                return _DELEGATED, usage
+
             # ---- 执行工具 ----
             for call in result.tool_calls:
                 usage.tool_calls += 1
@@ -2916,8 +3015,11 @@ class AiChatPlugin(PluginBase):
             group_id=target.group_id or (target.chat_id if target.is_group else None),
             group_name=group_name,
             is_superuser=is_super, can_moderate=can_moderate,
+            # 技能用它自己回消息（AI 不转述、也不接话）
             store=self.store, api=self.api, cfg=self.config,
-            extras={"max_mute_seconds": int(self.cfg["tools"]["max_mute_seconds"]),
+            extras={"send": lambda text: self._send(
+                        target, MessageChain().text(str(text))),
+                    "max_mute_seconds": int(self.cfg["tools"]["max_mute_seconds"]),
                     "group_id": target.chat_id if target.is_group else None,
                     # 联网搜索：客户端与正文上限都从上下文传，工具模块不持有它们
                     "web": self.web if self.cfg["search"]["enabled"] else None,
@@ -3420,6 +3522,13 @@ class AiChatPlugin(PluginBase):
                                description="切换你在此处的当前会话")
         async def cmd_attach(params, event: MessageEvent):
             return self._do_switch(params.session, event)
+
+        @self.register_command(f"{A}.asr", permission="superuser", scope="private",
+                               description="检查语音转写引擎（能否把 QQ 语音转成文字）")
+        async def cmd_asr(packet):
+            msg = await self.asr.self_check()
+            return (f"🎧 语音转写：{msg}\n"
+                    f"配置在 plugins.ai_chat.asr（command=本地引擎 / url=网关转写）")
 
         @self.register_command(f"{A}.mark", schema=S.MarkSchema, permission="",
                                scope="all",
