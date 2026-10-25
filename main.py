@@ -542,7 +542,7 @@ class AiChatPlugin(PluginBase):
                 cfg=lambda: {"enabled": False}, logger=self.logger)
             return
         register_skill_tools(
-            self.tools, skills=skills,
+            self.tools, skills=skills, cmds=self.cmds,
             # 传取值函数而不是快照：配置改了（含热重载）立刻生效
             cfg=lambda: self.cfg.get("skills") or {},
             logger=self.logger)
@@ -2073,6 +2073,61 @@ class AiChatPlugin(PluginBase):
             return "", media, nested
         return "", "", nested
 
+    async def _run_skill_command(self, skill, args: dict, target: ChatTarget,
+                                 meta: dict) -> str:
+        """触发一条**被映射的命令**：合成真实事件 → `CommandManager.handle()`。
+
+        为什么走 `handle()` 而不是直接调 handler：权限（`permission`）、作用域
+        （`scope`）、Schema 校验、参数错误/无权限的反馈话术、插件服务范围守卫，
+        全都长在那条链上。直接调 handler 等于开一个**绕过所有判定**的后门 ——
+        用户说句话就能执行他没权限的命令。这条路没有后门：判定不过就返回
+        「未知命令」口径（`_not_found`），与手敲一致。
+        """
+        if self.cmds is None:
+            return "（当前环境没有命令系统）"
+        line = skill.command_line()
+        # 参数按 `--键=值` 拼进命令行：与用户手敲 `--key=value` 同一形态，
+        # 解析器会放进 kwargs、再由命令自己的 Schema 校验/转换类型
+        parts = [line]
+        for key, value in (args or {}).items():
+            if value is None or value == "":
+                continue
+            if isinstance(value, bool):
+                value = "true" if value else "false"
+            parts.append(f"--{key}={value}")
+        event = self._skill_event(target, meta, " ".join(parts))
+        result = await self.cmds.handle(event)
+        if isinstance(result, tuple) and result:
+            if result[0] == "_not_found":
+                return (f"这个功能现在用不了（命令 {line} 不可用，"
+                        f"可能是没有权限或不在服务范围内）")
+            return str(result[1] if len(result) > 1 else result[0])
+        if result is None:
+            return ""      # 命令自己发过消息了
+        if not isinstance(result, str):
+            # MessageChain / 分段列表：命令自己会发，这里不再重复
+            return ""
+        return result
+
+    def _skill_event(self, target: ChatTarget, meta: dict, text: str):
+        """造一条「以调用者身份、带命令文本」的真人消息事件。
+
+        只填命令系统真正会读的字段（`plain_text` / `message_type` / `user_id` /
+        `group_id` / `sender`）；其余留默认值 —— 命令里若要回消息，它会走自己
+        的 `api`，与手敲完全一样。
+        """
+        from napcat.models import MessageEvent, Sender
+        return MessageEvent(
+            message_type=target.kind,
+            user_id=int(meta.get("user_id") or 0),
+            group_id=int(target.group_id) if target.is_group else None,
+            sender=Sender(user_id=int(meta.get("user_id") or 0),
+                          nickname=str(meta.get("nickname") or ""),
+                          card=str(meta.get("card") or "")),
+            message=[{"type": "text", "data": {"text": text}}],
+            raw_message=text,
+        )
+
     async def _do_mark(self, params, event: MessageEvent) -> str:
         """`/aichat mark [序号]` —— 标记**引用消息里的图片**，让模型能看到它。
 
@@ -2954,6 +3009,11 @@ class AiChatPlugin(PluginBase):
                     except Exception as e:  # noqa: BLE001 - 技能失败由它自己报
                         self.logger.warning("[ai_chat] 技能 %s 调用失败: %r",
                                             call.name, e)
+                    # 命令的**返回值**就是它要对用户说的话（`/byrdocs search`
+                    # 回什么，这里就发什么）。命令自己发过消息时返回空串，
+                    # 那就什么都不用补 —— AI 这一轮始终不接话。
+                    if result:
+                        await self._send(target, MessageChain().text(result))
                     # ⚠️ **必须补一条工具结果**：assistant 的 tool_call 没配对结果时，
                     # `sanitize_history` 会把它当「无法配对的历史前缀」丢掉 ——
                     # 线上 s0019 每轮都报「丢掉 2 条」，上下文整段丢失。
@@ -3030,6 +3090,8 @@ class AiChatPlugin(PluginBase):
             store=self.store, api=self.api, cfg=self.config,
             extras={"send": lambda text: self._send(
                         target, MessageChain().text(str(text))),
+                    "run_skill": lambda skill, args: self._run_skill_command(
+                        skill, args, target, meta),
                     "max_mute_seconds": int(self.cfg["tools"]["max_mute_seconds"]),
                     "group_id": target.chat_id if target.is_group else None,
                     # 联网搜索：客户端与正文上限都从上下文传，工具模块不持有它们

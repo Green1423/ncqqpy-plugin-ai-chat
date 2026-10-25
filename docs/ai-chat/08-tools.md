@@ -57,15 +57,26 @@
 
 ---
 
-## 别的插件提供的技能
+## 别的插件提供的技能（命令映射）
 
-除了上面的内置工具与 `tools.custom`，**别的插件**还能通过框架的技能通道
-（`@self.register_skill(...)`，见 [技能](https://github.com/Green1423/ncqqpy/blob/main/docs/plugin-dev/17-skills.md)）把自己的能力
-交给模型：`byrdocs` 的「搜资料」、`bupt_news` 的「通知检索 / 最近通知 / 通知详情 /
-第二课堂活动」（`bupt_news.search` / `recent` / `notice` / `activities`）等都以这种形式出现。
+别的插件可以用一行把自己的**命令**挂给模型：
 
-对使用者来说它们就是普通工具：模型在对话里自己决定调不调。唯一的区别是
-**从哪来的** —— 描述前面会带提供方，例如 `[byrdocs] 在 BYR Docs 资料库里搜索…`。
+```python
+# 在 bupt_news / byrdocs 之类插件里
+self.register_skill("search", command="byrdocs.search")
+```
+
+对使用者来说它就是普通工具，但执行方式不同 —— 走的是**命令系统**：
+
+| 环节 | 行为 |
+|---|---|
+| 参数 | 由那条命令的 `CommandSchema` 翻译而来（不另写） |
+| 权限 / 作用域 / 服务范围 | **与手敲命令完全一致**（AI 这条通道不绕过任何检查） |
+| 回复 | 命令返回什么就发什么 |
+| AI | **不接话**：这轮交给插件，模型不转述、也不接收命令输出 |
+
+所以「说人话」和「敲命令」在权限上是等价的：没有权限的人在群里让 AI 去搜，
+结果与他自己敲 `/byrdocs search` 一样 —— 用不了。
 
 关掉/收窄口径：
 
@@ -73,4 +84,5 @@
 "skills": {"enabled": true, "allow": [], "deny": ["byrdocs.search"]}
 ```
 
-`ai_chat` 每轮重新读技能表，所以装/卸/热重载插件之后**不用重启**。
+`ai_chat` 每轮重新解析技能表（命令被禁用/卸载后工具立刻消失），装/卸/热重载
+插件**不用重启**。详见 [技能](https://github.com/Green1423/ncqqpy/blob/main/docs/plugin-dev/17-skills.md)。

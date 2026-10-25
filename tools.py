@@ -245,24 +245,55 @@ def _fmt_time(ts: datetime) -> str:
 #: 技能结果的上限 —— 与内置工具同一个量级（模型读不动更长的东西）
 SKILL_MAX_CHARS = 3000
 
+#: `CommandSchema` 的字段类名（去 Field）→ JSON Schema 类型
+_FIELD_JSON_TYPE = {
+    "bool": "boolean", "int": "integer", "float": "number", "qq": "integer",
+    "duration": "integer", "choice": "string", "variadic": "string",
+    "str": "string",
+}
 
-def register_skill_tools(reg: ToolRegistry, *, skills, cfg: dict,
+
+def command_tool_schema(handler) -> dict:
+    """命令的 `CommandSchema` → 给模型看的 JSON Schema（**不另写一份**）。
+
+    这是「技能 = 命令映射」的关键：参数定义只有一处（命令的 Schema），
+    模型看到的工具参数就是从那儿翻译出来的，两边永远不会漂移。
+    """
+    props: dict = {}
+    required: list[str] = []
+    schema = getattr(handler, "schema", None)
+    fields = schema.get_fields() if schema is not None else {}
+    for fname, field in fields.items():
+        type_name = type(field).__name__.replace("Field", "").lower()
+        prop: dict = {"type": _FIELD_JSON_TYPE.get(type_name, "string")}
+        choices = list(getattr(field, "choices", None) or [])
+        if choices:
+            prop["type"] = "string"          # ChoiceField：直接告诉模型可选值
+            prop["enum"] = [str(c) for c in choices]
+        desc = str(getattr(field, "description", "") or "")
+        if desc:
+            prop["description"] = desc
+        props[fname] = prop
+        if getattr(field, "required", False) and getattr(field, "default", None) is None:
+            required.append(fname)
+    out: dict = {"type": "object", "properties": props}
+    if required:
+        out["required"] = required
+    return out
+
+
+def register_skill_tools(reg: ToolRegistry, *, skills, cfg, cmds,
                          logger=None) -> None:
-    """把**别的插件注册的技能**接成工具（`napcat.skills`）。
+    """把**别的插件注册的技能**接成工具 —— 技能是「命令映射」。
 
-    提供方在自己的插件里 `@self.register_skill(...)`；这里只负责「读出来、
-    包成工具、调用时把结果/异常变成文本」。谁提供、提供什么，ai_chat 一概
-    不关心 —— 这正是这条通道存在的意义：加一个能力不用改 ai_chat。
+    提供方只写一行 `self.register_skill("search", command="byrdocs.search")`；
+    这里负责：解析出那条命令 → 用它的 Schema 生成工具参数 → 调用时交给
+    `main._run_skill_command()`（合成真实事件走 `CommandManager.handle()`）。
+    所以**权限/作用域/Schema 校验全部由命令系统判定**，AI 这条路绕不过去。
 
-    过滤（`skills.*` 配置）：
-
-    * `enabled=false` → 一个都不接；
-    * `allow`（非空）→ 只接名单里的；
-    * `deny` → 名单里的不接（`allow` 优先，两个都给就按 allow 走）。
+    `cfg` 可以是取值函数（配置热重载后立刻生效）。
     """
     def provider(ctx):
-        # `cfg` 可以是**取值函数**：配置会热重载（`/aichat` 改设置、config.json
-        # 被编辑），注册时拷一份字典就等于把开关钉死在加载那一刻
         conf = cfg() if callable(cfg) else cfg
         conf = conf if isinstance(conf, dict) else {}
         if not bool(conf.get("enabled", True)):
@@ -275,84 +306,43 @@ def register_skill_tools(reg: ToolRegistry, *, skills, cfg: dict,
                 continue
             if not allow and skill.name in deny:
                 continue
-            out.append(_skill_tool(skill, logger=logger))
+            found = cmds.find_command(skill.command) if hasattr(
+                cmds, "find_command") else None
+            handler = found[1] if found else None
+            if handler is None or getattr(handler, "disabled", False):
+                continue          # 命令没了/被禁用 → 不暴露死工具
+            out.append(_skill_tool(skill, handler, logger=logger))
         return out
 
     reg.set_provider(provider)
 
 
-def _skill_tool(skill, *, logger=None) -> Tool:
-    """技能 → 工具。名字用 `plugin_skill`（OpenAI 只允许字母数字下划线连字符）。"""
+def _skill_tool(skill, handler, *, logger=None) -> Tool:
+    """技能 → 工具（名字用 `plugin_skill`，参数由命令 Schema 翻译）。"""
 
-    async def handler(ctx, **_ignored):
-        from napcat.skills import SkillContext, call_skill
+    async def tool_handler(ctx, **_ignored):
         args = dict(_ignored)
-        # ⚠️ **不要**把 `send` 写进构造参数：`SkillContext.send` 是框架后加的字段，
-        # 而框架模块只在**进程启动**时加载（插件是热重载的）。两者错位时
-        # `SkillContext(..., send=None)` 会抛
-        #   TypeError: unexpected keyword argument 'send'
-        # 再被 `ToolRegistry.call` 兜成「工具参数错误」—— 看起来像模型传错了参数，
-        # 实际是版本错位，**所有**插件的技能一起失效（线上 s0020 三条记录都是它）。
-        # 改成分两步：先按老字段构造，再挂属性（普通 dataclass 两种版本都支持）。
-        sctx = SkillContext(
-            caller="ai_chat", user_id=int(ctx.user_id or 0),
-            group_id=int(ctx.group_id or 0), is_group=bool(ctx.in_group),
-            session_id=str(ctx.session_id or ""),
-            is_superuser=bool(ctx.is_superuser),
-            is_admin=bool(ctx.can_moderate))
-        # 技能自己回消息才算「说过了」。⚠️ 这里的关键是**只有真发出去才置 done**：
-        # 早先无条件置位，于是 `real_send` 缺失/发送失败时，兜底也被跳过 ——
-        # 技能不回、AI 也不回，用户什么都收不到（线上 s0019 就这么静默了）。
-        real_send = (ctx.extras or {}).get("send")
-        said = {"done": False}
-
-        async def _send(message):
-            text_out = str(message or "").strip()
-            if not text_out or real_send is None:
-                return
-            try:
-                await real_send(text_out)
-            except Exception as e:  # noqa: BLE001 - 发送失败不能把技能结果吞掉
-                if logger:
-                    logger.warning("[ai_chat] 技能 %s 回消息失败: %r",
-                                   skill.name, e)
-                return
-            said["done"] = True
+        runner = (ctx.extras or {}).get("run_skill")
+        if runner is None:
+            return "（当前环境不支持触发插件命令）"
         try:
-            sctx.send = _send
-        except AttributeError:               # 极端情况（frozen/slots）：退回"AI 转述"
-            # ⚠️ 这里**不能**置 `done`：置了就"技能没回、AI 也不回"，用户什么都收不到。
-            # 保持 False，让下面的兜底把技能返回值发出去。
+            text = await runner(skill, args)
+        except Exception as e:  # noqa: BLE001 - 命令失败不该拖垮对话
             if logger:
-                logger.warning("[ai_chat] 当前框架的 SkillContext 不能挂 send："
-                               "技能只能返回文本、由 AI 转述（重启进程后恢复正常）")
-        try:
-            text = await call_skill(skill, args, sctx)
-            if not said["done"]:
-                # 技能没自己发（或发失败）：把它的返回值发出去；连值都没有就明说，
-                # 绝不能「委派完谁都不说话」
-                await _send(text)
-                if not said["done"]:
-                    await _send(f"（{skill.name} 这次没有返回结果）")
-        except Exception as e:  # noqa: BLE001 - 技能失败要变成模型能读的一句话
-            if logger:
-                logger.warning("[ai_chat] 技能 %s 执行失败: %r", skill.name, e)
-            # 抛出去而不是直接返回字符串：`ToolRegistry.call` 会把异常变成
-            # 「工具执行异常：…」并把 `failed` 标上 —— 混在正常结果里会让
-            # 上层把一次失败当成一次成功（统计、重试判据都会错）
-            raise RuntimeError(
-                f"技能 {skill.name} 执行失败：{err_text(e)}"
-                f"（可以换个说法重试，或告诉用户这个功能暂时不可用）") from e
+                logger.warning("[ai_chat] 技能 %s 触发失败: %r", skill.name, e)
+            raise RuntimeError(f"技能 {skill.name} 触发失败：{err_text(e)}") from e
+        text = str(text or "")
         if len(text) > SKILL_MAX_CHARS:
-            text = text[:SKILL_MAX_CHARS] + "…（结果过长，已截断）"
-        return text or "（技能返回空结果）"
+            text = text[:SKILL_MAX_CHARS] + "…（已截断）"
+        return text
 
     return Tool(
         name=skill.tool_name,
-        description=(f"[{skill.plugin}] {skill.description}".strip()),
-        parameters=(skill.parameters or {"type": "object", "properties": {}}),
-        handler=handler,
-        # 委派型：执行结果由插件自己发给用户，AI 不接话、也不转述
+        description=(f"[{skill.plugin}] {skill.description or handler.description} "
+                     f"（相当于用户发 {skill.command_line()}）").strip(),
+        parameters=command_tool_schema(handler),
+        handler=tool_handler,
+        # 委派型：命令自己回消息，AI 不接话、也不转述
         delegates=True,
     )
 
