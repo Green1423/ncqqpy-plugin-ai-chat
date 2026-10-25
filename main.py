@@ -2947,11 +2947,22 @@ class AiChatPlugin(PluginBase):
                 "delegates", False)]
             if delegated:
                 for call in delegated:
+                    result = ""
                     try:
-                        await self.tools.call(call.name, call.arguments or {}, ctx)
+                        result, _ = await self.tools.call(
+                            call.name, call.arguments or {}, ctx)
                     except Exception as e:  # noqa: BLE001 - 技能失败由它自己报
                         self.logger.warning("[ai_chat] 技能 %s 调用失败: %r",
                                             call.name, e)
+                    # ⚠️ **必须补一条工具结果**：assistant 的 tool_call 没配对结果时，
+                    # `sanitize_history` 会把它当「无法配对的历史前缀」丢掉 ——
+                    # 线上 s0019 每轮都报「丢掉 2 条」，上下文整段丢失。
+                    note = (f"已转交给 {call.name} 执行，结果由它直接回复用户。"
+                            + (f"（{result[:200]}）" if result else ""))
+                    tool_msg = tool_message(call.id or "delegated", note,
+                                            name=call.name)
+                    history.append(tool_msg)
+                    self.store.append(session.id, tool_msg)
                 return _DELEGATED, usage
 
             # ---- 执行工具 ----

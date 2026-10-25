@@ -209,14 +209,23 @@ class ToolRegistry:
             return (f"你没有使用 `{name}` 的权限（需要群主/管理员）。", True)
         if tool.superuser_only and not ctx.is_superuser:
             return (f"工具 `{name}` 仅超级用户可用。", True)
+        # ⚠️ **两段 try，不能合成一段**：`TypeError` 只有在**调用那一刻**才是
+        # "参数对不上"；`await` 之后抛的 TypeError 是工具内部的 bug。
+        # 合在一起会把内部错误报成「参数错误」，于是模型以为是自己传错了参数、
+        # 换个问法重试 —— 用户白等一轮，真正的 bug 被掩盖（线上 s0020 就这样）。
         try:
             result = tool.handler(ctx, **(arguments or {}))
-            if inspect.isawaitable(result):
-                result = await result
         except TypeError as e:
             # 参数对不上（模型传错名字）—— 明确回喂，模型会自己改
             return (f"工具 `{name}` 参数错误：{e}", True)
         except Exception as e:  # noqa: BLE001 - 工具失败不该拖垮整轮对话
+            if self.logger:
+                self.logger.warning("[ai_chat] 工具 %s 执行失败: %r", name, e)
+            return (f"工具 `{name}` 执行异常：{err_text(e)}", True)
+        try:
+            if inspect.isawaitable(result):
+                result = await result
+        except Exception as e:  # noqa: BLE001 - 同上；这里**不是**参数问题
             if self.logger:
                 self.logger.warning("[ai_chat] 工具 %s 执行失败: %r", name, e)
             return (f"工具 `{name}` 执行异常：{err_text(e)}", True)
@@ -278,28 +287,53 @@ def _skill_tool(skill, *, logger=None) -> Tool:
     async def handler(ctx, **_ignored):
         from napcat.skills import SkillContext, call_skill
         args = dict(_ignored)
+        # ⚠️ **不要**把 `send` 写进构造参数：`SkillContext.send` 是框架后加的字段，
+        # 而框架模块只在**进程启动**时加载（插件是热重载的）。两者错位时
+        # `SkillContext(..., send=None)` 会抛
+        #   TypeError: unexpected keyword argument 'send'
+        # 再被 `ToolRegistry.call` 兜成「工具参数错误」—— 看起来像模型传错了参数，
+        # 实际是版本错位，**所有**插件的技能一起失效（线上 s0020 三条记录都是它）。
+        # 改成分两步：先按老字段构造，再挂属性（普通 dataclass 两种版本都支持）。
         sctx = SkillContext(
             caller="ai_chat", user_id=int(ctx.user_id or 0),
             group_id=int(ctx.group_id or 0), is_group=bool(ctx.in_group),
             session_id=str(ctx.session_id or ""),
             is_superuser=bool(ctx.is_superuser),
-            is_admin=bool(ctx.can_moderate),
-            # 技能自己回消息（AI 不说话），所以把「往哪儿发」交给它
-            send=None)
-        # 技能自己回消息才算「说过了」；没回就把它的返回值发出去 ——
-        # 否则用户发「帮我查查学校的通知」，插件不回、AI 也不回，等于没反应。
+            is_admin=bool(ctx.can_moderate))
+        # 技能自己回消息才算「说过了」。⚠️ 这里的关键是**只有真发出去才置 done**：
+        # 早先无条件置位，于是 `real_send` 缺失/发送失败时，兜底也被跳过 ——
+        # 技能不回、AI 也不回，用户什么都收不到（线上 s0019 就这么静默了）。
         real_send = (ctx.extras or {}).get("send")
         said = {"done": False}
 
         async def _send(message):
+            text_out = str(message or "").strip()
+            if not text_out or real_send is None:
+                return
+            try:
+                await real_send(text_out)
+            except Exception as e:  # noqa: BLE001 - 发送失败不能把技能结果吞掉
+                if logger:
+                    logger.warning("[ai_chat] 技能 %s 回消息失败: %r",
+                                   skill.name, e)
+                return
             said["done"] = True
-            if real_send is not None:
-                await real_send(message)
-        sctx.send = _send
+        try:
+            sctx.send = _send
+        except AttributeError:               # 极端情况（frozen/slots）：退回"AI 转述"
+            # ⚠️ 这里**不能**置 `done`：置了就"技能没回、AI 也不回"，用户什么都收不到。
+            # 保持 False，让下面的兜底把技能返回值发出去。
+            if logger:
+                logger.warning("[ai_chat] 当前框架的 SkillContext 不能挂 send："
+                               "技能只能返回文本、由 AI 转述（重启进程后恢复正常）")
         try:
             text = await call_skill(skill, args, sctx)
-            if not said["done"] and str(text or "").strip():
+            if not said["done"]:
+                # 技能没自己发（或发失败）：把它的返回值发出去；连值都没有就明说，
+                # 绝不能「委派完谁都不说话」
                 await _send(text)
+                if not said["done"]:
+                    await _send(f"（{skill.name} 这次没有返回结果）")
         except Exception as e:  # noqa: BLE001 - 技能失败要变成模型能读的一句话
             if logger:
                 logger.warning("[ai_chat] 技能 %s 执行失败: %r", skill.name, e)
