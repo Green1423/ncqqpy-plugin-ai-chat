@@ -30,6 +30,11 @@ TRUNCATED_HINT = "\n…（结果过长已截断，如需更多请缩小查询范
 
 
 def _as_text(value: Any) -> str:
+    # `None` 表示"没有结果"，不是 JSON 的 null —— 早先漏了这一条，
+    # 于是返回 None 的工具会把字面量 `null` **发给用户**（委派型工具直接把
+    # 返回值发出去）。空就是空，交给调用方决定补什么话。
+    if value is None:
+        return ""
     if isinstance(value, str):
         return value
     try:
@@ -233,7 +238,10 @@ class ToolRegistry:
         text = _as_text(result)
         if len(text) > MAX_RESULT_CHARS:
             text = text[:MAX_RESULT_CHARS] + TRUNCATED_HINT
-        return (text or "（工具返回空结果）", False)
+        # ⚠️ 空结果就返回空串，**不要**在这里塞占位符：委派型工具会把
+        # 返回值直接发给用户，塞了它就变成用户真的收到「（工具返回空结果）」
+        # （线上就这么给用户发过一句废话）。占位符由模型侧自己补。
+        return (text, False)
 
 
 def _fmt_time(ts: datetime) -> str:

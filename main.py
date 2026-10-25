@@ -2104,10 +2104,26 @@ class AiChatPlugin(PluginBase):
             return str(result[1] if len(result) > 1 else result[0])
         if result is None:
             return ""      # 命令自己发过消息了
-        if not isinstance(result, str):
-            # MessageChain / 分段列表：命令自己会发，这里不再重复
-            return ""
-        return result
+        if isinstance(result, str):
+            return result
+        # ⚠️ MessageChain / 分段列表：**这条链上没有框架的分发器**，
+        # 命令只是"返回"了消息，不自己发就永远到不了用户 —— 早先这里直接
+        # `return ""`（误以为"命令自己会发"），于是返回富文本（正文图片/表格）
+        # 的那些命令，用户只收到一句「（工具返回空结果）」。
+        # 富文本必须**原样发出去**，不能压成字符串（压了图片就没了）。
+        # `MessageChain` 没有"从分段列表构造"的公开接口（只有 `build()`
+        # 取出、`__add__` 合并），所以这里直接拼 `_segments` —— 分段本身是
+        # 命令产出的原始结构，原样转发即可，不做任何改写。
+        if isinstance(result, MessageChain):
+            chain = result
+        else:
+            chain = MessageChain()
+            for seg in result or []:
+                if isinstance(seg, dict) and seg.get("type"):
+                    chain._segments.append(seg)
+        if chain:
+            await self._send(target, chain)
+        return ""
 
     def _skill_event(self, target: ChatTarget, meta: dict, text: str):
         """造一条「以调用者身份、带命令文本」的真人消息事件。
@@ -3032,8 +3048,11 @@ class AiChatPlugin(PluginBase):
                     self.logger.info("[ai_chat] 工具调用 %s(%s)", call.name,
                                      call.arguments)
                 out_text, is_error = await self.tools.call(call.name, call.arguments, ctx)
-                tool_msg = tool_message(call.id, out_text, name=call.name,
-                                        is_error=is_error)
+                # 模型侧：空结果要**明确**告诉它"工具什么都没返回"，否则它会
+                # 把空串当成"成功但无内容"继续瞎编。用户侧不会看到这句
+                # （占位符只进工具消息，`tools.call` 已改成返回空串）。
+                tool_msg = tool_message(call.id, out_text or "（工具返回空结果）",
+                                        name=call.name, is_error=is_error)
                 history.append(tool_msg)
                 self.store.append(session.id, tool_msg)
 
