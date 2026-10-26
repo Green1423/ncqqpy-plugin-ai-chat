@@ -556,7 +556,7 @@ class AiChatPlugin(PluginBase):
             os.path.join(self._data_dir, "sent_texts.json"), logger=self.logger)
         #: 语音转写（把 QQ 语音变成文字再交给模型；引擎由 `asr` 配置决定）
         self.asr = Transcriber(AsrOptions.from_cfg(self.cfg.get("asr")),
-                               logger=self.logger)
+                               logger=self.logger, api=self.api)
         #: 「这模型收不收图片/音频」的探测结果（按 base_url+model 缓存）
         self.capabilities = CapabilityCache(
             os.path.join(self._data_dir, "capabilities.json"), logger=self.logger)
@@ -1417,6 +1417,25 @@ class AiChatPlugin(PluginBase):
                 return True
         return False
 
+    def _guest_sessions_of(self, user_id: int) -> list:
+        """这个人作为**客人**参与的会话（不管有没有焦点）。"""
+        uid = int(user_id)
+        try:
+            return [s for s in self.store.list(guest_id=uid,
+                                               limit=self.store.max_sessions)
+                    if uid in set(s.guests) and not s.archived]
+        except Exception:  # noqa: BLE001 - 查不到就当没有
+            return []
+
+    def _send_soon(self, target: ChatTarget, chain) -> None:
+        """不阻塞地发一条提示（`_access_denied` 是同步路径）。"""
+        try:
+            task = asyncio.get_event_loop().create_task(self._send(target, chain))
+            self._tasks.add(task)
+            task.add_done_callback(self._tasks.discard)
+        except RuntimeError:
+            pass
+
     def _invited_session_of(self, user_id: int) -> Optional[Session]:
         """这个人的**当前焦点**是不是一个「他被邀请参与」的会话。
 
@@ -1455,6 +1474,23 @@ class AiChatPlugin(PluginBase):
         # ⚠️ 默认值必须是 False：只把「显式写了 notify_denied: true」当成要提示。
         # 写成 `.get("notify_denied", True)` 时，**缺这个键**（老配置、手工精简过的
         # 配置、测试夹具）就会退回「要提示」—— 于是「未开通一律静默」失效。
+        # ★ 「被邀请但还没 attach」的人不该得到**静默**：
+        #   用户报过「invite 了非绑定用户，对方说用不了 aichat」—— 实际是
+        #   服务范围拦住了他（他还没建立焦点），而默认策略是静默丢弃，
+        #   看起来就像机器人坏了。这里无论 notify_denied 怎么配，都给他一句
+        #   可行动的提示（限冷却，不会刷屏）。
+        invited = self._guest_sessions_of(int(user_id))
+        if invited and not target.is_group:
+            cooldown = int(binding.get("invite_hint_cooldown") or 60)
+            key = ("invite", int(user_id))
+            now = time.time()
+            if now - self._denied_notice.get(key, 0.0) >= cooldown:
+                self._denied_notice[key] = now
+                names = "、".join(f"{s.id}「{s.name}」" for s in invited[:3])
+                self._send_soon(target, MessageChain().text(
+                    f"ℹ️ 你被邀请参与会话 {names}，但还没切过去 —— "
+                    f"先发 /aichat attach {invited[0].id}，之后直接说话就行。"))
+            return True
         if not binding.get("notify_denied", False):
             return True
         cooldown = int(binding.get("notify_cooldown") or 0)
@@ -1828,7 +1864,15 @@ class AiChatPlugin(PluginBase):
             if item.ok and kind == "record":
                 # **默认转给 AI**：语音先转成文字，正文里直接带上内容 ——
                 # 模型收不了音频（实测上游拒收），但文字它一定读得懂。
+                # `message_id` 也带上：`/fetch_ptt_text` 认 id 时不必再传文件
+                self.asr.message_id = int(getattr(event, "message_id", 0) or 0)
+                # api 客户端可能晚于 on_load 才就绪：每次用前对齐一下
+                self.asr.api = self.api
                 text, err = await self.asr.transcribe(item.path)
+                if self.cfg.get("log_verbose"):
+                    self.logger.info("[ai_chat] 语音转写（%s）：%s",
+                                     self.asr.opt.resolved_engine(),
+                                     (text or err)[:80])
                 if text:
                     item.transcript = text
                 elif err and err != "没有配置语音转写引擎":
@@ -2727,6 +2771,13 @@ class AiChatPlugin(PluginBase):
             # 「引用链」可以只靠本地数据追溯 —— 不用为每一层再付一次 get_msg
             # （框架给每次 API 调用加了 1~5 秒节流，见 docs §12.3）。
             "reply_to": int(self._reply_message_id(event) or 0),
+            #: 暂存这一刻的焦点会话 id（空 = 当时没有会话）。切会话后这些分段
+            #: **只属于原会话**，提交时不会被并进新会话（用户明确要求）
+            "session_id": str(getattr(self._current_session(
+                target, int(event.user_id)), "id", "") or ""),
+            #: 暂存这一刻的焦点会话 id（0 = 当时没有会话）。
+            #: 切会话后，这些分段**只属于原会话**，不会被并进新会话
+            #: （用户明确要求：暂存内容不要跨会话合并）
             "group_id": int(event.group_id) if event.group_id else 0,
             # 这一段的引用目标是不是多媒体（提交时才回绝，见 _extract_text_async）
             "media": media,
@@ -2836,6 +2887,29 @@ class AiChatPlugin(PluginBase):
             # 那句「暂不支持多模态」现在作为**提示**跟在引文位置（见 `_quoted_suffix`），
             # 而不是把整条输入扔掉。原来那样做，用户问「这张图里是什么」会被直接
             # 打回，连问题都没进模型。
+            # ★ 只提交**属于当前会话**的分段：切会话前暂存的内容不并进来
+            #   （用户明确要求）。属于别的会话的分段放回暂存区，切回去还能提交。
+            me = self._current_session(
+                target, int((items[-1].get("user_id") if items else 0) or 0))
+            owner_id = str(getattr(me, "id", "") or "")
+            keep, foreign = [], []
+            for it in items:
+                owner = str(it.get("session_id") or "")
+                if owner and owner_id and owner != owner_id:
+                    foreign.append(it)
+                else:
+                    keep.append(it)
+            if foreign:
+                self.buffer.restore(key, foreign)
+                self.logger.info(
+                    "[ai_chat] %s：%d 段暂存内容属于别的会话，未并入（仍在暂存区）",
+                    target.label, len(foreign))
+            items = keep
+            if not items and not marks:
+                await self._send(target, MessageChain().text(
+                    "ℹ️ 暂存区里的内容属于**上一个会话**，没有并入当前会话。\n"
+                    "要提交它们：切回那个会话再发结束符；要丢掉：/aichat detach"))
+                return
             text = self._compose_input(items)
             # 只有标记、没有文字也算一次提交（用户可能就想「把这张图给它看」）
             marks = list(marks or [])
@@ -2883,6 +2957,60 @@ class AiChatPlugin(PluginBase):
                 self._pending_submit.discard(key)
                 self._schedule_submit(target)
 
+    #: 单请求最多带几张图（超过就改成「一张图一轮」读图）
+    MEDIA_SINGLE_ROUND_MAX = 6
+    #: 单请求图片总字节上限（超过同上）
+    MEDIA_SINGLE_ROUND_BYTES = 2_400_000
+
+    #: 分张读图时每轮的系统提示（模型只看图、只记录，不回答用户）
+    _READ_IMAGE_SYSTEM = (
+        "你正在分批接收一张长图片文档。现在只做一件事：看清这一张，"
+        "用 3~6 行记下它的要点（标题、编号、条款、数字）。"
+        "不要回答用户的问题，不要寒暄，不要提到“第几张”。")
+
+    async def _describe_images(self, items: list, *, fail_note: str = "") -> list:
+        """**一张图一轮**地让模型读图，返回 `[([图#k], 要点), ...]`。
+
+        为什么不是「一次传完」：请求体是 base64 内联的，7 页扫描件能顶到
+        413（上游直接拒收），上限调不高。改成逐张读、每张让模型记要点，
+        最后只在正文里带**文字要点 + 标号**，既不受体积限制，也保住图的内容。
+        """
+        out = []
+        for item in items[:8]:
+            raw = item if isinstance(item, dict) else {}
+            try:
+                num = int(raw.get("num") or 0)
+            except (TypeError, ValueError):
+                num = 0
+            kind = str(raw.get("kind") or "")
+            label = {"image": "图", "voice": "语音", "video": "视频"}.get(kind, kind)
+            marker = f"[{label}#{num}]"
+            part = None
+            try:
+                part = MediaItem.from_dict(raw).payload_part()
+            except Exception:  # noqa: BLE001 - 读不出就不描述
+                part = None
+            if not part:
+                continue
+            msgs = [
+                {"role": "system", "content": self._READ_IMAGE_SYSTEM},
+                {"role": "user", "content": [
+                    {"type": "text", "text": f"{marker} 这一张讲什么？只记要点。"},
+                    part,
+                ]},
+            ]
+            try:
+                res = await self.llm.chat(msgs, max_tokens=400)
+                note = str(getattr(res, "text", "") or "").strip()
+            except Exception as e:  # noqa: BLE001 - 单张失败不该毁掉整轮
+                self.logger.warning("[ai_chat] 分张读图失败 %s: %r", marker, e)
+                note = ""
+            if note:
+                out.append((marker, note))
+        if out:
+            self.logger.info("[ai_chat] 分张读图 %d 张（每张一轮，未回用户）", len(out))
+        return out
+
     async def _run_turn(self, target: ChatTarget, session: Session, text: str,
                         meta: dict) -> None:
         """执行一轮：追加用户消息 → 模型/工具循环 → 发送回复。"""
@@ -2924,6 +3052,26 @@ class AiChatPlugin(PluginBase):
                                         line + "\n【引用材料结束】", 1)
                 else:
                     text = text.rstrip() + "\n" + line
+        # ★ 图多/超预算时**一张图一轮**先读，最后只把要点 + 标号附在正文里。
+        #   不这么做的话，7 页扫描件一次塞进请求必然 413（整轮失败）；
+        #   分张读图时每轮都明确「不要回答用户」，用户只看得到最后那条答案。
+        if include:
+            chosen = [(m) for m in media_meta
+                      if [str(m.get("kind")), int(m.get("num") or 0)] in
+                      [[str(a), int(b)] for a, b in include]]
+            total = sum(int(m.get("size") or 0) for m in chosen)
+            over = (len(chosen) > self.MEDIA_SINGLE_ROUND_MAX
+                    or total > self.MEDIA_SINGLE_ROUND_BYTES)
+            if over:
+                notes = await self._describe_images(chosen)
+                if notes:
+                    block = "\n".join(f"{mk} {note}" for mk, note in notes)
+                    text = (text.rstrip()
+                            + "\n\n【已逐张读图，要点如下（图没有再附）】\n" + block)
+                    # 这一轮不再附图片字节：要点已在正文里，避免又撞 413。
+                    # `media_meta` 原样保留 —— 标号/路径仍要记进历史，
+                    # 之后 `hget` 或再引用时才找得到这张图。
+                    include = []
         message = user_message(
             text,
             origin=("user.group" if target.is_group else "user.private"),
@@ -3019,11 +3167,16 @@ class AiChatPlugin(PluginBase):
         # ⚠️ 只有「还在等结束符」时才提示。连发多条各带结束符时，后几条**已经**
         # 触发提交（进了 `_pending_submit`），这时再说「发结束符继续」就是错的：
         # 用户照做会多出一轮空提交（实测报过）。
-        if pending.get("items") and \
+        # 只提示**属于当前会话**的分段：切会话后旧会话的残留不算「新内容」，
+        # 否则用户会看到「还有 N 段新内容」却永远等不到它被提交（实测卡死）。
+        mine = str(session.id)
+        mine_items = [it for it in (pending.get("items") or [])
+                      if str(it.get("session_id") or "") in ("", mine)]
+        if mine_items and \
                 target.conversation_key not in self._pending_submit:
             await self._send(target, MessageChain().text(
                 "（刚才那段已回复；暂存区里还有 %d 段新内容，发结束符继续）"
-                % len(pending["items"])))
+                % len(mine_items)))
         quote_id = meta.get("message_ids", [None])[-1]
         # 清空本轮 id 桶再发：`_send` 会把这一轮真正发出去的消息 id 记进去，
         # 发完就能建立「消息 id → 本轮回答的原文」这层映射（引用图片时要用）。
@@ -3819,8 +3972,16 @@ class AiChatPlugin(PluginBase):
                 self.store.set_public(session.id, True)
             lines = [f"✅ 已新建会话 {session.describe()}"]
             if params.attach:
+                # 切焦点前先看看暂存区：那里的内容属于**原来的**会话，
+                # 不会被带进新会话（用户明确要求，见 `_do_switch` 的说明）
+                staged = len(self.buffer.peek(target.conversation_key).get("items") or [])
                 self.store.set_focus(target, int(event.user_id), session.id)
                 lines.append(f"已设为你在此处的当前会话（{target.label}），直接说话即可")
+                if staged:
+                    lines.append(
+                        f"ℹ️ 暂存区里还有 {staged} 段没提交的内容，它们属于"
+                        f"**切换前的会话**，不会并入这里"
+                        f"（切回去还能提交；要丢掉先 /aichat detach）")
             else:
                 lines.append(f"未使用。用 /aichat attach {session.id} 切过去")
             if owner_kind == OWNER_GROUP and want_public:
@@ -4169,9 +4330,11 @@ class AiChatPlugin(PluginBase):
                     f"并且**不参与上下文压缩**。\n"
                     f"查看：/aichat role　清除：/aichat role --clear=true")
 
-        @self.register_command(f"{A}.delete", schema=S.DeleteSchema, permission="",
-                               scope="all", description="删除会话（仅所有者，需 --yes=true）")
-        async def cmd_delete(params, event: MessageEvent):
+        @self.register_command(f"{A}.remove", schema=S.DeleteSchema, permission="",
+                               scope="all",
+                               description="删除会话（仅所有者，需 --yes=true；"
+                                           "原 /aichat delete 已改名）")
+        async def cmd_remove(params, event: MessageEvent):
             session = self.store.resolve(params.session)
             if session is None:
                 return f"找不到会话：{params.session}"
@@ -4181,47 +4344,13 @@ class AiChatPlugin(PluginBase):
             if not params.yes:
                 return (f"确认删除会话 {session.id}「{session.name}」？"
                         f"它共有 {session.message_count} 条历史。"
-                        f"确认发 /aichat delete {session.id} --yes=true")
+                        f"确认发 /aichat remove {session.id} --yes=true")
             where = self.store.attachments(session.id)
             self.store.delete(session.id)
             self._multi_user.pop(session.id, None)
             tail = f"（原在 {len(where)} 处被使用）" if where else ""
             return f"已删除会话 {session.id}「{session.name}」{tail}"
 
-        @self.register_command(f"{A}.compact", permission="", scope="all",
-                               description="手动压缩当前（或指定）会话的上下文")
-        async def cmd_compact(packet, event: MessageEvent):
-            args = list(packet.args or [])
-            target = self._target_of(event)
-            uid = int(event.user_id)
-            session = self._current_session(target, uid)
-            if args and not args[0].startswith("-"):
-                session = self.store.resolve(args[0]) or session
-            if session is None:
-                return "你在此处没有当前会话，也没有指定会话可压缩"
-            ok, why = self._may_attach(session, target, uid)
-            if not ok:
-                return f"⚠️ {why}"
-            if not self.compactor.client.enabled:
-                return "未配置 LLM（llm.base_url / model / api_key），无法压缩"
-            history = self.store.history(session.id)
-            if len(history) < self.policy.min_head_messages:
-                return f"会话 {session.id} 只有 {len(history)} 条历史，没什么可压缩的"
-            before = self.policy.pressure(history)
-            report = await self.compactor.should_and_compact(
-                session.id, history, store=self.store, force=True,
-                session_name=session.name, role=session.role)
-            if not report:
-                return (f"压缩未执行：{self.compactor.last_error or '没有可用的切点'}"
-                        f"（历史 {len(history)} 条，压力 {before:.0%}）")
-            return ("🗜 已压缩会话 %s：吸收 %d 条 → 检查点 %d 字，"
-                    "保留最近 %d 条原文\n估算 token %d → %d（预算 %d）"
-                    % (session.id, report["absorbed"], len(report["summary"]),
-                       report.get("checkpoint", {}).get("retained", 0),
-                       report["before_tokens"], report["after_tokens"],
-                       self.policy.max_tokens))
-
-        # ---- 邀请（会话所有者；群归属的会话由群主/管理员代管）----
         @self.register_command(f"{A}.invite", schema=S.InviteSchema, permission="",
                                scope="all",
                                description="邀请参与会话：给 QQ 号=直接邀请，"
@@ -4325,38 +4454,6 @@ class AiChatPlugin(PluginBase):
         async def cmd_timeout(params, event: MessageEvent):
             return self._do_timeout(params, event)
 
-        # ---- 超级用户 + 仅私聊：绑定 ----
-        @self.register_command(f"{A}.config", schema=S.ConfigSchema,
-                               permission="superuser", scope="private",
-                               description="查看/补齐 config.json 里的插件配置段（仅私聊）")
-        async def cmd_config(params):
-            report = self.config.fill_defaults(factory_defaults())
-            if report.filled:
-                return (f"⚙️ 已把 {len(report.filled)} 个缺失配置项写入 "
-                        f"config.json → plugins.ai_chat\n"
-                        f"补齐的键：{', '.join(report.filled[:12])}"
-                        + ("…" if len(report.filled) > 12 else "")
-                        + "\n（已有值一律未改动；改完用 "
-                          "/aichat reload --confirm=true 生效）")
-            return (f"⚙️ config.json → plugins.ai_chat 已完整"
-                    f"（{len(DEFAULT_CONFIG)} 个顶层段，共 "
-                    f"{len(_flatten(factory_defaults()))} 个配置项），无需补齐")
-
-        @self.register_command(f"{A}.reload", schema=S.ReloadSchema,
-                               permission="superuser", scope="private",
-                               description="从 config.json 重读本插件配置（手工改配置后用）")
-        async def cmd_reload(params):
-            if not params.confirm:
-                return ("确认从磁盘重读 config.json？"
-                        "确认发 /aichat reload --confirm=true\n"
-                        "（只影响本插件；手工改过的文件内容会覆盖内存里的值）")
-            self.reload_config(from_disk=True)
-            spec = self.reasoning.spec_for(self.llm.model)
-            return (f"♻️ 已从 config.json 重读配置\n"
-                    f"model: {self.llm.model or '（未配置）'}\n"
-                    f"思考强度：{self.reasoning.describe(spec)}\n"
-                    f"方言：{self.reasoning.dialect} · "
-                    f"上下文预算：{self.policy.max_tokens}")
 
         # ---- 服务范围管理：targets / add / del（kind 选类型、target 给号码） ----
         # 这三个命令走**手工挂载**（见下方 _mount_scope_command 的说明），
@@ -4624,7 +4721,8 @@ class AiChatPlugin(PluginBase):
                 if shared and int(session.owner_id) != uid
                 or (shared and session.owner_kind == OWNER_GROUP) else "")
         keep = (f"\nℹ️ 暂存区里还有 {staged} 段没提交的内容，"
-                f"会并入这个会话（要丢掉先 /aichat detach）" if staged else "")
+                f"它们属于切换前的会话，**不会并入**这里"
+                f"（切回去还能提交；要丢掉先 /aichat detach）" if staged else "")
         via = "（凭邀请码加入）" if via_code else ""
         return (f"✅ 你在此处的会话已切到 {session.id}「{session.name}」{where}{via}"
                 f"（{target.label}，所有者：{session.owner_label}）{note}{keep}\n"
@@ -5365,6 +5463,19 @@ class _StagingBuffer:
             return
         marks.append(item)
         state["marks"] = marks[-8:]              # 一次提交最多带 8 张，够用
+        state["updated"] = time.time()
+        self.save()
+
+    def restore(self, key: str, items: list[dict]) -> None:
+        """把取出来又**不该提交**的分段放回去（保持在原位置最前）。
+
+        用途：切过会话之后提交，属于旧会话的分段不能并进新会话 ——
+        它们被 `take()` 取出来了，这里原样放回，切回去还能接着提交。
+        """
+        if not items:
+            return
+        state = self._data.setdefault(key, {"items": [], "since": time.time()})
+        state["items"] = list(items) + list(state.get("items") or [])
         state["updated"] = time.time()
         self.save()
 

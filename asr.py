@@ -33,7 +33,8 @@ from .media import probe_wav
 @dataclass
 class AsrOptions:
     enabled: bool = True
-    #: `""`（自动） / `cmd` / `http` / `none`
+    #: `""`（自动） / `cmd` / `http` / `api` / `none`
+    #:   `api` = 交给 NapCat 的 `/fetch_ptt_text`（服务端自带语音转文字）
     engine: str = ""
     #: 外部命令模板；`{file}` 会被替换成 wav 路径
     command: str = ""
@@ -41,6 +42,8 @@ class AsrOptions:
     url: str = ""
     model: str = ""
     api_key: str = ""
+    #: 走 `/fetch_ptt_text` 时传什么：`auto`（有 file 传 file）/ `file` / `message_id`
+    api_mode: str = "auto"
     #: 单条语音的转写上限（秒）与结果上限（字）
     timeout: float = 60.0
     max_chars: int = 600
@@ -61,6 +64,7 @@ class AsrOptions:
             model=str(c.get("model") or "").strip(),
             api_key=str(c.get("api_key") or "").strip(),
             timeout=_f("timeout", 60.0),
+            api_mode=str(c.get("api_mode") or "auto").strip().lower(),
             max_chars=int(c.get("max_chars") or 600),
         )
 
@@ -68,12 +72,13 @@ class AsrOptions:
         """实际用哪个引擎（`""` = 自动判断）。"""
         if not self.enabled:
             return "none"
-        if self.engine in ("cmd", "http", "none"):
+        if self.engine in ("cmd", "http", "api", "none"):
             return self.engine
         if self.command:
             return "cmd"
         if self.url:
             return "http"
+        return "api"              # 交给 NapCat 的 /fetch_ptt_text
         return "none"
 
     def describe(self) -> str:
@@ -82,15 +87,22 @@ class AsrOptions:
             return f"cmd：{self.command.split()[0] if self.command else '（空）'}"
         if eng == "http":
             return f"http：{self.url or '（空）'}"
+        if eng == "api":
+            return "api：NapCat /fetch_ptt_text"
         return "未配置"
 
 
 class Transcriber:
     """把 wav 转成文字。**永不抛异常**：失败返回 `("", 原因)`。"""
 
-    def __init__(self, options: Optional[AsrOptions] = None, *, logger=None) -> None:
+    def __init__(self, options: Optional[AsrOptions] = None, *, logger=None,
+                 api=None, message_id: int = 0) -> None:
         self.opt = options or AsrOptions()
         self.logger = logger
+        #: NapCat API 客户端（`api` 引擎用它的 `/fetch_ptt_text`）
+        self.api = api
+        #: 这条语音对应的消息 id（接口认 id 就不用再传文件）
+        self.message_id = int(message_id or 0)
 
     # ---- 对外 ----
 
@@ -101,10 +113,26 @@ class Transcriber:
         if not path or not os.path.exists(path):
             return "", "音频文件不存在"
         try:
+            text, why = "", ""
             if eng == "cmd":
                 text = await self._run_cmd(path)
+            elif eng == "api":
+                text, why = await self._run_api(path)
             else:
                 text = await self._run_http(path)
+            # ⚠️ 回退：`api`（NapCat 的 /fetch_ptt_text）不通时，只要配了
+            # `command` 或 `url` 就再试一次 —— 不然一条配置错就把语音全废了。
+            if not text and eng == "api":
+                if self.opt.command:
+                    if self.logger:
+                        self.logger.info("[ai_chat] api 引擎不行，回退 cmd")
+                    text = await self._run_cmd(path)
+                elif self.opt.url:
+                    if self.logger:
+                        self.logger.info("[ai_chat] api 引擎不行，回退 http")
+                    text = await self._run_http(path)
+            if not text and why:
+                return "", why
         except Exception as e:  # noqa: BLE001 - 转写失败不该让整轮对话失败
             if self.logger:
                 self.logger.warning("[ai_chat] 语音转写失败: %r", e)
@@ -135,6 +163,55 @@ class Transcriber:
         lines = [ln.strip() for ln in (out or b"").decode("utf-8", "replace").splitlines()]
         lines = [ln for ln in lines if ln]
         return lines[-1] if lines else ""
+
+    async def _run_api(self, path: str) -> tuple[str, str]:
+        """走 NapCat 自带的 `/fetch_ptt_text`（服务端语音转文字）。
+
+        为什么优先用它：不用另外装模型/跑 ffmpeg 推理，时效也好 ——
+        NapCat 收到语音时就转过了。参数按 `api_mode` 决定：
+
+        * `file`：传本地文件路径（我们下载下来的 amr/silk）；
+        * `message_id`：传原始消息 id（服务端自己取那条语音）；
+        * `auto`：两者都带上，服务端认哪个用哪个。
+        """
+        api = self.api
+        if api is None:
+            return "", "没有 API 客户端（api 引擎不可用）"
+        # ⚠️ 默认**只传 `message_id`**：服务端的 `file` 指的是它自己的文件名，
+        # 传本地路径（`/data/media/...amr`）大概率被拒；id 才是它认识的引用。
+        # 没有 id 时才退回文件，`api_mode` 可以强制/两者都传。
+        mode = str(self.opt.api_mode or "auto").lower()
+        params: dict = {}
+        if mode in ("auto", "message_id") and self.message_id:
+            params["message_id"] = int(self.message_id)
+        if mode in ("file", "both") and path:
+            params["file"] = path
+        if not params and path:
+            params["file"] = path
+        if not params:
+            return "", "缺少语音文件/消息 id"
+        try:
+            data = await api._call("fetch_ptt_text", params)
+        except Exception as e:  # noqa: BLE001 - 接口不可用就退回别的引擎
+            if self.logger:
+                self.logger.warning("[ai_chat] /fetch_ptt_text 失败（params=%s）：%s",
+                                    list(params), e)
+            return "", f"/fetch_ptt_text 调用失败：{e}"
+        text = ""
+        if isinstance(data, dict):
+            for key in ("text", "transcription", "result", "msg"):
+                if data.get(key):
+                    text = str(data[key])
+                    break
+        elif isinstance(data, str):
+            text = data
+        text = " ".join(str(text or "").split())
+        if not text:
+            if self.logger:
+                self.logger.info("[ai_chat] /fetch_ptt_text 返回里没有文字：%r",
+                                 str(data)[:200])
+            return "", "/fetch_ptt_text 没有返回文字"
+        return text[: self.opt.max_chars], ""
 
     async def _run_http(self, path: str) -> str:
         if not self.opt.url:
@@ -169,7 +246,8 @@ class Transcriber:
         """用 1 秒静音跑一遍，返回人话结论。"""
         eng = self.opt.resolved_engine()
         if eng == "none":
-            return ("未配置：`asr.command`（本地引擎）或 `asr.url`（网关转写）至少填一个。"
+            return ("未配置：`asr.engine=api`（NapCat 的 /fetch_ptt_text）或 "
+                    "`asr.command` / `asr.url` 至少有一个可用。"
                     "填好后语音会自动转成文字交给模型。")
         fd, path = tempfile.mkstemp(suffix=".wav")
         try:

@@ -643,23 +643,29 @@ async def test_session_lifecycle(h: Harness):
     check("attach 直接切换（不再要求 --force）",
           "已切到" in text and "--force" not in text, text)
     check("回执标出原来的会话", f"原 {study.id}" in text, text)
-    check("回执说明暂存区那几段会并入", "暂存区里还有 1 段" in text, text)
+    check("回执说明暂存区那几段**不会**并入", "暂存区里还有 1 段" in text
+          and "不会并入" in text, text)
     check("切换没丢暂存区",
           len(h.plugin.buffer.peek(f"private:{ALICE}").get("items") or []) == 1,
           f"{h.plugin.buffer.peek(f'private:{ALICE}')}")
     check("当前会话已换成目标", _current_session(h).id == auto_id,
           f"{_current_session(h)}")
 
-    # 暂存的那段仍会并入**新**会话（回执说过会并入，这里验证真的并入了）
+    # ★ 用户明确要求：切会话前暂存的内容**不并入**新会话。
+    #   在新会话里发结束符 → 只提示「属于上一个会话」，模型不该被调用；
+    #   那段内容**仍在暂存区**（切回去还能提交）。
     h.clear()
     await h.private("补个结束符//", settle=1.2)
     await h.wait_reply()
     hist_new = [m.text for m in h.plugin.store.history(auto_id)]
-    check("暂存的分段并入了新会话",
-          any("切会话前打了一半" in t for t in hist_new), f"{hist_new}")
-    hist_old = [m.text for m in h.plugin.store.history(study.id)]
-    check("没有并进原来的会话", not any("切会话前打了一半" in t for t in hist_old),
-          f"{hist_old}")
+    check("旧会话的暂存内容没有并进新会话",
+          not any("切会话前打了一半" in t for t in hist_new), f"{hist_new}")
+    check("只提交了新会话里自己写的",
+          any("补个结束符" in t for t in hist_new), f"{hist_new}")
+    check("旧会话那段仍在暂存区",
+          any("切会话前打了一半" in str(it.get("text") or "")
+              for it in (h.plugin.buffer.peek(f"private:{ALICE}").get("items") or [])),
+          f"{h.plugin.buffer.peek(f'private:{ALICE}')}")
 
     # 历史隔离：两个会话的历史互不串
     h.clear()
@@ -2101,7 +2107,6 @@ async def test_quoted_all_page_images(h: Harness):
 
     h.plugin.sent_images.remember(800001, [f"http://x/{i}.png" for i in (1, 2, 3)])
     h.plugin.sent_images.remember(800002, [f"http://x/{i}.png" for i in (4, 5, 6)])
-    h.plugin.sent_images.remember(800003, ["http://x/7.png"])
     h.msg_lookup[800002] = {
         "message_id": 800002, "message_type": "private",
         "sender": {"user_id": BOT_ID, "nickname": "机器人"},
@@ -2192,6 +2197,113 @@ async def test_images_then_text_with_markers(h: Harness):
     check("先说明包含几张", "包含的图片" in texts[0], texts[0][:60])
     check("每张图前有标号", texts[1] == "[图#1]", texts[1])
     check("正文里标号在原位", "[图#1]" in texts[-1], texts[-1][:120])
+
+
+async def test_multi_round_image_read(h: Harness):
+    """超限时**一张图一轮**读图：每轮只带一张图 + 一句「记要点，不要回答」。
+
+    为什么要分轮：请求体是 base64 内联的，7 页扫描件一次塞进去必然 413。
+    分轮读完后，最后一轮只带文字要点（图不再附），由模型据此作答。
+    """
+    print("\n[19.49] 一张图一轮读图（不回用户）")
+    from plugins.ai_chat.capability import CapabilityCache as _CC
+    key = _CC.key(getattr(h.plugin.llm, "base_url", ""),
+                  getattr(h.plugin.llm, "model", ""))
+    h.plugin.capabilities.put(key, "image", state="yes")
+    from PIL import Image
+    png = TMP_DIR / "mr.png"
+    Image.new("RGB", (12, 12), (9, 9, 9)).save(png)
+    items = [{"kind": "image", "num": i + 1, "path": str(png),
+              "mime": "image/png", "size": 500_000, "ok": True, "note": ""}
+             for i in range(3)]
+    seq = iter(["第一页：总则", "第二页：条件", "第三页：附件"])
+    h.llm.responder = lambda messages, tools: StubResult(text=next(seq, "读完"))
+    h.clear()
+    notes = await h.plugin._describe_images(items)
+    check("每张一个要点", len(notes) == 3, f"{notes}")
+    check("要点带标号",
+          [mk for mk, _ in notes] == ["[图#1]", "[图#2]", "[图#3]"], f"{notes}")
+    calls = h.llm.requests[-3:]
+    imgs_per_call = []
+    for req in calls:
+        parts = [m for m in req["messages"] if m.get("role") == "user"][-1]["content"]
+        imgs_per_call.append(sum(1 for p in parts if p.get("type") == "image_url"))
+    check("每轮只带一张图", imgs_per_call == [1, 1, 1], f"{imgs_per_call}")
+    check("每轮都要求只记要点",
+          all("要点" in req["messages"][0]["content"] for req in calls), "")
+
+
+async def test_invited_guest_hint(h: Harness):
+    """被邀请但没 attach 的未绑定用户 → 明确提示「先 attach」，不再静默。
+
+    用户报过：「invite 邀请到非绑定的用户时，该用户无法正常使用」——
+    实际是服务范围拦住了他（没有焦点就过不了受邀例外），而默认是静默丢弃，
+    看起来就像机器人坏了。
+    """
+    print("\n[19.5] 受邀未 attach 的用户得到可行动提示")
+    await establish(h)
+    sid = _current_session(h).id
+    h.plugin.cfg["binding"]["users"] = [ALICE]        # BOB 未绑定
+    h.clear()
+    await h.private(f"/aichat invite {sid} {BOB}", settle=0.9)
+    await h.wait_reply()
+    h.clear()
+    await h.private("你好，我在吗？", user_id=BOB, settle=1.4)
+    texts = [reply_text(r) for r in h.replies if reply_text(r).strip()]
+    check("有提示（不是静默）", bool(texts), f"{texts}")
+    check("提示里给出 attach 的具体命令",
+          any(f"/aichat attach {sid}" in t for t in texts), f"{texts}")
+
+    # attach 之后就能正常用（受邀例外生效）
+    h.clear()
+    await h.private(f"/aichat attach {sid}", user_id=BOB, settle=0.9)
+    await h.wait_reply()
+    h.clear()
+    await h.private("现在可以了吗//", user_id=BOB, settle=1.5)
+    texts = [reply_text(r) for r in h.replies if reply_text(r).strip()]
+    check("attach 后能正常对话", any("收到" in t for t in texts), f"{texts}")
+
+
+async def test_voice_via_fetch_ptt_text(h: Harness):
+    """语音走 NapCat 的 `/fetch_ptt_text`：转成文字进正文，模型据此作答。
+
+    线上踩过的坑：只传本地文件路径会被服务端拒（它认的是自己的文件 id），
+    所以默认**只传 `message_id`**。
+    """
+    print("\n[19.52] 语音 → /fetch_ptt_text → 文字进正文")
+    import subprocess
+    await establish(h)
+    wav = str(TMP_DIR / "ptt.wav")
+    subprocess.run(["ffmpeg", "-y", "-f", "lavfi", "-i", "anullsrc=r=8000:cl=mono",
+                    "-t", "0.5", wav], capture_output=True)
+    raw = open(wav, "rb").read()
+
+    async def fake_dl(url):
+        return raw
+    h.plugin.media._download = fake_dl
+    h.plugin.asr.opt.engine = "api"
+    calls = []
+    orig = h.plugin.api._call
+
+    async def routed(action, params=None):
+        if action == "fetch_ptt_text":
+            calls.append((action, dict(params)))
+            return {"text": "帮我看看明天的课表"}
+        return await orig(action, params)
+    h.plugin.api._call = routed
+
+    payload = h._msg_payload("private", "语音指令//", user_id=ALICE)
+    payload["message"] = [{"type": "record", "data": {"url": "http://x/a.amr"}}] \
+        + payload["message"]
+    h.clear()
+    await h._send_raw(payload, 2.0)
+    await h.wait_reply()
+    seen = h.llm.last_user_content()
+    check("调用了 fetch_ptt_text", bool(calls), f"{calls}")
+    check("默认只传 message_id",
+          calls and "message_id" in calls[0][1] and "file" not in calls[0][1],
+          f"{calls}")
+    check("转写文字进了正文", "明天的课表" in seen, seen[:120])
 
 
 async def test_interpret_not_delegated(h: Harness):
@@ -3649,12 +3761,12 @@ async def test_delete_and_rename(h: Harness):
           h.plugin.store.get(sid).name)
 
     h.clear()
-    await h.private(f"/aichat delete {sid}", settle=0.7)
+    await h.private(f"/aichat remove {sid}", settle=0.7)
     text = await h.wait_reply()
     check("删除需要确认", "确认" in text and h.plugin.store.get(sid) is not None, text)
 
     h.clear()
-    await h.private(f"/aichat delete {sid} --yes=true", settle=0.7)
+    await h.private(f"/aichat remove {sid} --yes=true", settle=0.7)
     text = await h.wait_reply()
     check("确认后删除", h.plugin.store.get(sid) is None, text)
 
@@ -3891,26 +4003,18 @@ async def test_config_template_seeding(h: Harness):
           f"{after['session']}")
     check("幂等：再补一次不写盘", h.plugin.seed_config_file() is False, "重复写了盘")
 
-    # 命令路径
+    # `/aichat config` 与 `/aichat reload` 已按用户要求删除：
+    # 配置补齐改由插件启动时自动做（`seed_config_file`），不再需要命令
     h.clear()
-    # 先造一个缺键状态
-    reloaded = json.loads(h.cfg_path.read_text(encoding="utf-8"))
-    del reloaded["plugins"]["ai_chat"]["wrapping"]
-    h.cfg_path.write_text(json.dumps(reloaded, ensure_ascii=False), encoding="utf-8")
-    h.plugin._cfg_root.reload()
-    await h.private("/aichat config", user_id=SUPERUSER, settle=0.9)
+    await h.private("/aichat config", user_id=SUPERUSER, settle=0.8)
     text = await h.wait_reply()
-    check("config 命令补齐并回报", "已把" in text and "wrapping" in text, text[:200])
+    check("config 命令已删除", "已把" not in text and "补齐的键" not in text,
+          text[:200])
     h.clear()
-    await h.private("/aichat config", user_id=SUPERUSER, settle=0.9)
+    await h.private("/aichat reload --confirm=true", user_id=SUPERUSER, settle=0.8)
     text = await h.wait_reply()
-    check("已完整时回报「无需补齐」", "无需补齐" in text, text[:200])
-
-    # 非超级用户拿不到这个命令
-    h.clear()
-    await h.private("/aichat config", settle=0.8)
-    text = await h.wait_reply()
-    check("普通用户不能用 config", "未知命令" in text, text[:120])
+    check("reload 命令已删除", "已从 config.json 重读配置" not in text,
+          text[:200])
 
 
 async def test_data_dir_resolution(h=None):
@@ -4883,13 +4987,13 @@ async def test_unified_help(h: Harness):
     check("列出全部子命令",
           all(f"/aichat {n}" in text for n in
               ("new", "list", "attach", "detach", "current",
-               "rename", "delete", "compact", "invite", "guests", "think")),
+               "rename", "remove", "invite", "guests", "think")),
           text[:400])
-    check("已删除的 switch / stats 不再出现",
-          "/aichat switch" not in text and "/aichat stats" not in text, text[:400])
-    check("超级用户才看得到 targets/add/del/model/config/reload",
-          all(f"/aichat {n}" in text for n in ("targets", "add", "del",
-                                               "model", "config", "reload")),
+    check("已删除的 switch / stats / compact / config / reload 不再出现",
+          all(f"/aichat {n}" not in text for n in
+              ("switch", "stats", "compact", "config", "reload")), text[:400])
+    check("超级用户才看得到 targets/add/del/model",
+          all(f"/aichat {n}" in text for n in ("targets", "add", "del", "model")),
           text[:600])
     check("子命令清单只给名字与介绍（不摊参数）",
           "/aichat new" in text and "/aichat new <name>" not in text, text[:400])
@@ -5113,7 +5217,10 @@ async def main():
         test_no_deferred_relative_imports, test_no_coupling_with_other_plugins,
         test_binding_allowlist, test_binding_group_vs_private, test_binding_cooldown,
         test_private_binding_bootstrap, test_unbound_is_silent,
-        test_unified_help, test_delegated_never_silent, test_quote_only_message_gets_full_text, test_quoted_all_page_images, test_sent_log_groups_multipart, test_interpret_not_delegated
+        test_unified_help, test_voice_via_fetch_ptt_text,
+        test_invited_guest_hint,
+        test_multi_round_image_read,
+        test_delegated_never_silent, test_quote_only_message_gets_full_text, test_quoted_all_page_images, test_sent_log_groups_multipart, test_images_then_text_with_markers, test_interpret_not_delegated
 
     ):
         await run_case(fn, ROOT_TMP)
