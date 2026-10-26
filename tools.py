@@ -294,7 +294,7 @@ def register_skill_tools(reg: ToolRegistry, *, skills, cfg, cmds,
                          logger=None) -> None:
     """把**别的插件注册的技能**接成工具 —— 技能是「命令映射」。
 
-    提供方只写一行 `self.register_skill("search", command="byrdocs.search")`；
+    提供方只写一行 `self.register_skill("search", command="插件名.命令")`；
     这里负责：解析出那条命令 → 用它的 Schema 生成工具参数 → 调用时交给
     `main._run_skill_command()`（合成真实事件走 `CommandManager.handle()`）。
     所以**权限/作用域/Schema 校验全部由命令系统判定**，AI 这条路绕不过去。

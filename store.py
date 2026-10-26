@@ -272,6 +272,144 @@ def generate_code(rng=None) -> str:
 
 # ==================== 会话存储 ====================
 
+class SentImagesIndex:
+    """机器人发出去的 `message_id → [图片 url, ...]`（`message_sent` 事件喂）。
+
+    **为什么需要**：一条长通知常带 7 张图，推送时被 `chunk.max_images` 切成几条
+    （3+3+1）。用户只引用其中一条时，`get_msg` 只回**那一条**的 3 张 ——
+    模型看到的就是「第 5、6、7 页」，前面几页永远进不来（用户报过）。
+    这里按 id 存下每条发了哪些图，引用时把相邻几条拼起来。
+    """
+
+    def __init__(self, path: str, *, logger=None, max_entries: int = 400) -> None:
+        self.path = path
+        self.logger = logger
+        self.max_entries = max(1, int(max_entries))
+        self._data: dict[str, list] = {}
+        self._load()
+
+    def _load(self) -> None:
+        if not os.path.exists(self.path):
+            return
+        try:
+            with open(self.path, encoding="utf-8") as f:
+                got = json.load(f)
+            if isinstance(got, dict):
+                self._data = {str(k): [str(u) for u in v if u]
+                              for k, v in got.items() if isinstance(v, list)}
+        except (OSError, json.JSONDecodeError) as e:
+            if self.logger:
+                self.logger.warning("[ai_chat] 发出图片索引读取失败（忽略）: %s", e)
+
+    def save(self) -> None:
+        while len(self._data) > self.max_entries:
+            self._data.pop(next(iter(self._data)), None)
+        tmp = self.path + ".tmp"
+        try:
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(self._data, f, ensure_ascii=False)
+            os.replace(tmp, self.path)
+        except OSError as e:
+            if self.logger:
+                self.logger.warning("[ai_chat] 发出图片索引落盘失败: %r", e)
+
+    def remember(self, message_id: int, urls: list) -> None:
+        key = str(int(message_id))
+        clean = [str(u) for u in (urls or []) if u]
+        if not clean or self._data.get(key) == clean:
+            return
+        self._data[key] = clean
+        self.save()
+
+    def get(self, message_id: int) -> list:
+        return list(self._data.get(str(int(message_id or 0))) or [])
+
+    def get_block(self, message_id: int, *, max_parts: int = 6) -> list:
+        """把一次推送被切成的几条里的图**按顺序拼起来**（去重保序）。"""
+        mid = int(message_id or 0)
+        if not mid or not self._data.get(str(mid)):
+            return []
+        lo = hi = mid
+        while lo - 1 >= 1 and lo - mid < max_parts and self._data.get(str(lo - 1)):
+            lo -= 1
+        while hi + 1 <= hi + max_parts and self._data.get(str(hi + 1)):
+            hi += 1
+        out: list = []
+        for i in range(lo, hi + 1):
+            for url in self._data.get(str(i)) or []:
+                if url not in out:
+                    out.append(url)
+        return out
+
+
+class SentTextIndex:
+    """机器人发出去的 `message_id → 完整文本`（**跨插件**，`message_sent` 事件喂）。
+
+    **为什么需要**：推送常被切成多条（长通知 3 段），用户往往只引用其中一段。
+    `get_msg` 只回那一段，模型拿到的就是半截话。`message_sent` 带的是那条消息的
+    完整内容，按 id 存下来，引用任意一段都能还原全文。
+    """
+
+    def __init__(self, path: str, *, logger=None, max_entries: int = 400) -> None:
+        self.path = path
+        self.logger = logger
+        self.max_entries = max(1, int(max_entries))
+        self._data: dict[str, str] = {}
+        self._load()
+
+    def _load(self) -> None:
+        if not os.path.exists(self.path):
+            return
+        try:
+            with open(self.path, encoding="utf-8") as f:
+                got = json.load(f)
+            if isinstance(got, dict):
+                self._data = {str(k): str(v) for k, v in got.items() if v}
+        except (OSError, json.JSONDecodeError) as e:
+            if self.logger:
+                self.logger.warning("[ai_chat] 发出文本索引读取失败（忽略）: %s", e)
+
+    def save(self) -> None:
+        while len(self._data) > self.max_entries:
+            self._data.pop(next(iter(self._data)), None)
+        tmp = self.path + ".tmp"
+        try:
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(self._data, f, ensure_ascii=False)
+            os.replace(tmp, self.path)
+        except OSError as e:
+            if self.logger:
+                self.logger.warning("[ai_chat] 发出文本索引落盘失败: %r", e)
+
+    def remember(self, message_id: int, text: str) -> None:
+        key = str(int(message_id))
+        if not text or self._data.get(key) == text:
+            return
+        self._data[key] = str(text)
+        self.save()
+
+    def get(self, message_id: int) -> str:
+        return str(self._data.get(str(int(message_id or 0))) or "")
+
+    def get_block(self, message_id: int, *, max_parts: int = 6) -> str:
+        """把**同一次推送被切成的多段**拼回来（引用其中一段也要给全文）。
+
+        做法：以引用的那个 id 为中心，向前往后各走 `max_parts` 步，只要相邻 id
+        也在索引里（说明是同一次连续发送）就连起来。索引里只存机器人自己发的，
+        所以不会把别人的消息混进来；真实推送的 `message_id` 是连续的。
+        """
+        mid = int(message_id or 0)
+        if not mid or not self._data.get(str(mid)):
+            return ""
+        lo = hi = mid
+        while lo - 1 >= 1 and lo - mid < max_parts and self._data.get(str(lo - 1)):
+            lo -= 1
+        while hi + 1 <= hi + max_parts and self._data.get(str(hi + 1)):
+            hi += 1
+        parts = [self._data[str(i)] for i in range(lo, hi + 1) if self._data.get(str(i))]
+        return "\n\n".join(parts)
+
+
 class SentReplyIndex:
     """机器人**自己发出去**的消息 id → 它对应的那条会话消息 `(sid, seq)`。
 

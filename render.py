@@ -183,6 +183,9 @@ def _css() -> str:
       margin-top: 14px; padding-top: 10px; border-top: 1px dashed #e6e8eb;
       font-size: 14px; color: #8a9099;
     }
+    .shot { margin: 10px 0 14px; }
+    .shot figcaption { font-size: 12px; color: #888; margin-bottom: 4px; }
+    .shot img { max-width: 100%; border-radius: 6px; display: block; }
     .cut { font-size: 13px; color: #c05621; margin-top: 6px; }
     /* 正文里的 Markdown（表格 / 列表 / 代码 / 公式）由**同一套**样式渲染 ——
        见 markdown.markdown_body_css 的说明，不要在这里另写一份。 */
@@ -201,7 +204,8 @@ def _esc(text: str) -> str:
 
 def build_html(ex: Exchange, *, width: int = 720, session_name: str = "",
                total: int = 0, max_chars_per_side: int = 2000,
-               context: Optional[list] = None) -> str:
+               context: Optional[list] = None,
+               media: Optional[list] = None) -> str:
     """一对问答 → 完整 HTML 文档。
 
     ⚠️ 所有动态内容都必须过 `_esc()`。群友昵称和消息正文直接拼进 HTML 是一个
@@ -233,6 +237,22 @@ def build_html(ex: Exchange, *, width: int = 720, session_name: str = "",
             body = clean_quoted(q_quoted) or q_quoted
             q_html += ('<div class="quote"><div class="quote-h">引用上文</div>'
                        + markdown_to_html(body) + "</div>")
+    # ★ 提问附带的图片（hget 以前只画文字，图全丢了 —— 用户明确要求补上）。
+    # 只在卡片里嵌**本地已存在**的文件；`file://` URI 由 Chromium 直接读。
+    media_html = ""
+    for item in (media or []):
+        try:
+            path = str((item or {}).get("path") or "")
+            marker = str((item or {}).get("marker") or "")
+        except AttributeError:
+            continue
+        if not path or not os.path.exists(path):
+            continue
+        media_html += (
+            '<figure class="shot">'
+            f'<figcaption>{_esc(marker)}</figcaption>'
+            f'<img src="{Path(path).as_uri()}" alt="{_esc(marker)}">'
+            '</figure>')
     a_html = markdown_to_html(answer)
 
     # 引用链（沿引用追溯出来的上文，最早在前）：每一对只给**问**与答案首段，
@@ -280,6 +300,7 @@ def build_html(ex: Exchange, *, width: int = 720, session_name: str = "",
     <div class="time">{_esc(ex.time or "")}{_esc(q_label)}</div>
   </div>
   <div class="q">{q_html}</div>
+  {media_html}
   <div class="ai"><div class="name">AI{_esc(a_label)}</div></div>
   <div class="a">{a_html}</div>
   {tool_line}
@@ -366,7 +387,8 @@ class HistoryRenderer:
     # ---- 渲染 ----
 
     async def render(self, ex: Exchange, *, session_name: str = "",
-                     total: int = 0, context: Optional[list] = None) -> str:
+                     total: int = 0, context: Optional[list] = None,
+                     media: Optional[list] = None) -> str:
         """渲染一对问答，返回 PNG 的绝对路径。失败抛 `RenderError`。"""
         chrome = self.chromium()
         if not chrome:
@@ -380,7 +402,7 @@ class HistoryRenderer:
 
         doc = build_html(ex, width=self.opt.width, session_name=session_name,
                          total=total, max_chars_per_side=self.opt.max_chars_per_side,
-                         context=context)
+                         context=context, media=media)
         try:
             with open(html_path, "w", encoding="utf-8") as f:
                 f.write(doc)

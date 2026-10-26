@@ -44,6 +44,7 @@ import functools
 import inspect
 import json
 import os
+import re
 import time
 from datetime import datetime
 from pathlib import Path
@@ -69,7 +70,8 @@ from .reasoning import (
     DIALECTS, LEVELS, VALIDATION_HINT, ReasoningPolicy, ReasoningSpec,
     override_text, spec_from_text,
 )
-from .history import (SUMMARY_SYSTEM_PROMPT, SummaryCache, extract_exchanges,
+from .history import (QUOTE_FOOTER, QUOTE_HEADER, SUMMARY_SYSTEM_PROMPT,
+                      SummaryCache, extract_exchanges, split_quoted,
                       strip_stray_label, trace_chain,
                       fallback_summary, has_compaction, parse_question_summaries,
                       parse_range, reject_range, render_list, summarize_context,
@@ -83,7 +85,8 @@ from .segments import (ROLE_ASSISTANT, Message, assistant_message, tool_message,
                        user_message)
 from .store import (
     CODE_TTL, ChatTarget, OWNER_GROUP, OWNER_USER,
-    SentReplyIndex, Session, SessionStore, normalize_code,
+    SentImagesIndex, SentReplyIndex, SentTextIndex, Session, SessionStore,
+    normalize_code,
 )
 from .tools import (ToolContext, ToolRegistry, register_builtin_tools,
                     register_image_tool, register_plot_tool, register_skill_tools,
@@ -367,6 +370,26 @@ def deep_merge(base: dict, override: dict) -> dict:
 
 # ==================== 插件 ====================
 
+#: 「用户要的是**解读**，不是取数据」的判据（只看用户自己写的正文，不看引文）。
+#:
+#: 为什么要在工具层硬拦：提示词只是「建议」，模型照样会把引文里的祈使句当任务。
+#: 用户引用一条通知问「帮我解读」，模型就去调插件命令 —— 转交后这轮结束，
+#: 没人解读，用户白问。这里命中就把工具调用**拒掉**，逼它自己回答。
+_INTERPRET_RE = re.compile(
+    r"解读|解释|讲解|总结|概括|翻译|分析|提炼|梳理|说说|讲讲|什么意思|讲了什么|怎么看")
+#: 但如果用户**同时**明确要查东西，就以查为主（「解读一下你帮我查到的那些通知」）
+_LOOKUP_RE = re.compile(
+    r"查一下|查查|帮我查|搜一下|搜搜|找一下|有没有|最新的|最近有|详情|列表|列一下|编号")
+
+
+def _wants_interpretation(own_text: str) -> bool:
+    """用户**自己写的正文**是在要解读吗（引文里的祈使句不算）？"""
+    text = str(own_text or "")
+    if not text.strip():
+        return False
+    return bool(_INTERPRET_RE.search(text)) and not bool(_LOOKUP_RE.search(text))
+
+
 #: 「这一轮交给别的插件了」的哨兵：`_model_loop` 返回它，`_run_turn` 据它决定不说话。
 #: 用对象而不是字符串：模型自己的输出永远不可能等于这个对象。
 _DELEGATED = object()
@@ -389,6 +412,35 @@ class AiChatPlugin(PluginBase):
     author = "ncqqpy"
 
     # ---------------- 生命周期 ----------------
+
+    def _exchange_media(self, messages: list, picked) -> list:
+        """`hget` 卡片里要画的图：这一问的消息里 `metadata.media` 且**本地还在**的。
+
+        `hget` 早先只画文字，图全丢了（用户明确指出）。只读本地文件 ——
+        卡片由 Chromium 渲染，`file://` 本地路径最稳，不去网络上抓。
+        """
+        out: list = []
+        try:
+            seqs = {int(getattr(picked, "seq", 0) or 0)}
+        except (TypeError, ValueError):
+            seqs = set()
+        for m in messages:
+            if int(getattr(m, "seq", 0) or 0) not in seqs:
+                continue
+            for item in ((m.metadata or {}).get("media") or []):
+                if not isinstance(item, dict):
+                    continue
+                if str(item.get("kind") or "") not in ("image", "voice", "video"):
+                    continue
+                path = str(item.get("path") or "")
+                if not path or not os.path.exists(path):
+                    continue
+                num = int(item.get("num") or 0)
+                kind_cn = {"image": "图", "voice": "语音", "video": "视频"}[
+                    str(item.get("kind"))]
+                out.append({"path": path, "marker": f"[{kind_cn}#{num}]",
+                            "kind": item.get("kind"), "num": num})
+        return out
 
     async def on_load(self):
         # ⚠️ 先**从磁盘重读**再补模板：`ConfigManager` 只在进程启动时读一次文件，
@@ -495,6 +547,13 @@ class AiChatPlugin(PluginBase):
             max_bytes=int(mm.get("max_bytes") or 4 * 1024 * 1024),
             max_side=int(mm.get("max_side") or 1568),
             keep_files=int(mm.get("keep_files") or 200))
+        #: 机器人自己发出去的消息全文（`message_id → 文本`），给「引用被分段的消息」
+        #: 还原完整内容用（见 `_on_message_sent`）
+        #: 机器人自己发出去的消息**图片 url**（同上，用于把被切分的多张图拼回来）
+        self.sent_images = SentImagesIndex(
+            os.path.join(self._data_dir, "sent_images.json"), logger=self.logger)
+        self.sent_texts = SentTextIndex(
+            os.path.join(self._data_dir, "sent_texts.json"), logger=self.logger)
         #: 语音转写（把 QQ 语音变成文字再交给模型；引擎由 `asr` 配置决定）
         self.asr = Transcriber(AsrOptions.from_cfg(self.cfg.get("asr")),
                                logger=self.logger)
@@ -546,6 +605,39 @@ class AiChatPlugin(PluginBase):
             # 传取值函数而不是快照：配置改了（含热重载）立刻生效
             cfg=lambda: self.cfg.get("skills") or {},
             logger=self.logger)
+
+        @self.on_event(MessageEvent)
+        async def _on_message_sent(event: MessageEvent):
+            """记下机器人（**任何插件**）发出去的消息全文。
+
+            为什么需要：推送常被切成好几条（长通知 3 段），用户只引用其中一段时，
+            `get_msg` 只能读到**那一段**。而 `message_sent` 事件带的是那条消息的
+            完整内容，按 `message_id` 存下来后，引用任意一段都能还原全文。
+            """
+            if str(getattr(event, "post_type", "")) != "message_sent":
+                return
+            try:
+                text = str(getattr(event, "plain_text", "") or "").strip()
+                mid = int(getattr(event, "message_id", 0) or 0)
+            except (TypeError, ValueError):
+                return
+            if text and mid:
+                self.sent_texts.remember(mid, text)
+            # 图片也要按 id 记：推送常被切成 3+3+1 条，只引用其中一条会丢前面几页
+            try:
+                segs = event.message if isinstance(event.message, list) else []
+                urls = []
+                for seg in segs:
+                    if not isinstance(seg, dict) or seg.get("type") != "image":
+                        continue
+                    data = seg.get("data") or {}
+                    url = str(data.get("url") or data.get("file") or "")
+                    if url:
+                        urls.append(url)
+                if mid and urls:
+                    self.sent_images.remember(mid, urls)
+            except Exception:  # noqa: BLE001 - 记不下来不该影响别的
+                pass
 
         @self.on_message()
         async def _on_any_message(event: MessageEvent):
@@ -1770,6 +1862,126 @@ class AiChatPlugin(PluginBase):
                  "其余只有标号 —— 看不到就直接说看不到，不要猜。")
         return text
 
+    def _remember_quoted_text(self, message_id: int, text: str) -> None:
+        """记下「这个 id 的完整正文」，`_quoted_suffix` 优先用它。
+
+        为什么不在 `_quoted_suffix` 里直接查：那条路径是同步的（拼文本），
+        而且已经要处理菊花链；把「全文从哪来」收敛到这里，改动面最小。
+        """
+        cache = getattr(self, "_quoted_full", None)
+        if cache is None:
+            cache = self._quoted_full = {}
+        if len(cache) > 64:
+            cache.clear()
+        cache[int(message_id)] = str(text or "")
+
+    async def _quoted_media(self, *, reply_id: int, session: Session) -> list:
+        """引用一条**带图**的消息时，把图取下来（不需要用户再 `/aichat mark`）。
+
+        两条来源：
+
+        1. 会话历史里那条消息的 `metadata.media`（我们自己收过的）—— 直接复用；
+        2. 否则问 QQ 要原文（`get_msg`），把 image 段下载、编号。
+
+        `get_msg` 有 1~5 秒节流，所以**只在引用时才调**，而且失败就安静返回空
+        （用户要的是「图没带过来就说明一下」，不是整轮失败）。
+        """
+        if not reply_id or not self.media:
+            return []
+        # ① 历史里已经有
+        known = self._session_message(session, reply_id)
+        if known is not None:
+            have = [m for m in ((known.metadata or {}).get("media") or [])
+                    if isinstance(m, dict) and str(m.get("kind")) == "image"]
+            if have:
+                return have
+        # ①.5 机器人自己发的（可能被分段）→ 用 message_sent 记下的**全文**
+        full = self.sent_texts.get_block(reply_id)
+        if full:
+            self._remember_quoted_text(reply_id, full)
+        # ①.4 框架记的「自己发出的消息」（`SentLog`，按**发送顺序**分组）——
+        #      这是唯一可靠的来源：`message_id` 由服务端分配、**不保证递增**，
+        #      所以既不能靠 id±1，也不能指望 `message_sent`（本机 NapPush 不推）。
+        sent = self._sent_block(reply_id)
+        if sent.get("images"):
+            out = []
+            for url in sent["images"][:8]:
+                num = int(session.meta.get("media_seq") or 0) + 1
+                session.meta["media_seq"] = num
+                self.store.touch(session.id)
+                # 页图缩到 1100px：足够读清文字，base64 体积能砍一半以上
+                # （8 张 1568px 的图能把请求体顶到 413，上游直接拒收）
+                item = await self.media.fetch(url, "image", num=num,
+                                              session=session, max_side=1100)
+                if item.ok:
+                    out.append(dict(item.to_dict(), marker=item.marker()))
+            if out:
+                return out
+        # ①.5 机器人自己发的（可能被切成多条）→ 用 message_sent 记下的**整批图**
+        urls = self.sent_images.get_block(reply_id)
+        if urls:
+            out = []
+            for url in urls[:8]:          # 一次最多补 8 张，别把上下文撑爆
+                num = int(session.meta.get("media_seq") or 0) + 1
+                session.meta["media_seq"] = num
+                self.store.touch(session.id)
+                # 页图缩到 1100px：足够读清文字，base64 体积能砍一半以上
+                # （8 张 1568px 的图能把请求体顶到 413，上游直接拒收）
+                item = await self.media.fetch(url, "image", num=num,
+                                              session=session, max_side=1100)
+                if item.ok:
+                    out.append(dict(item.to_dict(), marker=item.marker()))
+            if out:
+                return out
+        # ② 问 QQ 要原文。一次推送常被切成好几条（3+3+1 张图），
+        #    只读被引用的那条会丢前面的页 —— 所以**顺带读相邻几条**。
+        #    ⚠️ 每条 `get_msg` 有 1~5 秒节流，所以限制最多再读 3 条，
+        #    遇到「不是机器人发的 / 没有图 / 读不到」就停。
+        urls: list[str] = []
+        base_sender = None
+        for step in (0, -1, 1, -2):
+            if step and len(urls) >= 8:
+                break
+            mid = int(reply_id) + step
+            msg = await self._get_msg_cached(mid)
+            if not isinstance(msg, dict):
+                if step:
+                    break
+                continue
+            sender = msg.get("sender") if isinstance(msg.get("sender"), dict) else {}
+            who = int(sender.get("user_id") or 0)
+            if step == 0:
+                base_sender = who
+            elif base_sender and who != base_sender:
+                break
+            segs = msg.get("message")
+            if not isinstance(segs, list):
+                if step:
+                    break
+                continue
+            got_any = False
+            for seg in segs:
+                if not isinstance(seg, dict) or str(seg.get("type")) != "image":
+                    continue
+                data = seg.get("data") or {}
+                url = str(data.get("url") or data.get("file") or "")
+                if url and url not in urls:
+                    urls.append(url)
+                    got_any = True
+            if step and not got_any:
+                break
+        if not urls:
+            return []
+        out = []
+        for url in urls[:8]:
+            num = int(session.meta.get("media_seq") or 0) + 1
+            session.meta["media_seq"] = num
+            self.store.touch(session.id)
+            item = await self.media.fetch(url, "image", num=num, session=session)
+            if item.ok:
+                out.append(dict(item.to_dict(), marker=item.marker()))
+        return out
+
     def _media_to_include(self, media_meta: list, picks: list, *, session: Session,
                           meta: dict, caps: dict) -> list[tuple[str, int]]:
         """算「这一轮真的要把哪些媒体交给模型」，返回 `[(kind, num)]`。
@@ -1923,6 +2135,50 @@ class AiChatPlugin(PluginBase):
                     continue
         return self._own_message(want)
 
+    #: 引用补全文本的上限（够模型判断，又不至于把上下文撑爆）
+    _QUOTE_FULL_MAX = 2000
+
+    def _clip_quote(self, text: str) -> str:
+        body = str(text or "").strip()
+        if len(body) > self._QUOTE_FULL_MAX:
+            body = body[:self._QUOTE_FULL_MAX] + "…（已截断）"
+        return body
+
+    def _sent_block(self, message_id: int) -> dict:
+        """框架 `SentLog` 里「这条消息所在的那一整批」：`{"text":…, "images":[…]}`。
+
+        没有日志（测试/独立运行）时返回空 dict，调用方自然退回旧路径。
+        """
+        log = getattr(getattr(self, "client", None), "api", None)
+        log = getattr(log, "sent_log", None) if log is not None else None
+        block = getattr(log, "block", None)
+        if not callable(block):
+            return {}
+        try:
+            got = block(int(message_id))
+        except Exception:  # noqa: BLE001 - 日志坏了不该影响回复
+            return {}
+        return got if isinstance(got, dict) else {}
+
+    def _full_quoted_text(self, message_id: int) -> str:
+        """拿一条消息的**全文**（本地优先，其次 `message_sent` 索引）。
+
+        只查本地/索引，**不发 API** —— 这条路径在拼文本时同步调用，
+        不能为了补全把整条回复拖慢几秒（`get_msg` 有 1~5 秒节流）。
+        """
+        if not message_id:
+            return ""
+        known = (getattr(self, "_quoted_full", None) or {}).get(int(message_id))
+        if known:
+            return str(known)
+        block = self.sent_texts.get_block(int(message_id))
+        if block:
+            return block
+        own = self._own_message(int(message_id))
+        if own is not None:
+            return split_quoted(own.text)[0]
+        return ""
+
     async def _quoted_suffix(self, event: MessageEvent,
                              session: Optional[Session] = None) -> str:
         """把引用的内容拼成「引用上文」段落，**沿着引用链一直往上追**。
@@ -1958,6 +2214,22 @@ class AiChatPlugin(PluginBase):
                 else:
                     out.append(f"\n[引用上文] 上面那条自己又引用了 [#{label}]"
                                "（同样在上下文中）。")
+                # ⚠️ 「原文在上下文里」只有**正文充实**时才成立。
+                # 如果这条自己的正文几乎是空的（用户只发了「引用 + 一句话」，
+                # 比如 `[#13]` 就是一条「引用了一条推送、正文只有链接」的消息），
+                # 那光给编号等于没给 —— 模型看不到被引用内容的全貌（线上用例：
+                # 问「可以吗」，模型只能看到一串 `[#N]` 和一个链接）。
+                own_text = split_quoted(msg.text)[0].strip()
+                nested_id = int((msg.metadata or {}).get("reply_to") or 0)
+                # 只在「被引用的那条**不在**上下文里」时才补 —— 在上下文里的
+                # 由编号链覆盖得到，再贴一遍就是重复（也浪费 token）。
+                nested_in_ctx = (self._session_message(session, nested_id)
+                                 is not None) if nested_id else False
+                if len(own_text) < 20 and nested_id and not nested_in_ctx:
+                    nested_full = self._full_quoted_text(nested_id)
+                    if nested_full:
+                        out.append("\n（补上它引用内容的全文，供你判断）\n"
+                                   + self._clip_quote(nested_full))
                 # 链继续走：本地 metadata 就够，不用 get_msg
                 cur = int((msg.metadata or {}).get("reply_to") or 0) or None
                 continue
@@ -1973,8 +2245,8 @@ class AiChatPlugin(PluginBase):
                     # 留一句提示占住引文的位置，用户写的正文照常提交。
                     # 措辞要跟当前规则一致：图片**不会**因为被引用就传过来，
                     # 得 `/aichat mark`；历史语音不重传。
-                    hint = (f"引用它不会自动传给我：让用户引用这条并发 "
-                            f"/aichat mark 我才能看到" if media == "图片"
+                    hint = ("这张图会随引用一起交给我；如果这里只有一句提示，"
+                            "说明当时没取到" if media == "图片"
                             else "历史语音不重传，这一条我听不到")
                     out.append(f"\n[引用上文] 对方引用的是一条{media}（{hint}）。")
                     break
@@ -1990,7 +2262,12 @@ class AiChatPlugin(PluginBase):
             else:
                 out.append(f"\n[引用上文] 上面那条消息自己又引用了：\n{text}")
             cur = nested
-        return "".join(out)
+        if not out:
+            return ""
+        # 用**显式边界**包起来：引用是资料，不是给模型的指令。
+        # 不包的时候，模型会把引文里的「查一下…/原文链接…」当成任务去做
+        # （实测：引用一条通知问「帮我解读」，它跑去调用插件的查询命令）。
+        return "\n" + QUOTE_HEADER + "".join(out) + "\n" + QUOTE_FOOTER
 
     @staticmethod
     def _reply_message_id(event: MessageEvent) -> Optional[int]:
@@ -2007,7 +2284,36 @@ class AiChatPlugin(PluginBase):
                     return None
         return None
 
+    async def _get_msg_cached(self, message_id: int):
+        """同一轮里同一个 id 只 `get_msg` 一次（框架每次调用有 1~5 秒节流）。"""
+        cache = getattr(self, "_getmsg_cache", None)
+        if cache is None:
+            cache = {}
+        key = int(message_id)
+        if key in cache:
+            return cache[key]
+        try:
+            got = await self.client.api.get_msg(message_id=key)
+        except Exception as e:  # noqa: BLE001 - 读不到就是读不到
+            if self.cfg.get("log_verbose"):
+                self.logger.info("[ai_chat] get_msg(%s) 失败：%r", key, e)
+            got = None
+        if isinstance(got, dict) and isinstance(got.get("data"), dict):
+            got = got["data"]
+        cache[key] = got
+        if len(cache) > 32:
+            cache.clear()
+        self._getmsg_cache = cache
+        return got
+
     async def _read_quoted(self, message_id: int) -> tuple[str, str, Optional[int]]:
+        # 机器人自己发过的：用 message_sent 记下的**全文**（推送常被切成多条，
+        # 用户只引用其中一段，get_msg 只能回那一段 —— 那半截话没法解读）
+        full = ((getattr(self, "_quoted_full", None) or {}).get(int(message_id))
+                or self._sent_block(message_id).get("text")
+                or self.sent_texts.get_block(message_id))
+        if full:
+            return (f"（机器人当时发的内容，完整全文）\n{full}", "", None)
         """读引用消息的内容 → `(文本, 多媒体类型名, 它自己引用的消息 id)`。
 
         文本与多媒体互斥：拿到文本返回 `(文本, "")`；引用的是图片/语音等返回
@@ -2074,7 +2380,7 @@ class AiChatPlugin(PluginBase):
         return "", "", nested
 
     async def _run_skill_command(self, skill, args: dict, target: ChatTarget,
-                                 meta: dict) -> str:
+                                 meta: dict, sent_flag: Optional[dict] = None) -> str:
         """触发一条**被映射的命令**：合成真实事件 → `CommandManager.handle()`。
 
         为什么走 `handle()` 而不是直接调 handler：权限（`permission`）、作用域
@@ -2103,9 +2409,13 @@ class AiChatPlugin(PluginBase):
                         f"可能是没有权限或不在服务范围内）")
             return str(result[1] if len(result) > 1 else result[0])
         if result is None:
-            return ""      # 命令自己发过消息了
+            # 命令自己把结果发出去了（框架约定：返回 None = 调用方不必再回）。
+            # ⚠️ 但**不能返回空串**：AI 这轮不说话，命令又没输出时用户就什么都收不到
+            # （线上「test」会话发「上上条为啥没有回复」就是这么静默的）。
+            return f"（已执行 {line}）"
         if isinstance(result, str):
-            return result
+            # 空串：命令什么都没说、也没发 —— 给一句话，别让委派变成静默
+            return result or f"（{line} 执行完了，但没有返回内容）"
         # ⚠️ MessageChain / 分段列表：**这条链上没有框架的分发器**，
         # 命令只是"返回"了消息，不自己发就永远到不了用户 —— 早先这里直接
         # `return ""`（误以为"命令自己会发"），于是返回富文本（正文图片/表格）
@@ -2114,16 +2424,63 @@ class AiChatPlugin(PluginBase):
         # `MessageChain` 没有"从分段列表构造"的公开接口（只有 `build()`
         # 取出、`__add__` 合并），所以这里直接拼 `_segments` —— 分段本身是
         # 命令产出的原始结构，原样转发即可，不做任何改写。
+        # 命令的产物怎么发：**优先交给提供方插件自己发**（`skill.deliver`）——
+        # 它有可能是 `MessageChain`、chain 列表、段列表，还各有分段/图片/文件规矩，
+        # 只有插件自己知道怎么发。没有 deliver 才退回本插件的默认发送。
+        if result is not None and not isinstance(result, str):
+            deliver = getattr(skill, "deliver", None)
+            if deliver is not None:
+                # 插件给的交付函数可以是同步的（就调两次 api），也可异步
+                out = deliver(result, self._skill_context_for(target, meta))
+                if inspect.isawaitable(out):
+                    await out
+                if sent_flag is not None:
+                    sent_flag["sent"] = True
+                return ""
+        if isinstance(result, str):
+            return result or f"（{line} 执行完了，但没有返回内容）"
+        # —— 兜底：插件没给 deliver，就按本插件的老规矩发（单条/多条/段列表）
+        parts: list = []
         if isinstance(result, MessageChain):
-            chain = result
-        else:
-            chain = MessageChain()
-            for seg in result or []:
-                if isinstance(seg, dict) and seg.get("type"):
-                    chain._segments.append(seg)
-        if chain:
-            await self._send(target, chain)
-        return ""
+            parts = [result]
+        elif isinstance(result, list):
+            for item in result:
+                if isinstance(item, MessageChain):
+                    parts.append(item)
+                elif isinstance(item, MessageChain) is False and isinstance(item, list):
+                    built = MessageChain()
+                    for seg in item:
+                        if isinstance(seg, dict) and seg.get("type"):
+                            built._segments.append(seg)
+                    if built:
+                        parts.append(built)
+                elif isinstance(item, dict) and item.get("type"):
+                    built = MessageChain()
+                    built._segments.append(item)
+                    parts.append(built)
+        if parts:
+            for part in parts:
+                await self._send(target, part)
+            if sent_flag is not None:
+                sent_flag["sent"] = True
+            return ""
+        # 命令返回了空串且没发过消息 —— 实话说一句，别让用户以为没反应
+        return f"（{line} 执行完了，但没有返回内容）"
+
+    def _skill_context_for(self, target: ChatTarget, meta: dict):
+        """给技能/插件用的上下文（身份 + 回话通道）。"""
+        from napcat.skills import SkillContext
+        uid = int(meta.get("user_id") or 0)
+        return SkillContext(
+            caller="ai_chat", user_id=uid,
+            group_id=int(target.group_id) if target.is_group else 0,
+            is_group=bool(target.is_group), session_id="",
+            is_superuser=bool(self.perm.is_superuser(uid)),
+            is_admin=bool(self.perm.is_group_admin(target.chat_id, uid)
+                          if target.is_group and hasattr(self.perm, "is_group_admin")
+                          else False),
+            send=lambda text: self._send(
+                target, MessageChain().text(str(text))))
 
     def _skill_event(self, target: ChatTarget, meta: dict, text: str):
         """造一条「以调用者身份、带命令文本」的真人消息事件。
@@ -2210,7 +2567,7 @@ class AiChatPlugin(PluginBase):
         if message is not None:
             return list((message.metadata or {}).get("segments") or []), {}
         try:
-            got = await self.client.api.get_msg(message_id=int(message_id))
+            got = await self._get_msg_cached(int(message_id))
         except Exception:  # noqa: BLE001 - 读不到就是读不到，由调用方给话术
             return [], {}
         if isinstance(got, dict) and "data" in got and isinstance(got["data"], dict):
@@ -2230,7 +2587,7 @@ class AiChatPlugin(PluginBase):
         否则用户只会觉得「机器人瞎了」。
         """
         if media in ("图片", "图片/表情"):
-            return ("（含一张图片，未标记：引用这条消息并发送 /aichat mark 我才能看到它）")
+            return ("（含一张图片；把它引用进提问我就能看到它）")
         if media == "语音":
             return "（含一条语音）"
         return f"（其中含{media}，未读取）"
@@ -2535,10 +2892,38 @@ class AiChatPlugin(PluginBase):
         #   ② 引用到的消息里的媒体（「引用这张图」= 我要你看着它回答）
         #   ③ 语音：全传（用户的要求：语音视为一条对话，不做筛选）
         # 再按模型能力过滤 —— 模型收不了的类型，只留标号、不传字节。
+        # 本轮「命令自己发过消息」的旗子（见 `_run_skill_command` 与委派分支）
+        self._skill_sent = {}
+        self._getmsg_cache = {}
         caps = await self._capabilities(self.llm)
         media_meta: list = [m for m in (meta.get("media") or []) if isinstance(m, dict)]
-        include = self._media_to_include(media_meta, meta.get("media_pick") or [],
+        # **引用内容不需要标记**：引用一条带图的消息，图要跟着一起来 —— 历史里有
+        # 记录就直接算；历史里没有（比如机器人自己推送的那条）就去 QQ 那边读一次。
+        quoted_items = await self._quoted_media(reply_id=int(meta.get("reply_to") or 0),
+                                                session=session)
+        media_meta = media_meta + quoted_items
+        quoted_picks = [[m.get("kind"), int(m.get("num") or 0)]
+                        for m in quoted_items if int(m.get("num") or 0) > 0]
+        include = self._media_to_include(media_meta,
+                                         list(meta.get("media_pick") or []) + quoted_picks,
                                          session=session, meta=meta, caps=caps)
+        # ★ 引用里新取到的图片也要在**正文原位**留下标号：
+        #   图片按 `[图#N]` 逐张先发，正文里得有同一个标号对得上 —— 否则模型
+        #   看到 7 张图却不知道哪张对应引文里的哪一句（用户要求「标号放原位」）。
+        #   这批图来自被引用的那条消息，所以标号插在引用材料块内、结束标记之前。
+        if quoted_items:
+            by_kind = {"image": "图", "voice": "语音", "video": "视频"}
+            marks = "、".join(
+                "[%s#%d]" % (by_kind.get(str(m.get("kind")), str(m.get("kind"))),
+                             int(m.get("num") or 0))
+                for m in quoted_items if int(m.get("num") or 0) > 0)
+            if marks:
+                line = f"（引用的这条消息里包含图片：{marks}）"
+                if "【引用材料结束】" in text:
+                    text = text.replace("【引用材料结束】",
+                                        line + "\n【引用材料结束】", 1)
+                else:
+                    text = text.rstrip() + "\n" + line
         message = user_message(
             text,
             origin=("user.group" if target.is_group else "user.private"),
@@ -3017,28 +3402,62 @@ class AiChatPlugin(PluginBase):
                     (d for d in self.tools.dynamic(ctx) if d.name == t.name), None),
                 "delegates", False)]
             if delegated:
+                # ★ 硬拦：用户这一轮**自己要的是解读**，却去调插件工具 —— 拒掉。
+                #   引文里的「请查询详情」不该被当成任务（提示词压不住，这里是兜底）。
+                own = ""
+                for m in reversed(history):
+                    if m.role == "user":
+                        own = split_quoted(m.text)[0]
+                        break
+                if _wants_interpretation(own):
+                    for call in delegated:
+                        note = ("这一轮用户要的是**解读/总结**，不是取数据："
+                                "请直接基于已有内容回答，不要转交给插件。")
+                        tool_msg = tool_message(call.id or "blocked", note,
+                                                name=call.name, is_error=True)
+                        history.append(tool_msg)
+                        self.store.append(session.id, tool_msg)
+                    if self.cfg.get("log_verbose"):
+                        self.logger.info("[ai_chat] 拒绝转交：这一轮是解读类请求")
+                    continue        # 让模型接着自己回答
+                sent = False
                 for call in delegated:
-                    result = ""
+                    out = ""
                     try:
-                        result, _ = await self.tools.call(
+                        out, _ = await self.tools.call(
                             call.name, call.arguments or {}, ctx)
                     except Exception as e:  # noqa: BLE001 - 技能失败由它自己报
                         self.logger.warning("[ai_chat] 技能 %s 调用失败: %r",
                                             call.name, e)
-                    # 命令的**返回值**就是它要对用户说的话（`/byrdocs search`
-                    # 回什么，这里就发什么）。命令自己发过消息时返回空串，
-                    # 那就什么都不用补 —— AI 这一轮始终不接话。
-                    if result:
-                        await self._send(target, MessageChain().text(result))
+                        out = f"（{call.name} 执行失败）"
+                    # 命令的**返回值**就是它要对用户说的话（`/bvrd search`
+                    # 回什么，这里就发什么）；`_SKILL_SENT` 表示命令已自己发出去了。
+                    flag = (ctx.extras or {}).get("skill_sent")
+                    if isinstance(flag, dict) and flag.pop("sent", False):
+                        sent = True
+                    if out:
+                        await self._send(target, MessageChain().text(out))
+                        sent = True
                     # ⚠️ **必须补一条工具结果**：assistant 的 tool_call 没配对结果时，
                     # `sanitize_history` 会把它当「无法配对的历史前缀」丢掉 ——
                     # 线上 s0019 每轮都报「丢掉 2 条」，上下文整段丢失。
                     note = (f"已转交给 {call.name} 执行，结果由它直接回复用户。"
-                            + (f"（{result[:200]}）" if result else ""))
+                            + (f"（{out[:200]}）" if out else ""))
                     tool_msg = tool_message(call.id or "delegated", note,
                                             name=call.name)
                     history.append(tool_msg)
                     self.store.append(session.id, tool_msg)
+                if not sent:
+                    # ⚠️ 走到这里说明「命令什么都没发」：可能是它返回空串、
+                    # 也可能是模型把话写在正文里同时调了工具（那几句正文不能丢）。
+                    # 无论如何**不能留空** —— 用户会以为机器人死了
+                    # （线上 s0025 三条都是这个：命令返回空 → 一个字都没回）。
+                    fallback = str(text or "").strip()
+                    if not fallback:
+                        names = "、".join(c.name for c in delegated)
+                        fallback = (f"（已交给 {names} 处理，但它这次没有返回内容；"
+                                    f"可以再试一次，或直接用命令查看）")
+                    await self._send(target, MessageChain().text(fallback))
                 return _DELEGATED, usage
 
             # ---- 执行工具 ----
@@ -3080,6 +3499,12 @@ class AiChatPlugin(PluginBase):
         self._multi_user[session.id] = (session.message_count, multi)
         return multi
 
+    #: 「本轮命令自己发过消息」的旗子（每轮 `_run_turn` 重置）。类属性兜底，
+    #: 直接 `__new__` 出来的实例（测试/脚本）也能安全读取。
+    _skill_sent: dict = {}
+    #: 最近一次引用到的全文（`message_id → 文本`），见 `_remember_quoted_text`
+    _quoted_full: dict = {}
+
     def _tool_context(self, target: ChatTarget, session: Session,
                       meta: dict) -> ToolContext:
         """组装工具上下文。
@@ -3109,8 +3534,13 @@ class AiChatPlugin(PluginBase):
             store=self.store, api=self.api, cfg=self.config,
             extras={"send": lambda text: self._send(
                         target, MessageChain().text(str(text))),
+                    # ⚠️ 直接传 `self._skill_sent`，不要写 `or {}`：空 dict 是假值，
+                    # `or {}` 会**每次新建一个**，旗子就永远传不出来（实测就这么
+                    # 漏了一次：链式结果发了，兜底还照样补一句）。
                     "run_skill": lambda skill, args: self._run_skill_command(
-                        skill, args, target, meta),
+                        skill, args, target, meta, self._skill_sent),
+                    #: 本轮「命令自己发过消息」的小旗子（委派分支据此决定要不要兜底）
+                    "skill_sent": self._skill_sent,
                     "max_mute_seconds": int(self.cfg["tools"]["max_mute_seconds"]),
                     "group_id": target.chat_id if target.is_group else None,
                     # 联网搜索：客户端与正文上限都从上下文传，工具模块不持有它们
@@ -3493,6 +3923,7 @@ class AiChatPlugin(PluginBase):
                                summaries=summaries,
                                chunk_max_chars=int(self.cfg["reply"]["chunk_max_chars"]))
 
+
         @self.register_command(f"{A}.hget", schema=S.HGetSchema, permission="",
                                scope="all",
                                description="把某一条历史问答渲染成图片（一次一条）")
@@ -3540,10 +3971,12 @@ class AiChatPlugin(PluginBase):
             # ⚠️ 先渲染完，**再**发文字头。
             # 反过来的话，渲染失败时用户已经收到一句「🖼 第 3 对」然后什么都不来 ——
             # 一个没有下文的头比一句错误更让人困惑（实测踩过）。
+            # 这一问附带、且**本地还在**的图片：跟着卡片一起画出来
+            media = self._exchange_media(messages, picked)
             try:
                 path = await self.renderer.render(
                     picked, session_name=session.name, total=len(exchanges),
-                    context=context)
+                    context=context, media=media)
             except RenderError as e:
                 raise CommandExecutionError(f"渲染历史图片失败：{e}") from None
             except Exception as e:  # noqa: BLE001 - 渲染是外部进程，什么都可能

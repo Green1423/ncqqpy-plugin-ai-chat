@@ -166,6 +166,8 @@ class MediaStore:
     max_bytes: int = 4 * 1024 * 1024
     max_side: int = 1568
     #: 落盘口径：`keep_files` 张之后按时间清理（跟 webimg 一个策略）
+    #: 单张图片压缩目标（字节）：超过就降质/缩边重来（见 `_shrink_image`）
+    max_image_bytes: int = 700_000
     keep_files: int = 200
 
     def __post_init__(self) -> None:
@@ -178,7 +180,7 @@ class MediaStore:
     # ---- 下载 ----
 
     async def fetch(self, url: str, kind: str, *, num: int = 0,
-                    session=None) -> MediaItem:
+                    session=None, max_side: Optional[int] = None) -> MediaItem:
         """下载一个媒体并落盘（图片会缩放）。失败返回 `ok=False` 的物件。"""
         item = MediaItem(kind=kind, num=int(num), source=str(url or ""))
         if not url:
@@ -209,7 +211,8 @@ class MediaStore:
                 return item
         data, ext = raw, ""
         if kind == "image":
-            data, ext, mime = self._shrink_image(raw, mime)
+            data, ext, mime = self._shrink_image(
+                raw, mime, max_side=max_side)
             if data is None:
                 item.ok, item.note = False, "图片解码失败"
                 return item
@@ -319,7 +322,8 @@ class MediaStore:
                 except OSError:
                     pass
 
-    def _shrink_image(self, raw: bytes, mime: str) -> tuple[Optional[bytes], str, str]:
+    def _shrink_image(self, raw: bytes, mime: str, *,
+                      max_side: Optional[int] = None) -> tuple[Optional[bytes], str, str]:
         """缩到 `max_side` 以内并转 JPEG —— 多模态接口对尺寸/体积都很敏感。
 
         没有 PIL 时原样返回（宁可大一点，也别丢功能）。
@@ -335,14 +339,27 @@ class MediaStore:
             return None, "", ""
         if img.mode not in ("RGB", "L"):
             img = img.convert("RGB")
-        side = int(self.max_side)
+        side = int(max_side or self.max_side)
         if side > 0 and max(img.size) > side:
             ratio = side / float(max(img.size))
             img = img.resize((max(1, int(img.width * ratio)),
                               max(1, int(img.height * ratio))))
-        out = io.BytesIO()
-        img.convert("RGB").save(out, format="JPEG", quality=88)
-        return out.getvalue(), ".jpg", "image/jpeg"
+        # 自适应压缩：单张超过 `target` 就降质/缩边重来（最多 3 轮）。
+        # 为什么必须做：请求里图片是 base64 内联的，单张 1.2MB 的扫描页三张就
+        # 能顶到 **413 request body too large**（上游直接拒，整轮失败）。
+        target = int(getattr(self, "max_image_bytes", 700_000))
+        data = b""
+        for attempt in range(3):
+            out = io.BytesIO()
+            quality = 88 - attempt * 12          # 88 → 76 → 64
+            img.convert("RGB").save(out, format="JPEG", quality=quality)
+            data = out.getvalue()
+            if len(data) <= target:
+                break
+            if attempt < 2:                      # 还太大 → 再缩 20%
+                img = img.resize((max(1, int(img.width * 0.8)),
+                                  max(1, int(img.height * 0.8))))
+        return data, ".jpg", "image/jpeg"
 
     # ---- 缓存目录 ----
 
