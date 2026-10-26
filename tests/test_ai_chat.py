@@ -2151,6 +2151,49 @@ async def test_sent_log_groups_multipart(h: Harness):
     check("不同目标不混", log2.block(1)["text"] == "A", log2.block(1)["text"])
 
 
+async def test_images_then_text_with_markers(h: Harness):
+    """图片一张一张先发（**每张带标号**），正文最后发且标号在**原位**。
+
+    用户要求：多图分张提供、标好号 → 再给文本（标号在原位）→ 让模型作答。
+    """
+    print("\n[19.48] 图逐张带标号在前、正文标号原位在后")
+    from napcat.api import SentLog
+    session = await establish(h)
+    png = TMP_DIR / "mt.png"
+    from PIL import Image
+    Image.new("RGB", (10, 10), (4, 4, 4)).save(png)
+
+    async def fake(url):
+        return png.read_bytes()
+
+    h.plugin.media._download = fake
+    from plugins.ai_chat.capability import CapabilityCache as _CC
+    key = _CC.key(getattr(h.plugin.llm, "base_url", ""),
+                  getattr(h.plugin.llm, "model", ""))
+    h.plugin.capabilities.put(key, "image", state="yes")
+
+    log = SentLog("")
+    log.remember("send_private_msg",
+                 {"user_id": str(ALICE),
+                  "message": [{"type": "image", "data": {"url": f"http://x/{i}.png"}}
+                              for i in (1, 2)]},
+                 {"message_id": 940081})
+    h.plugin.client.api.sent_log = log
+    h.clear()
+    await h.private("这几页讲的什么//", with_reply=940081, settle=2.2)
+    await h.wait_reply()
+    parts = [m for m in h.llm.requests[-1]["messages"]
+             if m.get("role") == "user"][-1]["content"]
+    kinds = [p["type"] for p in parts]
+    texts = [p["text"] for p in parts if p["type"] == "text"]
+    check("顺序：说明 → 标号/图 → 正文",
+          kinds[:3] == ["text", "text", "image_url"] and kinds[-1] == "text",
+          f"{kinds}")
+    check("先说明包含几张", "包含的图片" in texts[0], texts[0][:60])
+    check("每张图前有标号", texts[1] == "[图#1]", texts[1])
+    check("正文里标号在原位", "[图#1]" in texts[-1], texts[-1][:120])
+
+
 async def test_interpret_not_delegated(h: Harness):
     """用户要**解读**时，工具层的硬拦：引文里的「请查询」不算任务。
 
