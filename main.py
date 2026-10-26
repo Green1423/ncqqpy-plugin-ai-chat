@@ -1695,7 +1695,13 @@ class AiChatPlugin(PluginBase):
             # 没有会话就是 None —— 那就退回贴原文，行为与以前一致。
             session = self._session_for(target, event)
             text, media = await self._extract_text_async(event, session)
-            if not text.strip() and not media:
+            # 这条消息**自己**带的媒体（语音/图片段）：`media` 只表示「引用的那条
+            # 是不是多媒体」，光看它会把「只发了一条语音」当成空消息丢掉 ——
+            # 线上表现就是「发语音没反应」（语音根本没进暂存区）。
+            has_segments = isinstance(event.message, list) and any(
+                isinstance(seg, dict) and seg.get("type") in ("record", "image")
+                for seg in event.message)
+            if not text.strip() and not media and not has_segments:
                 return
             if trigger["ignore_command_messages"] and self._is_command_text(text):
                 # 命令系统自己会处理（群里还要求 @，这里的判据与它一致）
@@ -1718,6 +1724,11 @@ class AiChatPlugin(PluginBase):
             # 到达时就落地编号。图片不在这里下载：按规则，图片必须由用户
             # `/aichat mark` 显式标记（见 `_do_mark`）—— 见 `docs/.../17-multimodal.md`。
             picked: list = []
+            # 用户**自己写**了字没有：`_extract_text` 会给纯语音/纯图片补上
+            # `[语音]`、`（含一张图片）` 这类说明，所以要先把这些标记剥掉再判 ——
+            # 否则「只发一条语音」会被当成「用户说了话」，永远不自动提交。
+            typed, has_record = self._typed_and_record(event)
+            user_said = typed
             media_items = await self._ingest_media(event, session)
             # 「发的这张图」和「问的问题」是同一件事 —— 默认交给模型；
             # 只有**历史里的**图才需要 `/aichat mark`（否则用户每次都得先标记，
@@ -1736,6 +1747,10 @@ class AiChatPlugin(PluginBase):
                     elif getattr(m, "transcript", ""):
                         # 转写成功：标号后面直接跟文字，模型不用再去"听"
                         marks.append(f"{m.marker()} {m.transcript}")
+                    elif m.kind == "record" and getattr(m, "note", ""):
+                        # 语音落地了但没转成文字：把**原因**写进正文 ——
+                        # 否则用户只看到「[语音#1]」，不知道卡在哪（线上只能靠猜）
+                        marks.append(f"{m.marker()}（没转成文字：{m.note[:60]}）")
                     else:
                         marks.append(m.marker())
                 if marks:
@@ -1778,6 +1793,16 @@ class AiChatPlugin(PluginBase):
 
             self._stage(target, event, body, explicit_finish=finished, media=media,
                         md=md_mode, media_items=media_items, media_pick=picked)
+            # ★ 一条**语音就是一次对话**：用户不用再发结束符（他的要求）。
+            #   语音已经转成文字进正文了，直接当「已说完」提交；
+            #   同一条消息里还带了文字的话，仍按普通分段逻辑等他收尾。
+            has_voice = has_record or any(
+                getattr(m, "kind", "") == "record" for m in media_items)
+            if has_voice and not user_said:
+                if self.cfg.get("log_verbose"):
+                    self.logger.info("[ai_chat] 语音单独成轮：跳过结束符直接提交")
+                self._schedule_submit(target)
+                return
         finally:
             self._end_ingest(ingest_key)
 
@@ -1817,6 +1842,35 @@ class AiChatPlugin(PluginBase):
     _QUOTE_LABEL_MAX = 10
 
     # ---------------- 多模态 ----------------
+
+    @staticmethod
+    def _typed_and_record(event: MessageEvent) -> tuple[bool, bool]:
+        """`(用户自己打了字吗, 这条消息里有语音段吗)`。
+
+        只认 `text` 段的实际内容：`[语音]`、`（含一张图片）` 这类是**我们补的**
+        说明，不能当成「用户说了话」—— 否则「只发一条语音」永远等不到结束符。
+        """
+        typed = False
+        record = False
+        segs = getattr(event, "message", None)
+        if isinstance(segs, list):
+            for seg in segs:
+                if not isinstance(seg, dict):
+                    continue
+                if str(seg.get("type")) == "record":
+                    record = True
+                elif str(seg.get("type")) == "text":
+                    if str((seg.get("data") or {}).get("text") or "").strip():
+                        typed = True
+        return typed, record
+
+    @staticmethod
+    def _without_media_notes(text: str) -> str:
+        """去掉媒体说明/标号后剩下的「用户自己写的字」。"""
+        import re as _re
+        body = _re.sub(r"\[[^\]]{0,12}\]", "", str(text or ""))
+        body = _re.sub(r"（[^）]{0,60}）", "", body)
+        return body.strip()
 
     async def _ingest_media(self, event: MessageEvent,
                             session: Optional[Session] = None) -> list:
@@ -1860,6 +1914,27 @@ class AiChatPlugin(PluginBase):
                 num = int(meta.get("media_seq") or 0) + 1
                 meta["media_seq"] = num
                 self.store.touch(session.id)      # 编号也要落盘
+            # ★ 语音优先**用消息 id 直接转写**（NapCat 的 /fetch_ptt_text）：
+            #   线上大量语音下载回来不是合法音频（`ffmpeg 转码失败：Invalid data`），
+            #   一旦卡在下载/转码，转写永远轮不到。接口只要 id，成功就不必下载。
+            if kind == "record" and self.asr is not None \
+                    and self.asr.opt.resolved_engine() == "api":
+                if self.media is not None and num == 0 and session is not None:
+                    meta = session.meta if isinstance(session.meta, dict) else {}
+                    num = int(meta.get("media_seq") or 0) + 1
+                    meta["media_seq"] = num
+                    self.store.touch(session.id)
+                early, _err = await self.asr.transcribe_by_message(
+                    int(getattr(event, "message_id", 0) or 0))
+                if early:
+                    quick = MediaItem(kind="record", num=num, path="",
+                                      mime="audio/silk", size=0, ok=True)
+                    quick.transcript = early
+                    items.append(quick)
+                    if self.cfg.get("log_verbose"):
+                        self.logger.info("[ai_chat] 语音由消息 id 直接转写：%s",
+                                         early[:60])
+                    continue
             item = await self.media.fetch(url, kind, num=num, session=session)
             if item.ok and kind == "record":
                 # **默认转给 AI**：语音先转成文字，正文里直接带上内容 ——
@@ -1875,8 +1950,14 @@ class AiChatPlugin(PluginBase):
                                      (text or err)[:80])
                 if text:
                     item.transcript = text
-                elif err and err != "没有配置语音转写引擎":
-                    item.transcript = f"（转写失败：{err}）"
+                elif err:
+                    # 原因记在 `note` 上：正文里显示「（没转成文字：…）」；
+                    # 下载/转码也失败时，两边原因都要给出来（只报全 ffmpeg 的错，
+                    # 就看不到「转写接口为什么失败」——线上排查吃过这个亏）
+                    note = str(err)
+                    if not item.ok and item.note:
+                        note = f"{note}；下载/转码也失败：{item.note}"
+                    item.note = note[:200]
             items.append(item)
             if not item.ok and self.cfg.get("log_verbose"):
                 self.logger.info("[ai_chat] 媒体落地失败（%s #%s）：%s",
@@ -4214,7 +4295,9 @@ class AiChatPlugin(PluginBase):
         async def cmd_asr(packet):
             msg = await self.asr.self_check()
             return (f"🎧 语音转写：{msg}\n"
-                    f"配置在 plugins.ai_chat.asr（command=本地引擎 / url=网关转写）")
+                    f"配置在 plugins.ai_chat.asr：engine=api（NapCat 的 "
+                    f"/fetch_ptt_text，默认）/ cmd / http；"
+                    f"api 不通时可退回 command 或 url")
 
         @self.register_command(f"{A}.mark", schema=S.MarkSchema, permission="",
                                scope="all",

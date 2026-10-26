@@ -42,8 +42,6 @@ class AsrOptions:
     url: str = ""
     model: str = ""
     api_key: str = ""
-    #: 走 `/fetch_ptt_text` 时传什么：`auto`（有 file 传 file）/ `file` / `message_id`
-    api_mode: str = "auto"
     #: 单条语音的转写上限（秒）与结果上限（字）
     timeout: float = 60.0
     max_chars: int = 600
@@ -64,7 +62,6 @@ class AsrOptions:
             model=str(c.get("model") or "").strip(),
             api_key=str(c.get("api_key") or "").strip(),
             timeout=_f("timeout", 60.0),
-            api_mode=str(c.get("api_mode") or "auto").strip().lower(),
             max_chars=int(c.get("max_chars") or 600),
         )
 
@@ -165,40 +162,37 @@ class Transcriber:
         return lines[-1] if lines else ""
 
     async def _run_api(self, path: str) -> tuple[str, str]:
-        """走 NapCat 自带的 `/fetch_ptt_text`（服务端语音转文字）。
+        """走 NapCat 的 `/fetch_ptt_text`（消息扩展：获取语音转文字结果）。
 
-        为什么优先用它：不用另外装模型/跑 ffmpeg 推理，时效也好 ——
-        NapCat 收到语音时就转过了。参数按 `api_mode` 决定：
+        接口定义（NapCat 消息扩展）是**只认 `message_id`**：
 
-        * `file`：传本地文件路径（我们下载下来的 amr/silk）；
-        * `message_id`：传原始消息 id（服务端自己取那条语音）；
-        * `auto`：两者都带上，服务端认哪个用哪个。
+        ```text
+        POST /fetch_ptt_text
+        { "message_id": 123456 }            # 必填，number 或 string
+        → { status: "ok", retcode: 0, data: { text: "hello" } }
+        ```
+
+        所以这里**只传 message_id**（早先还拼了个 `file`，那不是这个接口的参数，
+        服务端直接 1400「请求参数错误」，表现为语音永远转不出来）。
+        `path` 只在没有 message_id 时用来报一句更准的原因。
         """
         api = self.api
         if api is None:
             return "", "没有 API 客户端（api 引擎不可用）"
-        # ⚠️ 默认**只传 `message_id`**：服务端的 `file` 指的是它自己的文件名，
-        # 传本地路径（`/data/media/...amr`）大概率被拒；id 才是它认识的引用。
-        # 没有 id 时才退回文件，`api_mode` 可以强制/两者都传。
-        mode = str(self.opt.api_mode or "auto").lower()
-        params: dict = {}
-        if mode in ("auto", "message_id") and self.message_id:
-            params["message_id"] = int(self.message_id)
-        if mode in ("file", "both") and path:
-            params["file"] = path
-        if not params and path:
-            params["file"] = path
-        if not params:
-            return "", "缺少语音文件/消息 id"
+        mid = int(self.message_id or 0)
+        if not mid:
+            return "", ("没有 message_id（/fetch_ptt_text 只认消息 id）"
+                        + ("；只有本地文件：" + path if path else ""))
         try:
-            data = await api._call("fetch_ptt_text", params)
+            data = await api._call("fetch_ptt_text", {"message_id": mid})
         except Exception as e:  # noqa: BLE001 - 接口不可用就退回别的引擎
             if self.logger:
-                self.logger.warning("[ai_chat] /fetch_ptt_text 失败（params=%s）：%s",
-                                    list(params), e)
+                self.logger.warning(
+                    "[ai_chat] /fetch_ptt_text 失败（message_id=%s）：%s", mid, e)
             return "", f"/fetch_ptt_text 调用失败：{e}"
         text = ""
         if isinstance(data, dict):
+            # 正常是 `{"text": ...}`；有的实现直接回字符串（`_call` 已经取过 data）
             for key in ("text", "transcription", "result", "msg"):
                 if data.get(key):
                     text = str(data[key])
@@ -206,11 +200,15 @@ class Transcriber:
         elif isinstance(data, str):
             text = data
         text = " ".join(str(text or "").split())
+        if self.logger:
+            # 成功也记一行：线上排查「语音没反应」时，这里能直接看到接口回了什么
+            self.logger.info("[ai_chat] /fetch_ptt_text(message_id=%s) → %r",
+                             mid, (text or str(data))[:120])
         if not text:
             if self.logger:
                 self.logger.info("[ai_chat] /fetch_ptt_text 返回里没有文字：%r",
                                  str(data)[:200])
-            return "", "/fetch_ptt_text 没有返回文字"
+            return "", "/fetch_ptt_text 没有返回文字（语音可能太短或未识别）"
         return text[: self.opt.max_chars], ""
 
     async def _run_http(self, path: str) -> str:
@@ -242,6 +240,36 @@ class Transcriber:
 
     # ---- 自检（配好之后先跑一下，别等群里发语音才发现引擎坏了）----
 
+    async def transcribe_by_message(self, message_id: int) -> tuple[str, str]:
+        """**不下载、不转码**，直接用消息 id 让 NapCat 转写。
+
+        为什么需要：线上语音下载回来的字节常常不是合法音频
+        （`ffmpeg 转码失败：Error opening input: Invalid data`），一旦卡在
+        下载/转码，转写就永远轮不到。这个接口只要 `message_id` —— 先走它，
+        成功了连下载都可以省掉。
+        """
+        mid = int(message_id or 0)
+        if not mid:
+            return "", "没有 message_id"
+        self.message_id = mid
+        # ★ 重试：刚收到的语音，服务端可能**还没转完**（线上第一次就回
+        #   `[1200] 获取语音转文字结果失败`，再等几百毫秒到几秒往往就能出）。
+        #   1200/1404/「没有返回文字」都值得再试；其它错误立刻返回。
+        delays = (0.0, 1.2, 2.5, 4.0)
+        last = ("", "未尝试")
+        for i, wait in enumerate(delays):
+            if wait:
+                await asyncio.sleep(wait)
+            text, err = await self._run_api("")
+            if text:
+                return text, ""
+            last = (text, err)
+            if err and not any(code in err for code in ("1200", "1404", "没有返回文字")):
+                break
+            if self.logger and i + 1 < len(delays):
+                self.logger.info("[ai_chat] 语音转写重试（第 %d 次）：%s", i + 1, err)
+        return last
+
     async def self_check(self) -> str:
         """用 1 秒静音跑一遍，返回人话结论。"""
         eng = self.opt.resolved_engine()
@@ -249,6 +277,32 @@ class Transcriber:
             return ("未配置：`asr.engine=api`（NapCat 的 /fetch_ptt_text）或 "
                     "`asr.command` / `asr.url` 至少有一个可用。"
                     "填好后语音会自动转成文字交给模型。")
+        if eng == "api":
+            # `api` 引擎没法用静音样本自检（接口只认真实语音的 message_id），
+            # 所以改成「用无效 id 探一下动作存不存在」：
+            #   1404 资源不存在 → 动作在、只是这条语音没有 → 可用
+            #   1400 参数错     → 动作在、参数被拒 → 也说明能通到业务逻辑
+            #   其它/连不上     → 不可用，原样报出来
+            api = self.api
+            if api is None:
+                return "api 引擎不可用：没有 API 客户端（插件未拿到 api）"
+            try:
+                got = await api._call("fetch_ptt_text", {"message_id": 1})
+            except Exception as e:  # noqa: BLE001 - 自检不该抛
+                msg = str(e)
+                if "1404" in msg or "资源不存在" in msg:
+                    return ("api 引擎可用：`/fetch_ptt_text` 接口在"
+                            "（用无效 id 探测，返回「资源不存在」—— 真实语音会带各自的 id）")
+                if "1400" in msg:
+                    return ("api 引擎基本可用：接口在，但参数被拒 —— "
+                            f"{msg[:120]}（真实语音到时会传它自己的 message_id）")
+                return f"api 引擎不可用：{msg[:160]}"
+            text = ""
+            if isinstance(got, dict):
+                text = str(got.get("text") or "")
+            return (f"api 引擎可用（探测 id 居然转出了 {text!r}）"
+                    if text else "api 引擎可用（探测 id 返回空文本）")
+
         fd, path = tempfile.mkstemp(suffix=".wav")
         try:
             with os.fdopen(fd, "wb") as f:

@@ -2264,6 +2264,63 @@ async def test_invited_guest_hint(h: Harness):
     check("attach 后能正常对话", any("收到" in t for t in texts), f"{texts}")
 
 
+async def test_voice_asr_retries_hot_failure(h: Harness):
+    """刚到的语音服务端可能还没转完（线上见过 `[1200]`）→ 要重试几次。
+
+    线上：第一次调 `/fetch_ptt_text` 回 `[1200] 获取语音转文字结果失败`，
+    等一两秒再调就成功了。所以这里验证「失败会重试、成功即返回」。
+    """
+    print("\n[19.54] 语音转写对 1200 重试")
+    await establish(h)
+    n = {"count": 0}
+
+    async def flaky(action, params=None):
+        if action != "fetch_ptt_text":
+            return None
+        n["count"] += 1
+        if n["count"] < 3:
+            raise RuntimeError("[1200] 获取语音转文字结果失败")
+        return {"text": "重试之后拿到了"}
+    h.plugin.asr.api = type("A", (), {"_call": staticmethod(flaky)})()
+    text, err = await h.plugin.asr.transcribe_by_message(4242)
+    check("最终拿到文字", text == "重试之后拿到了", f"{text!r} / {err!r}")
+    check("确实重试了（3 次）", n["count"] == 3, f"{n['count']} 次")
+
+
+async def test_voice_is_a_turn_without_terminator(h: Harness):
+    """一条语音 = 一次对话：不用发结束符就提交（用户明确要求）。"""
+    print("\n[19.53] 单条语音自动成轮（不需要结束符）")
+    import subprocess
+    await establish(h)
+    wav = str(TMP_DIR / "one.wav")
+    subprocess.run(["ffmpeg", "-y", "-f", "lavfi", "-i", "anullsrc=r=8000:cl=mono",
+                    "-t", "0.4", wav], capture_output=True)
+    raw = open(wav, "rb").read()
+
+    async def fake_dl(url):
+        return raw
+    h.plugin.media._download = fake_dl
+    orig = h.plugin.api._call
+
+    async def routed(action, params=None):
+        if action == "fetch_ptt_text":
+            return {"text": "帮我查下最近的通知"}
+        return await orig(action, params)
+    h.plugin.api._call = routed
+
+    payload = h._msg_payload("private", "", user_id=ALICE)
+    payload["message"] = [{"type": "record", "data": {"url": "http://x/a.amr"}}]
+    h.clear()
+    await h._send_raw(payload, 2.8)
+    texts = [reply_text(r) for r in h.replies if reply_text(r).strip()]
+    check("没发结束符也有回复", bool(texts), f"{texts}")
+    seen = h.llm.last_user_content() if h.llm.requests else ""
+    check("模型收到语音转写的内容", "查下最近的通知" in seen, seen[:120])
+    check("暂存区已清空",
+          not (h.plugin.buffer.peek(f"private:{ALICE}").get("items") or []),
+          f"{h.plugin.buffer.peek(f'private:{ALICE}')}")
+
+
 async def test_voice_via_fetch_ptt_text(h: Harness):
     """语音走 NapCat 的 `/fetch_ptt_text`：转成文字进正文，模型据此作答。
 
@@ -2300,9 +2357,10 @@ async def test_voice_via_fetch_ptt_text(h: Harness):
     await h.wait_reply()
     seen = h.llm.last_user_content()
     check("调用了 fetch_ptt_text", bool(calls), f"{calls}")
-    check("默认只传 message_id",
-          calls and "message_id" in calls[0][1] and "file" not in calls[0][1],
-          f"{calls}")
+    # NapCat 的消息扩展 `/fetch_ptt_text` **只认 message_id**（没有 file 参数）
+    check("参数与文档一致（只有 message_id）",
+          calls and list(calls[0][1]) == ["message_id"]
+          and int(calls[0][1]["message_id"]) > 0, f"{calls}")
     check("转写文字进了正文", "明天的课表" in seen, seen[:120])
 
 
@@ -2387,12 +2445,15 @@ async def test_voice_transcribed(h: Harness):
     base2 = h._msg_payload("private", "", user_id=ALICE, message_id=515152)
     base2["message"] = [{"type": "record",
                          "data": {"url": "http://x/w.wav", "file": "w.wav"}}]
-    await h._send_raw(base2, settle=1.0)
-    await h.private("那这个呢？//", settle=1.4)
+    # 语音现在**自己成轮**（不需要结束符），失败也照样提交
+    await h._send_raw(base2, settle=2.4)
     await h.wait_reply()
     seen2 = h.llm.last_user_content()
-    check("转写失败也照样提交", "那这个呢" in seen2, seen2[:160])
-    check("失败原因写在标号后面", "转写失败" in seen2, seen2[:200])
+    check("转写失败也照样提交", "[语音#2]" in seen2, seen2[:160])
+    # 措辞从「（转写失败：…）」改成「（没转成文字：…）」：原因写在标号后面，
+    # 别拿一句括号冒充「转写结果」，但用户/模型都要能看出卡在哪
+    check("失败原因写在标号后面",
+          "没转成文字" in seen2 or "转写失败" in seen2, seen2[:200])
 
 
 async def test_media_gating(h: Harness):
@@ -5217,7 +5278,9 @@ async def main():
         test_no_deferred_relative_imports, test_no_coupling_with_other_plugins,
         test_binding_allowlist, test_binding_group_vs_private, test_binding_cooldown,
         test_private_binding_bootstrap, test_unbound_is_silent,
-        test_unified_help, test_voice_via_fetch_ptt_text,
+        test_unified_help, test_voice_asr_retries_hot_failure,
+        test_voice_is_a_turn_without_terminator,
+        test_voice_via_fetch_ptt_text,
         test_invited_guest_hint,
         test_multi_round_image_read,
         test_delegated_never_silent, test_quote_only_message_gets_full_text, test_quoted_all_page_images, test_sent_log_groups_multipart, test_images_then_text_with_markers, test_interpret_not_delegated
