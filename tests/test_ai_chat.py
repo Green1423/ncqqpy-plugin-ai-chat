@@ -4571,12 +4571,18 @@ async def test_binding_allowlist(h: Harness):
     for target, uid, label in [
         (ChatTarget("group", GROUP), ALICE, "群"),
         (ChatTarget("private", ALICE), ALICE, "私聊"),
-        (ChatTarget("group", GROUP), SUPERUSER, "超级用户在群"),
-        (ChatTarget("private", SUPERUSER), SUPERUSER, "超级用户私聊"),
     ]:
         ok, why = plugin.check_access(target, uid)
         check(f"空名单拒绝：{label}", not ok, f"allow={ok}")
         check(f"空名单的说明提到 binding：{label}", "binding" in why, why[:80])
+
+    # 超级用户豁免：名单为空时也要进得去，否则连第一条都开不出来
+    for target, uid, label in [
+        (ChatTarget("group", GROUP), SUPERUSER, "超级用户在群"),
+        (ChatTarget("private", SUPERUSER), SUPERUSER, "超级用户私聊"),
+    ]:
+        ok, _why = plugin.check_access(target, uid)
+        check(f"超级用户豁免：{label}", ok, "应当放行")
 
     # ---- 配好白名单 ----
     restore_bound()
@@ -4595,9 +4601,9 @@ async def test_binding_allowlist(h: Harness):
         ok, why = plugin.check_access(target, uid)
         check(f"{label}", ok == want, f"allow={ok} want={want} why={why[:60]}")
 
-    # ---- 与权限等级无关：超级用户也不能越界 ----
+    # ---- 超级用户豁免（与其它插件同口径）----
     ok, why = plugin.check_access(ChatTarget("group", 99999), SUPERUSER)
-    check("超级用户在未绑定的群里也用不了", not ok, f"allow={ok}")
+    check("超级用户豁免：未绑定的群也能用", ok, f"allow={ok}")
     # 小窗地址（private + 来源群）：授权与否看**这个小窗的主人**，
     # 而不是发消息的人 —— 否则群里任何人都能借别人的小窗地址越权。
     ok, why = plugin.check_access(ChatTarget("private", BOB, GROUP), BOB)
@@ -4651,15 +4657,13 @@ async def test_binding_allowlist(h: Harness):
     check("未绑群的命令被回绝", any("没有开通" in t for t in texts), f"{texts}")
     check("回绝不泄露命令内容", not any("ai_chat ——" in t for t in texts), f"{texts}")
 
-    # ---- 群白名单没配时，回落到框架的 bound_groups ----
+    # ---- 群白名单没配时**不**回落到框架的 bound_groups ----
     saved_groups = plugin.cfg["binding"]["groups"]
     try:
         plugin.cfg["binding"]["groups"] = []
         ok, _ = plugin.check_access(ChatTarget("group", GROUP), ALICE)
-        check("binding.groups 未配时复用框架 bound_groups", ok,
-              "应当放行（框架已绑该群）")
-        ok, _ = plugin.check_access(ChatTarget("group", 99999), ALICE)
-        check("复用兜底同样拦未绑群", not ok, "应当拒绝")
+        check("binding.groups 未配时不回落框架 bound_groups（空 = 一个都不许）",
+              not ok, "应当拒绝")
     finally:
         plugin.cfg["binding"]["groups"] = saved_groups
 
@@ -4676,14 +4680,14 @@ async def test_binding_allowlist(h: Harness):
     check("已绑群正常服务", bool(h.replies) and h.llm.calls == 1,
           f"replies={len(h.replies)} calls={h.llm.calls}")
 
-    # ---- empty_means=allow：空名单 = 不限制（显式选择才生效）----
+    # ---- 不再有 empty_means 开关：写了也不生效，空名单就是谁都不用 ----
     h.client.groups.clear()
     plugin.cfg["binding"] = {"groups": [], "users": [], "empty_means": "allow",
                              "notify_denied": True, "notify_cooldown": 0}
     ok, _ = plugin.check_access(ChatTarget("group", 99999), ALICE)
-    check("empty_means=allow 时不再拦", ok, "应当放行")
+    check("没有 empty_means=allow 这种开关（空名单照旧拒绝）", not ok, "应当拒绝")
     ok, _ = plugin.check_access(ChatTarget("private", BOB), BOB)
-    check("empty_means=allow 对私聊同样放行", ok, "应当放行")
+    check("私聊也照旧拒绝", not ok, "应当拒绝")
     restore_bound()
 
 
@@ -4899,10 +4903,12 @@ async def test_private_binding_bootstrap(h: Harness):
         plugin.config.set("binding.users", [])
         plugin._denied_notice.clear()
 
-        # 死锁现场：私聊不可用
+        # 死锁现场：普通用户私聊不可用；超管靠豁免能进来开第一条
         ChatTarget = plugin_module("store").ChatTarget
+        ok, _ = plugin.check_access(ChatTarget("private", ALICE), ALICE)
+        check("私聊白名单为空时普通用户被拒", not ok, "本该被拒")
         ok, _ = plugin.check_access(ChatTarget("private", SUPERUSER), SUPERUSER)
-        check("私聊白名单为空时确实用不了", not ok, "本该被拒")
+        check("私聊白名单为空时超管仍可用（豁免，防死锁）", ok, "本该放行")
 
         # 但 bind 必须能执行（不受服务范围限制）
         h.clear()

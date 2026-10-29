@@ -9,10 +9,9 @@
     "ai_chat": {
       "enabled": true,
       "binding": {                       // 服务范围：只服务列在这里的群/私聊（见第二节）
-        "groups": [100000003],           // 留空则回落到顶层 bound_groups
+        "groups": [100000003],           // 留空 = 一个群都不许（不回落 bound_groups）
         "users": [10000001],             // 私聊白名单（框架不管私聊）
                                          // 群开通 = 全群可用；群里每人各有自己的会话
-        "empty_means": "deny",           // 名单为空：deny=谁都不用 / allow=不限制
         "notify_denied": true,           // 回绝时是否回一句说明
         "notify_cooldown": 300           // 回绝提示冷却（秒）
       },

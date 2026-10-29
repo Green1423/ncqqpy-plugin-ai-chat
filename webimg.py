@@ -21,11 +21,12 @@ from __future__ import annotations
 
 import hashlib
 import os
-import shutil
 from typing import Optional
 
 from .plot import marker_for
 from .search import FetchBlocked, FetchTooLarge
+
+from napcat.persist import prune_keep
 
 #: 魔数 → 扩展名。**不看后缀**：`evil.png` 里可以是任何东西。
 _IMAGE_MAGIC: tuple[tuple[bytes, str], ...] = (
@@ -178,29 +179,8 @@ class WebImageService:
 
     def prune(self) -> None:
         """目录只留最近 `keep_files` 个文件（防止 SD 卡被慢慢写满）。"""
-        keep = max(1, int(self.cfg.get("keep_files") or 60))
-        out_dir = self._out_dir()
-        try:
-            entries = []
-            for name in os.listdir(out_dir):
-                path = os.path.join(out_dir, name)
-                if name.endswith(".part"):
-                    continue
-                try:
-                    entries.append((os.path.getmtime(path), path))
-                except OSError:
-                    continue
-            if len(entries) <= keep:
-                return
-            entries.sort(reverse=True)
-            for _mtime, path in entries[keep:]:
-                try:
-                    if os.path.isdir(path):
-                        shutil.rmtree(path, ignore_errors=True)
-                    else:
-                        os.remove(path)
-                except OSError:
-                    continue
-                self.rendered.discard(path)
-        except OSError:
-            return
+        removed = prune_keep(self._out_dir(),
+                             keep=int(self.cfg.get("keep_files") or 60),
+                             skip_suffix=(".part",))
+        for path in removed:
+            self.rendered.discard(path)

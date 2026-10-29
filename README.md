@@ -83,7 +83,6 @@ git clone https://github.com/Green1423/ncqqpy-plugin-ai-chat plugins/ai_chat
   "binding": {
     "groups": [],
     "users": [],
-    "empty_means": "deny",
     "notify_denied": false,
     "notify_cooldown": 300
   },

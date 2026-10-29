@@ -29,13 +29,13 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
+from napcat.persist import prune_keep
+
 from .history import Exchange, clean_quoted, split_quoted
 from .png import PAGE_PAD, crop_bottom_to_ink, crop_right_to_ink, crop_to_ink
 from .markdown import (FRAGMENT_WIDTHS, build_fragment_html,
-                       build_inline_math_html,
-                       build_markdown_html, build_math_html,
-                       build_table_html, katex_head, markdown_body_css,
-                       markdown_to_html)
+                       build_inline_math_html, build_markdown_html,
+                       katex_head, markdown_body_css, markdown_to_html)
 
 # ⚠️ Chromium 的**定位/启动/超时**统一由框架提供（`napcat.render`）：
 # 三个插件各写一份，任何一份改了另外两份都不会跟着改（实测已分叉）。
@@ -641,30 +641,7 @@ class HistoryRenderer:
 
     def prune(self) -> None:
         """图片目录只保留最近 `keep_files` 个文件（防止 SD 卡被慢慢写满）。"""
-        keep = max(1, int(self.opt.keep_files))
-        try:
-            entries = []
-            for name in os.listdir(self.out_dir):
-                path = os.path.join(self.out_dir, name)
-                if name.startswith("prof-"):
-                    continue
-                try:
-                    entries.append((os.path.getmtime(path), path))
-                except OSError:
-                    continue
-            if len(entries) <= keep:
-                return
-            entries.sort(reverse=True)
-            for _mtime, path in entries[keep:]:
-                try:
-                    if os.path.isdir(path):
-                        shutil.rmtree(path, ignore_errors=True)
-                    else:
-                        os.remove(path)
-                except OSError:
-                    pass
-        except OSError:
-            pass
+        prune_keep(self.out_dir, keep=self.opt.keep_files, skip_prefix=("prof-",))
 
 
 #: 框架版 `file_uri` 的本地别名（调用点保持原名，改动面最小）。

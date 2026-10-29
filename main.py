@@ -65,7 +65,7 @@ from .custom_tools import register_config_tools
 from .asr import AsrOptions, Transcriber
 from .capability import CapabilityCache, supports as capability_supports
 from .llm import LlmClient, err_text, resolve_secret
-from .media import KIND_LABELS, MediaItem, MediaStore, parse_markers
+from .media import MediaItem, MediaStore
 from .reasoning import (
     DIALECTS, LEVELS, VALIDATION_HINT, ReasoningPolicy, ReasoningSpec,
     override_text, spec_from_text,
@@ -94,6 +94,8 @@ from .tools import (ToolContext, ToolRegistry, register_builtin_tools,
                     register_web_tools)
 from .webimg import WebImageService
 from . import schemas as S
+
+from napcat.scope import Scope, parse_ids
 
 # ==================== 默认配置 ====================
 
@@ -190,7 +192,6 @@ DEFAULT_CONFIG: dict = {
     "binding": {
         "groups": [],          # 允许使用的群号
         "users": [],           # 允许使用的 QQ 号（私聊；群开通即全群可用，不按人）
-        "empty_means": "deny",  # groups/users 为空时的语义：deny=谁都不用 allow=不限制
         # 未开通的聊天**默认什么都不回**（连「未开通」也不提示）：
         # 服务范围是运维决策，不该在别人的群里制造一条机器人消息。
         # 调试期想看到回绝原因，把它改成 true（并用 notify_cooldown 限频）。
@@ -1340,57 +1341,54 @@ class AiChatPlugin(PluginBase):
                 continue          # 配置里写错的值忽略掉，不让一个笔误废掉整条白名单
         return out
 
+    def _scope(self) -> Scope:
+        """服务范围（口径见 `napcat.scope`）：只看 `binding`，空 = 谁都不用。"""
+        return Scope.of(self.cfg.get("binding"))
+
     def _bound_ids(self, key: str) -> set[int]:
-        return self._to_ids((self.cfg.get("binding") or {}).get(key))
+        return parse_ids((self.cfg.get("binding") or {}).get(key))
 
     def _bound_groups(self) -> set[int]:
-        """群白名单。
+        """群白名单 = `binding.groups`（空 = 一个都不许）。
 
-        优先用 `binding.groups`；没配就复用框架的 `bound_groups`。后者是
-        「机器人监听哪些群」（见 `GroupBinding`），**空列表 = 监听所有群**，
-        语义与白名单相反，所以只在它非空时借用来兜底 —— 免得为了同一件事
-        在两处维护两份群号，漏配一边就静默没有服务。
+        ⚠️ **不回落**框架的 `bound_groups`：那是「机器人监听哪些群」（为空 =
+        监听所有群），与「允许哪些群用本插件」语义正好相反 —— 拿它兜底等于
+        「机器人进了多少群，这个服务就在多少群里可用」。
         """
-        own = self._bound_ids("groups")
-        if own:
-            return own
-        try:
-            inherited = self._to_ids(self._groups.list_bound()
-                                     if self._groups is not None else [])
-        except Exception:  # noqa: BLE001
-            inherited = set()
-        return inherited          # 空 = 框架也没限定，交给 empty_means 决定
-
-    def _empty_means(self) -> str:
-        return str((self.cfg.get("binding") or {}).get("empty_means") or "deny").lower()
+        return self._bound_ids("groups")
 
     def check_access(self, target: ChatTarget, user_id: int) -> tuple[bool, str]:
         """这个聊天地址是否在服务范围内。返回 `(允许, 回绝原因)`。
 
-        **与权限等级无关**：不做 `is_superuser` 豁免 —— 服务范围是运维决策，
-        不是权限决策。超级用户在未绑定的群里同样用不了。
+        白名单口径与其它插件一致（见 `napcat.scope`）：只看本插件 `binding`，
+        空 = 谁都不用，不回落框架 `bound_groups`。
+
+        **超级用户豁免**：`bind` 命令本身只能在私聊由超管执行，不豁免就会
+        「名单配错 → 谁都改不了」。
 
         **群与私聊是两条独立通道**：群开通了就是全群可用（群里每人各有自己的
         会话，不需要按人授权）；私聊才是按人开通。两者互不影响 ——
         群开通不会自动开放私聊，反之亦然。
         """
+        cfg_hint = "config.json → plugins.ai_chat.binding"
+        if self.perm.is_superuser(int(user_id)):
+            return True, ""                  # 豁免：防止白名单把自己锁在外面
+        scope = self._scope()
         groups = self._bound_groups()
         users = self._bound_ids("users")
-        empty = self._empty_means()
-        cfg_hint = "config.json → plugins.ai_chat.binding"
 
         if target.is_group:
             # 注意：正常的 WS 投递路径上，框架的 `_on_ws_event()` 已经先按
             # `bound_groups` 把未绑群的群消息**整条丢弃**了（不会到插件）。
             # 这里再判一次是第二道闸：插件自己派发的事件、直接调 `cmds.handle()`
             # 的场景（测试、未来别的入口）同样要被拦住。
-            if not groups and empty == "deny":
+            if scope.group_ok(target.chat_id):
+                return True, ""
+            if not groups:
                 return False, (f"本群没有开通 AI 对话服务（{cfg_hint}.groups 为空）。"
                                "联系管理员把本群加入白名单。")
-            if groups and int(target.chat_id) not in groups:
-                return False, (f"本群（{target.chat_id}）没有开通 AI 对话服务。"
-                               f"联系管理员把它加到 {cfg_hint}.groups。")
-            return True, ""
+            return False, (f"本群（{target.chat_id}）没有开通 AI 对话服务。"
+                           f"联系管理员把它加到 {cfg_hint}.groups。")
 
         # 私聊 / 群临时会话（小窗）
         # ⚠️ 授权与否看**这个地址的主人**，不是发消息的人。`private` 地址的
@@ -1399,9 +1397,7 @@ class AiChatPlugin(PluginBase):
         if int(user_id) != int(target.chat_id):
             return False, (f"这个私聊地址属于 {target.chat_id}，"
                            f"你（{user_id}）不能在它上面使用服务。")
-        if users and int(user_id) in users:
-            return True, ""
-        if not users and empty != "deny":
+        if scope.user_ok(user_id):
             return True, ""
         # ---- 受邀例外（**只在私聊里生效**）----
         # 会话所有者可以 `/aichat invite` 一个不在白名单里的人，被邀请者 attach 后
@@ -1785,7 +1781,7 @@ class AiChatPlugin(PluginBase):
                     text = (text.rstrip() + "\n" + " ".join(marks)).strip()
                 media = ""      # 已经有真媒体了，不要再写「（其中含图片，未读取）」
 
-            # 服务范围（白名单）—— 与权限等级无关，不做超级用户豁免。
+            # 服务范围（白名单）—— 口径见 `napcat.scope`（超管豁免）。
             # ⚠️ 必须放在「是不是命令」的判定**之后**：管理服务范围本身的命令
             # （`/aichat add`/`del`/`targets` 等）必须能在未开通的私聊里执行，否则会死锁 ——
             # bind 只能在私聊用，而 users 为空时私聊又被这里挡住，
@@ -4614,16 +4610,12 @@ class AiChatPlugin(PluginBase):
         async def cmd_targets(packet, event: MessageEvent):
             groups = sorted(self._bound_groups())
             users = sorted(self._bound_ids("users"))
-            empty = self._empty_means()
             lines = ["🔓 服务范围（谁能用 AI 对话）", "", f"👥 群（{len(groups)}）"]
             lines += [f"  {g}" for g in groups] or ["  （未配置）"]
             lines += ["", f"👤 用户（{len(users)}）"]
             lines += [f"  {u}" for u in users] or ["  （未配置）"]
             if not groups and not users:
-                lines += ["", f"⚠️ 名单为空，当前策略：{empty}"
-                              + ("（谁都不可用）" if empty == "deny" else "（不限制）")]
-            else:
-                lines += ["", f"（名单为空时：{empty}）"]
+                lines += ["", "⚠️ 名单为空：谁都不可用（要开就 /aichat add 显式加）"]
             table = self.store.focus_table()
             lines += ["", f"💬 当前会话焦点（{len(table)} 处）"]
             if table:
@@ -4934,11 +4926,8 @@ class AiChatPlugin(PluginBase):
         shown = " / ".join(str(t) for t in terms) or "//"
         groups = self._bound_groups()
         users = self._bound_ids("users")
-        empty = self._empty_means()
         def _n(vals, unit):
-            if vals:
-                return f"{len(vals)} 个{unit}"
-            return "未限定" if empty == "allow" else "无"
+            return f"{len(vals)} 个{unit}" if vals else "无"
         at = "先 @我，" if self.cfg["trigger"].get("group_require_at") else ""
         return (f"AI 对话。"
                 f"不用命令也能对话：私聊直接说话，群里{at}长内容可分段发，"

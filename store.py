@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import json
 import os
+
 import random
 import threading
 import time
@@ -26,6 +27,8 @@ from dataclasses import dataclass, field
 from typing import Iterable, Optional
 
 from .segments import Message
+
+from napcat.persist import write_json
 
 STATE_VERSION = 1
 
@@ -272,7 +275,64 @@ def generate_code(rng=None) -> str:
 
 # ==================== 会话存储 ====================
 
-class SentImagesIndex:
+class _JsonIndex:
+    """`message_id → 值` 的 JSON 索引骨架（落盘 + 上限淘汰 + 读坏忽略）。
+
+    三个索引（发出的图片 / 发出的文本 / 发送记录）的簿记**逐字相同**，只有
+    「值怎么归一化」与日志里的名字不一样。以前是三份复制 —— 改一处忘两处
+    是迟早的事，而且它们的淘汰顺序、原子替换、读坏处理本来就该永远一致。
+
+    子类只需要两个东西：`LABEL`（日志分类名）与 `_entry()`（值归一化）。
+    """
+
+    #: 日志里的分类名（「发出图片索引」/「发送索引」…）
+    LABEL = "索引"
+
+    def __init__(self, path: str, *, logger=None, max_entries: int = 400) -> None:
+        self.path = path
+        self.logger = logger
+        self.max_entries = max(1, int(max_entries))
+        self._data: dict = {}
+        self._load()
+
+    def _entry(self, value):
+        """磁盘上的一个值 → 内存里的样子；返回 None 表示这条丢掉。"""
+        return value
+
+    def _load(self) -> None:
+        if not os.path.exists(self.path):
+            return
+        try:
+            with open(self.path, encoding="utf-8") as f:
+                got = json.load(f)
+        except (OSError, json.JSONDecodeError) as e:
+            self._warn("读取失败（忽略）", e)
+            return
+        if not isinstance(got, dict):
+            return
+        data: dict = {}
+        for key, value in got.items():
+            clean = self._entry(value)
+            if clean is not None:
+                data[str(key)] = clean
+        self._data = data
+
+    def save(self) -> None:
+        """落盘（原子替换）。超过 `max_entries` 时先淘汰最老的条目。"""
+        # 淘汰最老的：dict 保持插入顺序，直接切掉前面多余的
+        while len(self._data) > self.max_entries:
+            self._data.pop(next(iter(self._data)), None)
+        try:
+            write_json(self.path, self._data)
+        except OSError as e:
+            self._warn("落盘失败", e)
+
+    def _warn(self, what: str, exc: BaseException) -> None:
+        if self.logger:
+            self.logger.warning("[ai_chat] %s%s: %s", self.LABEL, what, exc)
+
+
+class SentImagesIndex(_JsonIndex):
     """机器人发出去的 `message_id → [图片 url, ...]`（`message_sent` 事件喂）。
 
     **为什么需要**：一条长通知常带 7 张图，推送时被 `chunk.max_images` 切成几条
@@ -281,37 +341,12 @@ class SentImagesIndex:
     这里按 id 存下每条发了哪些图，引用时把相邻几条拼起来。
     """
 
-    def __init__(self, path: str, *, logger=None, max_entries: int = 400) -> None:
-        self.path = path
-        self.logger = logger
-        self.max_entries = max(1, int(max_entries))
-        self._data: dict[str, list] = {}
-        self._load()
+    LABEL = "发出图片索引"
 
-    def _load(self) -> None:
-        if not os.path.exists(self.path):
-            return
-        try:
-            with open(self.path, encoding="utf-8") as f:
-                got = json.load(f)
-            if isinstance(got, dict):
-                self._data = {str(k): [str(u) for u in v if u]
-                              for k, v in got.items() if isinstance(v, list)}
-        except (OSError, json.JSONDecodeError) as e:
-            if self.logger:
-                self.logger.warning("[ai_chat] 发出图片索引读取失败（忽略）: %s", e)
-
-    def save(self) -> None:
-        while len(self._data) > self.max_entries:
-            self._data.pop(next(iter(self._data)), None)
-        tmp = self.path + ".tmp"
-        try:
-            with open(tmp, "w", encoding="utf-8") as f:
-                json.dump(self._data, f, ensure_ascii=False)
-            os.replace(tmp, self.path)
-        except OSError as e:
-            if self.logger:
-                self.logger.warning("[ai_chat] 发出图片索引落盘失败: %r", e)
+    def _entry(self, value):
+        if not isinstance(value, list):
+            return None
+        return [str(u) for u in value if u]
 
     def remember(self, message_id: int, urls: list) -> None:
         key = str(int(message_id))
@@ -342,7 +377,7 @@ class SentImagesIndex:
         return out
 
 
-class SentTextIndex:
+class SentTextIndex(_JsonIndex):
     """机器人发出去的 `message_id → 完整文本`（**跨插件**，`message_sent` 事件喂）。
 
     **为什么需要**：推送常被切成多条（长通知 3 段），用户往往只引用其中一段。
@@ -350,36 +385,10 @@ class SentTextIndex:
     完整内容，按 id 存下来，引用任意一段都能还原全文。
     """
 
-    def __init__(self, path: str, *, logger=None, max_entries: int = 400) -> None:
-        self.path = path
-        self.logger = logger
-        self.max_entries = max(1, int(max_entries))
-        self._data: dict[str, str] = {}
-        self._load()
+    LABEL = "发出文本索引"
 
-    def _load(self) -> None:
-        if not os.path.exists(self.path):
-            return
-        try:
-            with open(self.path, encoding="utf-8") as f:
-                got = json.load(f)
-            if isinstance(got, dict):
-                self._data = {str(k): str(v) for k, v in got.items() if v}
-        except (OSError, json.JSONDecodeError) as e:
-            if self.logger:
-                self.logger.warning("[ai_chat] 发出文本索引读取失败（忽略）: %s", e)
-
-    def save(self) -> None:
-        while len(self._data) > self.max_entries:
-            self._data.pop(next(iter(self._data)), None)
-        tmp = self.path + ".tmp"
-        try:
-            with open(tmp, "w", encoding="utf-8") as f:
-                json.dump(self._data, f, ensure_ascii=False)
-            os.replace(tmp, self.path)
-        except OSError as e:
-            if self.logger:
-                self.logger.warning("[ai_chat] 发出文本索引落盘失败: %r", e)
+    def _entry(self, value):
+        return str(value) if value else None
 
     def remember(self, message_id: int, text: str) -> None:
         key = str(int(message_id))
@@ -410,7 +419,7 @@ class SentTextIndex:
         return "\n\n".join(parts)
 
 
-class SentReplyIndex:
+class SentReplyIndex(_JsonIndex):
     """机器人**自己发出去**的消息 id → 它对应的那条会话消息 `(sid, seq)`。
 
     **为什么需要它**：用户会引用机器人发的**图片** —— Markdown 模式的整篇回答是
@@ -425,38 +434,12 @@ class SentReplyIndex:
     落盘 + 有上限（与摘要缓存同一套路数）：重启后仍能引用旧消息，超了淘汰最老的。
     """
 
-    def __init__(self, path: str, *, logger=None, max_entries: int = 400) -> None:
-        self.path = path
-        self.logger = logger
-        self.max_entries = max(1, int(max_entries))
-        self._data: dict[str, list] = {}
-        self._load()
+    LABEL = "发送索引"
 
-    def _load(self) -> None:
-        if not os.path.exists(self.path):
-            return
-        try:
-            with open(self.path, encoding="utf-8") as f:
-                got = json.load(f)
-            if isinstance(got, dict):
-                self._data = {str(k): v for k, v in got.items()
-                              if isinstance(v, list) and len(v) == 2}
-        except (OSError, json.JSONDecodeError) as e:
-            if self.logger:
-                self.logger.warning("[ai_chat] 发送索引读取失败（忽略）: %s", e)
-
-    def save(self) -> None:
-        # 淘汰最老的：dict 保持插入顺序，直接切掉前面多余的
-        while len(self._data) > self.max_entries:
-            self._data.pop(next(iter(self._data)), None)
-        tmp = self.path + ".tmp"
-        try:
-            with open(tmp, "w", encoding="utf-8") as f:
-                json.dump(self._data, f, ensure_ascii=False)
-            os.replace(tmp, self.path)
-        except OSError as e:
-            if self.logger:
-                self.logger.warning("[ai_chat] 发送索引落盘失败: %r", e)
+    def _entry(self, value):
+        if not isinstance(value, list) or len(value) != 2:
+            return None
+        return value
 
     def add(self, message_ids, sid: str, seq: int) -> None:
         """记下「这些消息 id 对应的原文在 `sid` 的第 `seq` 条」。"""
