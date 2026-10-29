@@ -426,7 +426,11 @@ def markdown_body_css() -> str:
     }
     pre {
       background: #f6f7f9; border: 1px solid #e6e8eb; border-radius: 8px;
-      padding: 12px 14px; margin: 12px 0; overflow-x: auto;
+      padding: 12px 14px; margin: 12px 0;
+      /* ⚠️ 不能 `overflow-x: auto`：滚动容器里的内容**仍被量进宽度**，
+         整页会从 720 被撑到 800+（实测 870），而截图只截 870 里靠左的部分，
+         右侧看起来就像被裁掉了。代码块换行显示，宽度就稳定在版心。 */
+      white-space: pre-wrap; overflow-wrap: anywhere; word-break: break-word;
     }
     pre code { background: none; padding: 0; font-size: 15px; line-height: 1.6; }
     blockquote {
@@ -451,6 +455,12 @@ def markdown_body_css() -> str:
        于是「页面自报需要多宽」那段永远测不到溢出、图照样被切（实测）。
        出图不支持滚动，所以这里把它关掉，让内容真的撑开，再由 _SIZE_SCRIPT 放宽整图。 */
     .math-display .katex-display { margin: 0; overflow: visible !important; }
+    /* ⚠️ KaTeX 会额外生成一份 MathML（给读屏用），它本该被 KaTeX 的 CSS 藏起来
+       （`clip: rect(1px,1px,1px,1px)`）。一旦那份 CSS 没到位（离线/自带资源缺失/
+       CDN 挂了），这个 `<math>` 会按**块级**排版、宽度撑到整行以上 ——
+       出图就从 720 变成 870 那种怪宽度，看起来像「右边被裁了」（实测 s0037）。
+       这里自己兜一道：不管 KaTeX CSS 在不在，都不让它参与排版与量测。 */
+    .katex-mathml, .katex-html .katex-mathml { display: none !important; }
 """
 
 
@@ -524,6 +534,7 @@ def build_markdown_html(text: str, *, width: int = 720,
     body = markdown_to_html(text)
     head = f'<div class="md-title">{html.escape(title)}</div>' if title else ""
     katex = katex_head(body)
+    size_script = _SIZE_SCRIPT
     return f"""<!DOCTYPE html>
 <html><head><meta charset="utf-8"><style>{_md_css(width)}</style>{katex}</head>
 <body>
@@ -531,7 +542,7 @@ def build_markdown_html(text: str, *, width: int = 720,
 {head}
 {body}
 </div>
-{_SIZE_SCRIPT}
+{size_script}
 </body></html>
 """
 

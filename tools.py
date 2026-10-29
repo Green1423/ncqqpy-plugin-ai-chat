@@ -19,6 +19,8 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Awaitable, Callable, Optional
 
+from napcat.tools import call_tool
+
 from .llm import err_text
 from .search import format_results
 
@@ -89,6 +91,8 @@ class Tool:
     #: **委派型**：调用它等于「把这件事交给别的插件」，由那个插件自己回消息 ——
     #: 结果不回喂模型、AI 本轮也不说话（见 `main._model_loop` 的 `_DELEGATED`）
     delegates: bool = False
+    #: 插件工具自带的「使用时机」提示（写进系统提示；为空就不写）
+    hint: str = ""
 
     def schema(self) -> dict:
         """OpenAI `tools[]` 里的函数声明。"""
@@ -109,7 +113,7 @@ class ToolRegistry:
         self.logger = logger
         self._tools: dict[str, Tool] = {}
         #: 动态工具来源（见 `set_provider`）
-        self._provider = None
+        self._providers: list = []
 
     # ---- 注册 ----
 
@@ -152,19 +156,29 @@ class ToolRegistry:
         为什么是"每轮重算"而不是"加载时快照"：提供技能的插件会热重载、
         会被禁用/卸载 —— 快照下来的工具会指向已经死掉的 handler（调用时才炸，
         模型只会看到一句莫名其妙的异常）。
+
+        ⚠️ **可以挂多个**：技能（命令映射）与插件工具（返回给模型）是两个
+        独立来源，各自 `set_provider` 一次。早先只存一个，后挂的会把先挂的顶掉 ——
+        表现为「注册了插件工具之后，所有技能工具都消失了」。
         """
-        self._provider = provider
+        if provider is not None:
+            self._providers.append(provider)
+
+    @property
+    def _provider(self):
+        return self._providers[0] if self._providers else None
 
     def dynamic(self, ctx: ToolContext) -> list[Tool]:
-        if self._provider is None:
-            return []
-        try:
-            got = self._provider(ctx)
-        except Exception as e:  # noqa: BLE001 - 技能表坏了也不能让整轮对话失败
-            if self.logger:
-                self.logger.warning("[ai_chat] 技能列表取用失败: %r", e)
-            return []
-        return [t for t in got or [] if isinstance(t, Tool)]
+        out: list[Tool] = []
+        for provider in list(self._providers):
+            try:
+                got = provider(ctx)
+            except Exception as e:  # noqa: BLE001 - 一个来源坏了不影响别的
+                if self.logger:
+                    self.logger.warning("[ai_chat] 动态工具取用失败: %r", e)
+                continue
+            out.extend(t for t in got or [] if isinstance(t, Tool))
+        return out
 
     # ---- 可见性 ----
 
@@ -352,6 +366,79 @@ def _skill_tool(skill, handler, *, logger=None) -> Tool:
         handler=tool_handler,
         # 委派型：命令自己回消息，AI 不接话、也不转述
         delegates=True,
+    )
+
+
+def register_plugin_tools(reg: ToolRegistry, *, tools, cfg, logger=None) -> None:
+    """把**别的插件注册的工具**接进本插件的工具表 —— 与技能不同：
+
+    * 工具自己带 handler 与 JSON Schema（不映射命令）；
+    * 调用结果**返回给模型**（`delegates=False`），由 AI 组织答复；
+    * 权限/作用域在**这里**判（`permission` / `scope`），不通过就不暴露。
+
+    `cfg` 可以是取值函数（配置热重载后立刻生效）。
+    """
+    def provider(ctx):
+        conf = cfg() if callable(cfg) else cfg
+        conf = conf if isinstance(conf, dict) else {}
+        if not bool(conf.get("enabled", True)):
+            return []
+        allow = [str(x) for x in (conf.get("allow") or [])]
+        deny = {str(x) for x in (conf.get("deny") or [])}
+        out = []
+        for item in tools.list(exclude="ai_chat"):
+            if allow and item.name not in allow:
+                continue
+            if not allow and item.name in deny:
+                continue
+            if not _tool_allowed(item, ctx):
+                continue
+            out.append(_plugin_tool(item, logger=logger))
+        return out
+
+    reg.set_provider(provider)
+
+
+def _tool_allowed(item, ctx) -> bool:
+    """工具声明的权限/作用域是否允许**此刻这次调用**。"""
+    scope = str(getattr(item, "scope", "all") or "all").lower()
+    if scope == "private" and ctx.in_group:
+        return False
+    if scope == "group" and not ctx.in_group:
+        return False
+    need = str(getattr(item, "permission", "") or "").lower()
+    if not need:
+        return True
+    if need == "superuser":
+        return bool(getattr(ctx, "is_superuser", False))
+    if need == "admin":
+        return bool(getattr(ctx, "is_superuser", False)
+                    or getattr(ctx, "is_admin", False))
+    return True
+
+
+def _plugin_tool(item, *, logger=None) -> Tool:
+    """工具 → 本插件的 `Tool`（结果**返回给模型**，非委派）。"""
+
+    async def tool_handler(ctx, **_args):
+        try:
+            # ctx 只在工具自己声明了第二个参数时才传（见 `napcat.tools.call_tool`）：
+            # 业务白名单（如「这个群允许用本插件吗」）需要知道**谁在调**，
+            # 而 `permission` / `scope` 只能表达「超管 / 群聊」这种粗粒度。
+            text = await call_tool(item, _args, ctx)
+        except Exception as e:  # noqa: BLE001 - 工具失败不该拖垮对话
+            if logger:
+                logger.warning("[ai_chat] 工具 %s 调用失败: %r", item.name, e)
+            raise RuntimeError(f"工具 {item.name} 调用失败：{err_text(e)}") from e
+        return text or "（工具没有返回内容）"
+
+    return Tool(
+        name=item.tool_name,
+        description=(f"[{item.plugin}] {item.describe()}"),
+        parameters=item.parameters,
+        handler=tool_handler,
+        delegates=False,        # ★ 结果进模型上下文，不直接发给用户
+        hint=str(getattr(item, "prompt_hint", "") or ""),
     )
 
 

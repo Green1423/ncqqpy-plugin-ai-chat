@@ -89,7 +89,8 @@ from .store import (
     normalize_code,
 )
 from .tools import (ToolContext, ToolRegistry, register_builtin_tools,
-                    register_image_tool, register_plot_tool, register_skill_tools,
+                    register_image_tool, register_plot_tool,
+                    register_plugin_tools, register_skill_tools,
                     register_web_tools)
 from .webimg import WebImageService
 from . import schemas as S
@@ -395,6 +396,16 @@ def _wants_interpretation(own_text: str) -> bool:
 _DELEGATED = object()
 
 
+class _EmptyTools:
+    """空工具表：框架还没有 `napcat.tools` 时的占位（见 `_build_tools`）。"""
+
+    def list(self, *, exclude: Optional[str] = None) -> list:
+        return []
+
+    def get(self, name: str):
+        return None
+
+
 class _EmptySkills:
     """空技能表：进程里的框架还没有技能通道时的占位（见 `_build_tools`）。"""
 
@@ -605,6 +616,23 @@ class AiChatPlugin(PluginBase):
             # 传取值函数而不是快照：配置改了（含热重载）立刻生效
             cfg=lambda: self.cfg.get("skills") or {},
             logger=self.logger)
+        # 别的插件注册的**工具**（`@self.register_tool(...)`，见 `napcat.tools`）：
+        # 与技能的区别是结果**回给模型**（不委派、不直接发消息）。
+        real_reg = getattr(self, "plugin_tools", None)
+        if real_reg is None:
+            # 框架的注册表挂在 `self.plugin_tools`（PluginBase 注入），
+            # 没注入就当没有；本插件的 `self.tools` 是自己的工具表，别混用
+            self.logger.warning(
+                "[ai_chat] 当前进程里的框架没有插件工具表（napcat.tools）——"
+                "插件工具暂不提供，重启进程后生效")
+            register_plugin_tools(self.tools, tools=_EmptyTools(),
+                                  cfg=lambda: {"enabled": False},
+                                  logger=self.logger)
+        else:
+            register_plugin_tools(
+                self.tools, tools=real_reg,
+                cfg=lambda: self.cfg.get("plugin_tools") or {},
+                logger=self.logger)
 
         @self.on_event(MessageEvent)
         async def _on_message_sent(event: MessageEvent):
@@ -1936,6 +1964,21 @@ class AiChatPlugin(PluginBase):
                                          early[:60])
                     continue
             item = await self.media.fetch(url, kind, num=num, session=session)
+            if not item.ok and kind == "image" and self.api is not None:
+                # 图片下载失败时，再问一次 NapCat 要**新鲜地址**（QQ 的 CDN
+                # 链接会过期，服务端重新签一个往往就能取到）。线上 s0034 的
+                # `[图#8]` 就是第一次拿到的地址下载失败、之后没有任何补救。
+                try:
+                    info = await self.api.get_image(
+                        file=str(data.get("file") or "") or None)
+                    fresh = str(getattr(info, "url", "") or "")
+                except Exception:  # noqa: BLE001 - 换不到就保持原样
+                    fresh = ""
+                if fresh and fresh != url:
+                    again = await self.media.fetch(fresh, "image", num=num,
+                                                   session=session)
+                    if again.ok:
+                        item = again
             if item.ok and kind == "record":
                 # **默认转给 AI**：语音先转成文字，正文里直接带上内容 ——
                 # 模型收不了音频（实测上游拒收），但文字它一定读得懂。
@@ -3821,6 +3864,8 @@ class AiChatPlugin(PluginBase):
             chat_label=f"群 {target.chat_id}" if target.is_group else f"用户 {target.chat_id}",
             speaker=ctx.at_label, user_id=ctx.user_id,
             tool_names=[t.name for t in self.tools.visible(ctx)]
+            if self.cfg["tools"]["enabled"] else [],
+            tool_hints=[t.hint for t in self.tools.visible(ctx) if getattr(t, "hint", "")]
             if self.cfg["tools"]["enabled"] else [],
             # 指引按「本轮有什么能力」拼：没开搜索就不讲搜索，Markdown 模式
             # 才讲 Markdown —— 提示里讲不存在的工具会让模型空调用一轮。

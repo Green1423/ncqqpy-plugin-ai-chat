@@ -2264,6 +2264,84 @@ async def test_invited_guest_hint(h: Harness):
     check("attach 后能正常对话", any("收到" in t for t in texts), f"{texts}")
 
 
+def _tool_ctx(*, user_id=ALICE, chat_kind="private", chat_id=None):
+    from plugins.ai_chat.tools import ToolContext
+    uid = int(user_id)
+    return ToolContext(session_id="s1", user_id=uid, chat_kind=chat_kind,
+                       chat_id=int(chat_id or uid))
+
+async def test_missing_media_is_explained(h: Harness):
+    """点名的图没取到 → 模型要看到「看不到 + 原因」，不能静默跳过。
+
+    线上 s0034 的 `[图#8]`：下载失败（note 只写了「下载失败：RuntimeError」），
+    重试时 `media_include` 里有它，但 `ok=False` 没有字节 → 模型只看到标号、
+    以为能看到图。现在会把原因写进正文，并且下载失败会重试 + 换新鲜地址。
+    """
+    print("\n[19.56] 没取到的媒体要说明原因")
+    from plugins.ai_chat.compaction import DshWrapping, WrappingConfig
+    from plugins.ai_chat.segments import user_message
+    msg = user_message("这个对吗", media=[{
+        "kind": "image", "num": 8, "ok": False, "path": "", "mime": "",
+        "size": 0, "note": "下载失败：HTTP 404"}],
+        media_include=[["image", 8]])
+    parts = DshWrapping(WrappingConfig(number_paragraphs=False)).project(
+        [msg])[0]["content"]
+    text = parts[0]["text"] if isinstance(parts, list) else parts
+    check("说明里带标号", "[图#8]" in text, text)
+    check("说明里带原因", "HTTP 404" in text, text)
+    check("没有把字节塞进去（本来就没有）",
+          isinstance(parts, str) or all(p.get("type") == "text" for p in parts),
+          f"{parts}")
+
+
+async def test_plugin_tool_returns_to_model(h: Harness):
+    """**工具**（`register_tool`）与**技能**的区别：结果回给模型，由 AI 作答。
+
+    技能 = 命令映射，命令自己发消息、AI 不接话；
+    工具 = 自己写的 handler，返回值进模型上下文，AI 据此组织答复。
+    """
+    print("\n[19.55] 插件工具：结果回模型")
+    await establish(h)
+    seen = []
+
+    async def lookup(args):
+        seen.append(dict(args))
+        return f"查询结果：{args.get('kw')} 有 3 条"
+
+    h.plugin.plugin_tools.register("demo", "lookup", lookup,
+                                   description="查资料（结果回模型）")
+
+    def responder(messages, tools):
+        if messages[-1].get("role") != "tool":
+            return StubResult(text="", tool_calls=[StubCall("demo_lookup",
+                                                            {"kw": "线代"}, "t1")])
+        return StubResult(text="根据工具结果：一共 3 条。")
+    h.llm.responder = responder
+    h.clear()
+    await h.private("查下线代//", settle=2.2)
+    await h.wait_reply()
+    texts = [reply_text(r) for r in h.replies if reply_text(r).strip()]
+    tool_msgs = [m for m in h.llm.requests[-1]["messages"] if m.get("role") == "tool"]
+    check("工具被调用（参数来自模型）", seen == [{"kw": "线代"}], f"{seen}")
+    check("结果回到模型上下文", bool(tool_msgs) and "3 条" in tool_msgs[0]["content"],
+          f"{tool_msgs}")
+    check("用户看到的是 AI 的答复（不是工具原文）",
+          texts == ["根据工具结果：一共 3 条。"], f"{texts}")
+
+    # 权限：superuser 专用的工具，普通用户看不到
+    async def secret(args):
+        return "机密"
+    h.plugin.plugin_tools.register("demo", "secret", secret,
+                                   description="超管专用", permission="superuser")
+    ctx = _tool_ctx(user_id=ALICE)
+    names = [t.name for t in h.plugin.tools.visible(ctx)]
+    check("普通用户看不到超管工具", "demo_secret" not in names, f"{names}")
+    ctx2 = _tool_ctx(user_id=SUPERUSER)
+    ctx2.is_superuser = True          # 消费侧靠这个布尔判「超管可见」
+    names2 = [t.name for t in h.plugin.tools.visible(ctx2)]
+    check("超管看得到", "demo_secret" in names2, f"{names2}")
+
+
 async def test_voice_asr_retries_hot_failure(h: Harness):
     """刚到的语音服务端可能还没转完（线上见过 `[1200]`）→ 要重试几次。
 
@@ -5278,7 +5356,9 @@ async def main():
         test_no_deferred_relative_imports, test_no_coupling_with_other_plugins,
         test_binding_allowlist, test_binding_group_vs_private, test_binding_cooldown,
         test_private_binding_bootstrap, test_unbound_is_silent,
-        test_unified_help, test_voice_asr_retries_hot_failure,
+        test_unified_help, test_missing_media_is_explained,
+        test_plugin_tool_returns_to_model,
+        test_voice_asr_retries_hot_failure,
         test_voice_is_a_turn_without_terminator,
         test_voice_via_fetch_ptt_text,
         test_invited_guest_hint,

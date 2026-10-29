@@ -19,6 +19,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import io
+import asyncio
 import os
 import re
 import shutil
@@ -186,10 +187,23 @@ class MediaStore:
         if not url:
             item.ok, item.note = False, "没有可下载的地址"
             return item
-        try:
-            raw = await self._fetch_bytes(url)
-        except Exception as e:  # noqa: BLE001 - 网络问题不该炸掉整轮
-            item.ok, item.note = False, f"下载失败：{type(e).__name__}"
+        # 重试一次：QQ 的图片 CDN 偶发 5xx/超时，一次失败就永久判定「取不到」
+        # 会让用户重发也没用（线上 s0034 的 [图#8] 就是这样丢的）。
+        raw = b""
+        last: Optional[Exception] = None
+        for attempt in range(2):
+            try:
+                raw = await self._fetch_bytes(url)
+                break
+            except Exception as e:  # noqa: BLE001 - 网络问题不该炸掉整轮
+                last = e
+                if attempt == 0:
+                    await asyncio.sleep(0.6)
+        if last is not None and not raw:
+            # 原因要**带出消息**：只写「RuntimeError」等于没说（HTTP 404、
+            # 超时、超过大小上限，处理方式完全不同）
+            item.ok = False
+            item.note = f"下载失败：{type(last).__name__}: {last}"
             return item
         if not raw:
             item.ok, item.note = False, "下载到 0 字节"
