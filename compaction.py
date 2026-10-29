@@ -498,7 +498,8 @@ def build_system_prompt(*, persona: str = "", extra_sections: Optional[list[str]
         # 工具 schema 里：模型常常不看 schema 描述就直接凭记忆回答。
         hints = [str(h).strip() for h in (tool_hints or []) if str(h).strip()]
         if hints:
-            cap.append("插件工具的使用时机：\n" + "\n".join(f"- {h}" for h in hints))
+            cap.append("插件工具/技能的使用时机：\n"
+                       + "\n".join(f"- {h}" for h in hints))
         sections.append("\n".join(cap))
 
     if extra_sections:

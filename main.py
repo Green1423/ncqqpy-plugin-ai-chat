@@ -3576,11 +3576,35 @@ class AiChatPlugin(PluginBase):
         cap = max(0.0, _coerce_float(cfg.get("retry_max_wait"), 8.0))
         notice = bool(cfg.get("retry_notice", True))
         told = False
+        # ★ 「想完了却没字数回答」是**可自愈**的：思考 token 与正文共用
+        #   `max_tokens` 配额，给少了就会 finish=stop 但正文为空
+        #   （线上报 E-xxxx：「空响应（finish_reason=stop，思考链 181 字）」）。
+        #   这里不要求用户改配置，先按 4 倍（至少 16384）补一次配额，还空就再
+        #   关掉思考重来一次 —— 两次都不行才把错误抛给用户。
+        budget_tried = 0
         for attempt in range(tries + 1):
             try:
                 return await self.llm.chat(messages, tools=tools, reasoning=reasoning,
                                            max_tokens=max_tokens, timeout=timeout)
             except Exception as e:  # noqa: BLE001 - 分类交给 _is_retryable
+                # ① 空响应（思考吃光配额）：加预算重试
+                if _looks_like_empty_reply(e) and budget_tried == 0:
+                    budget_tried = 1
+                    cur = int(max_tokens or self.cfg["llm"].get("max_tokens") or 4096)
+                    bigger = max(16384, cur * 4)
+                    self.logger.warning(
+                        "[ai_chat] 空响应（思考吃光 max_tokens=%s），改用 %s 重试一次",
+                        cur, bigger)
+                    max_tokens = bigger
+                    continue
+                # ② 加了预算还是空：关掉思考再试一次（把配额全留给正文）
+                if _looks_like_empty_reply(e) and budget_tried == 1:
+                    budget_tried = 2
+                    self.logger.warning(
+                        "[ai_chat] 加预算仍空响应，关掉思考再试一次")
+                    reasoning = "thinking:off"
+                    max_tokens = max(16384, int(max_tokens or 16384))
+                    continue
                 if attempt >= tries or not _is_retryable(e) \
                         or _looks_like_context_overflow(e):
                     raise
@@ -5368,6 +5392,12 @@ def _message_id_of(resp) -> int:
         if mid:
             return mid
     return 0
+
+
+def _looks_like_empty_reply(e: BaseException) -> bool:
+    """是不是「想完了却没字数回答」（思考 token 吃光 max_tokens）。"""
+    text = str(e or "")
+    return "空响应" in text and "思考链" in text
 
 
 def _is_retryable(e: BaseException) -> bool:

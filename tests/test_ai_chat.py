@@ -2270,6 +2270,75 @@ def _tool_ctx(*, user_id=ALICE, chat_kind="private", chat_id=None):
     return ToolContext(session_id="s1", user_id=uid, chat_kind=chat_kind,
                        chat_id=int(chat_id or uid))
 
+async def test_tool_skill_prompt_hints(h: Harness):
+    """技能/工具都能带「什么时候该用」，并写进**系统提示**（不只留在 schema 里）。"""
+    print("\n[19.58] 技能/工具的「何时该用」进系统提示")
+    await establish(h)
+
+    async def handler(args):
+        return "结果"
+    h.plugin.plugin_tools.register(
+        "demo", "lookup", handler, description="查资料",
+        prompt_hint="用户明确要查资料时才用 demo_lookup；闲聊不要用")
+
+    @h.plugin.register_command("demo.cmd", permission="", scope="all",
+                               description="演示命令")
+    async def cmd(packet, event):
+        return "ok"
+    h.plugin.skills.register("demo", "sk", command="demo.cmd",
+                             description="演示", prompt_hint="用户要演示时才用 demo_sk")
+
+    h.clear()
+    await h.private("随便聊聊//", settle=1.4)
+    await h.wait_reply()
+    system = h.llm.requests[-1]["messages"][0]["content"]
+    check("系统提示里有「使用时机」一节", "使用时机" in system, system[-300:])
+    check("工具的话术在里面", "闲聊不要用" in system, system[-300:])
+    check("技能的话术也在里面", "用户要演示时才用" in system, system[-300:])
+
+
+async def test_empty_reply_budget_retry(h: Harness):
+    """「想完了却没字数回答」自动补配额重试，而不是直接报错。
+
+    线上：`max_tokens=4096`，推理模型把配额全用在思考上，`finish_reason=stop`
+    但正文为空 → 用户只看到 `⚠️ AI 对话出错（E-xxxx）`。现在会自动按 4 倍
+    （至少 16384）重试一次，还空就关掉思考再试一次。
+    """
+    print("\n[19.57] 空响应：自动补配额重试")
+    await establish(h)
+    llm_mod = plugin_module("llm")
+    calls = {"n": 0}
+
+    def responder(messages, tools):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise llm_mod.LlmError(
+                "空响应（finish_reason=stop，思考链 181 字）；若为推理模型请调大 "
+                "ai_chat.llm.max_tokens")
+        return StubResult(text="这次答上来了")
+    h.llm.responder = responder
+    h.clear()
+    await h.private("问一句//", settle=2.4)
+    texts = [reply_text(r) for r in h.replies if reply_text(r).strip()]
+    check("自动重试后给出答案", texts == ["这次答上来了"], f"{texts}")
+    check("确实重试了一次（共两次调用）", calls["n"] == 2, f"{calls['n']}")
+
+    # 两次都空：关掉思考再试一次（第三次）
+    calls["n"] = 0
+
+    def always_empty(messages, tools):
+        calls["n"] += 1
+        if calls["n"] <= 2:
+            raise llm_mod.LlmError("空响应（finish_reason=stop，思考链 900 字）")
+        return StubResult(text="关掉思考后答上来了")
+    h.llm.responder = always_empty
+    h.clear()
+    await h.private("再问一句//", settle=2.6)
+    texts = [reply_text(r) for r in h.replies if reply_text(r).strip()]
+    check("关掉思考后成功", texts == ["关掉思考后答上来了"], f"{texts}")
+    check("三次调用（原 / 加预算 / 关思考）", calls["n"] == 3, f"{calls['n']}")
+
+
 async def test_missing_media_is_explained(h: Harness):
     """点名的图没取到 → 模型要看到「看不到 + 原因」，不能静默跳过。
 
@@ -5356,7 +5425,9 @@ async def main():
         test_no_deferred_relative_imports, test_no_coupling_with_other_plugins,
         test_binding_allowlist, test_binding_group_vs_private, test_binding_cooldown,
         test_private_binding_bootstrap, test_unbound_is_silent,
-        test_unified_help, test_missing_media_is_explained,
+        test_unified_help, test_tool_skill_prompt_hints,
+        test_empty_reply_budget_retry,
+        test_missing_media_is_explained,
         test_plugin_tool_returns_to_model,
         test_voice_asr_retries_hot_failure,
         test_voice_is_a_turn_without_terminator,

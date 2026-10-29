@@ -366,6 +366,9 @@ def _skill_tool(skill, handler, *, logger=None) -> Tool:
         handler=tool_handler,
         # 委派型：命令自己回消息，AI 不接话、也不转述
         delegates=True,
+        # 「什么时候该用我」写进系统提示（与插件工具同一节）；
+        # 不写就退回 `description` —— 至少让模型知道这工具是干什么的
+        hint=str(getattr(skill, "prompt_hint", "") or ""),
     )
 
 

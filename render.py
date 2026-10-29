@@ -37,12 +37,27 @@ from .markdown import (FRAGMENT_WIDTHS, build_fragment_html,
                        build_table_html, katex_head, markdown_body_css,
                        markdown_to_html)
 
-#: 找不到可用的 Chromium
-CHROMIUM_CANDIDATES = (
-    "chromium", "chromium-browser", "google-chrome", "google-chrome-stable",
-    "chrome", "/usr/bin/chromium", "/usr/bin/chromium-browser",
-    "/usr/bin/google-chrome",
-)
+# ⚠️ Chromium 的**定位/启动/超时**统一由框架提供（`napcat.render`）：
+# 三个插件各写一份，任何一份改了另外两份都不会跟着改（实测已分叉）。
+# 框架模块只在**进程启动**时加载，而插件是热重载的 —— 老进程里还没有它，
+# 直接 import 会把整个插件打挂，所以拿不到就按文件路径加载同一份实现。
+try:                                        # 正常路径（重启后走这里）
+    from napcat.render import (RenderError, find_chromium, file_uri)
+    from napcat.render import run_chromium as _run_chromium
+except ImportError:                         # 老进程：按路径加载，实现仍只有一份
+    import importlib.util as _ilu
+    import sys as _sys
+
+    _spec = _ilu.spec_from_file_location(
+        "napcat_render_boot",
+        Path(__file__).resolve().parents[2] / "napcat" / "render.py")
+    _mod = _ilu.module_from_spec(_spec)
+    _sys.modules["napcat_render_boot"] = _mod
+    _spec.loader.exec_module(_mod)
+    RenderError = _mod.RenderError
+    find_chromium = _mod.find_chromium
+    file_uri = _mod.file_uri
+    _run_chromium = _mod.run_chromium
 
 _HEIGHT_RE = re.compile(r"H=(\d+)")
 
@@ -76,8 +91,6 @@ FRAGMENT_CROP_ALL = frozenset({"math"})
 _WIDE_RE = re.compile(r"W=(\d+)")
 
 
-class RenderError(RuntimeError):
-    """渲染失败 —— 消息可直接展示给用户（不暴露路径/命令行）。"""
 
 
 @dataclass
@@ -100,18 +113,6 @@ class RenderOptions:
     max_width: int = 1600
 
 
-def find_chromium(hint: str = "") -> Optional[str]:
-    """找可执行的 Chromium。`hint` 优先（配置里可显式指定）。"""
-    if hint:
-        if os.path.sep in hint:
-            return hint if os.path.exists(hint) else None
-        return shutil.which(hint)
-    for name in CHROMIUM_CANDIDATES:
-        got = shutil.which(name) if os.path.sep not in name else (
-            name if os.path.exists(name) else None)
-        if got:
-            return got
-    return None
 
 
 def _truncate(text: str, limit: int) -> tuple[str, bool]:
@@ -632,34 +633,9 @@ class HistoryRenderer:
     async def _run_chrome(self, chrome: str, args: list[str],
                           profile: str) -> tuple[str, str]:
         """跑一次 Chromium。参数一律走 argv（不拼 shell），带超时。"""
-        cmd = [
-            chrome, "--headless=new", "--no-sandbox", "--disable-gpu",
-            "--disable-dev-shm-usage", "--no-first-run", "--no-default-browser-check",
-            "--disable-extensions", "--disable-background-networking",
-            "--user-data-dir=" + profile,
-        ] + args
-        try:
-            proc = await asyncio.create_subprocess_exec(
-                *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
-        except FileNotFoundError as e:
-            raise RenderError(f"启动 Chromium 失败：{e}") from e
-        except OSError as e:
-            raise RenderError(f"启动 Chromium 失败：{e}") from e
-        try:
-            out_b, err_b = await asyncio.wait_for(proc.communicate(),
-                                                  timeout=float(self.opt.timeout))
-        except asyncio.TimeoutError:
-            try:
-                proc.kill()
-            except (ProcessLookupError, OSError):
-                pass                    # 已经自己退出了
-            try:
-                await asyncio.wait_for(proc.wait(), timeout=5)
-            except Exception:           # noqa: BLE001 - 回收失败不该盖住超时本身
-                pass
-            raise RenderError(f"渲染超时（超过 {self.opt.timeout:.0f} 秒）")
-        return ((out_b or b"").decode("utf-8", "replace"),
-                (err_b or b"").decode("utf-8", "replace"))
+        _rc, out, err = await _run_chromium(
+            chrome, args, profile=profile, timeout=float(self.opt.timeout))
+        return out, err
 
     # ---- 清理 ----
 
@@ -691,6 +667,5 @@ class HistoryRenderer:
             pass
 
 
-def _file_uri(path: str) -> str:
-    """本地路径 → `file://` URI（路径里的空格/中文都必须正确编码）。"""
-    return Path(os.path.abspath(path)).as_uri()
+#: 框架版 `file_uri` 的本地别名（调用点保持原名，改动面最小）。
+_file_uri = file_uri
