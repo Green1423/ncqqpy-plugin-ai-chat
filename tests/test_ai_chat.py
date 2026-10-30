@@ -2434,6 +2434,47 @@ async def test_voice_asr_retries_hot_failure(h: Harness):
     check("确实重试了（3 次）", n["count"] == 3, f"{n['count']} 次")
 
 
+async def test_voice_reply_defaults_to_markdown(h: Harness):
+    """语音输入**默认用 Markdown 出图**回复（用户要求）。
+
+    理由：语音是「说一句话让你办件事」，回答通常要点多、排版有用；
+    显式写 `//md` 的普通文字也一样走 md，`//` 的纯文字提问仍是纯文本。
+    """
+    print("\n[19.59] 语音输入默认 md 出图")
+    import subprocess
+    await establish(h)
+    wav = str(TMP_DIR / "mdv.wav")
+    subprocess.run(["ffmpeg", "-y", "-f", "lavfi", "-i", "anullsrc=r=8000:cl=mono",
+                    "-t", "0.4", wav], capture_output=True)
+    raw = open(wav, "rb").read()
+
+    async def fake_dl(url):
+        return raw
+    h.plugin.media._download = fake_dl
+    orig = h.plugin.api._call
+
+    async def routed(action, params=None):
+        if action == "fetch_ptt_text":
+            return {"text": "帮我总结今天的事"}
+        return await orig(action, params)
+    h.plugin.api._call = routed
+
+    called = []
+    orig_md = h.plugin._send_markdown
+
+    async def spy(target, session, text, *, quote_id=None):
+        called.append(text[:20])
+        return await orig_md(target, session, text, quote_id=quote_id)
+    h.plugin._send_markdown = spy
+
+    payload = h._msg_payload("private", "", user_id=ALICE)
+    payload["message"] = [{"type": "record", "data": {"url": "http://x/a.amr"}}]
+    h.clear()
+    await h._send_raw(payload, 3.5)
+    await h.wait_reply()
+    check("语音的回答走了 md 出图", bool(called), f"{called}")
+
+
 async def test_voice_is_a_turn_without_terminator(h: Harness):
     """一条语音 = 一次对话：不用发结束符就提交（用户明确要求）。"""
     print("\n[19.53] 单条语音自动成轮（不需要结束符）")
@@ -2459,8 +2500,11 @@ async def test_voice_is_a_turn_without_terminator(h: Harness):
     payload["message"] = [{"type": "record", "data": {"url": "http://x/a.amr"}}]
     h.clear()
     await h._send_raw(payload, 2.8)
+    # 语音回复现在是 **md 出图**（图片消息没有文字），所以判「有没有回复」，
+    # 不拿文字判
     texts = [reply_text(r) for r in h.replies if reply_text(r).strip()]
-    check("没发结束符也有回复", bool(texts), f"{texts}")
+    check("没发结束符也有回复（文字或图片）",
+          bool(h.replies), f"{[(type(r).__name__, reply_text(r)[:20]) for r in h.replies]}")
     seen = h.llm.last_user_content() if h.llm.requests else ""
     check("模型收到语音转写的内容", "查下最近的通知" in seen, seen[:120])
     check("暂存区已清空",
@@ -5431,7 +5475,8 @@ async def main():
         test_no_deferred_relative_imports, test_no_coupling_with_other_plugins,
         test_binding_allowlist, test_binding_group_vs_private, test_binding_cooldown,
         test_private_binding_bootstrap, test_unbound_is_silent,
-        test_unified_help, test_tool_skill_prompt_hints,
+        test_unified_help, test_voice_reply_defaults_to_markdown,
+        test_tool_skill_prompt_hints,
         test_empty_reply_budget_retry,
         test_missing_media_is_explained,
         test_plugin_tool_returns_to_model,

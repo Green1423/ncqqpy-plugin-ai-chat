@@ -1815,13 +1815,17 @@ class AiChatPlugin(PluginBase):
                 self._schedule_submit(target)
                 return
 
-            self._stage(target, event, body, explicit_finish=finished, media=media,
-                        md=md_mode, media_items=media_items, media_pick=picked)
             # ★ 一条**语音就是一次对话**：用户不用再发结束符（他的要求）。
             #   语音已经转成文字进正文了，直接当「已说完」提交；
             #   同一条消息里还带了文字的话，仍按普通分段逻辑等他收尾。
             has_voice = has_record or any(
                 getattr(m, "kind", "") == "record" for m in media_items)
+            # ★ 语音输入**默认用 Markdown 出图**回复（用户要求）：语音是「说一句话
+            #   让我办件事」，回答通常要点多、排版有用；而且语音提问时用户多半不在
+            #   盯着屏幕逐字读。显式写了 `//`（普通模式）仍以用户的写法为准。
+            md_eff = bool(md_mode or has_voice)
+            self._stage(target, event, body, explicit_finish=finished, media=media,
+                        md=md_eff, media_items=media_items, media_pick=picked)
             if has_voice and not user_said:
                 if self.cfg.get("log_verbose"):
                     self.logger.info("[ai_chat] 语音单独成轮：跳过结束符直接提交")

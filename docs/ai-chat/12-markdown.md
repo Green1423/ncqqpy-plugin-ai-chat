@@ -1,6 +1,6 @@
 # 十二、Markdown 模式
 
-> 文档索引：[docs/README.md](https://github.com/Green1423/ncqqpy/blob/main/docs/README.md) · 上级：[ai_chat 插件](README.md) · 上一章：[联网搜索](11-web-search.md) · 下一章：[`/md`：把上一条 AI 回复转成图片](14-md-image.md)
+> 文档索引：[docs/README.md](https://github.com/Green1423/ncqqpy/blob/main/docs/README.md) · 上级：[ai_chat 插件](README.md) · 上一章：[联网搜索](11-web-search.md) · 下一章：[函数图像](13-plot.md)
 
 AI 默认用纯文本回复（QQ 不渲染 Markdown）。开启 Markdown 模式后，回复会先渲染成
 一张图片再发出，适合表格、公式、代码块较多的问题。
@@ -92,3 +92,9 @@ AI 默认用纯文本回复（QQ 不渲染 Markdown）。开启 Markdown 模式�
 改成 `white-space: pre-wrap` 换行显示 —— 否则一段长代码同样把整页撑宽。
 
 验证：普通段落 720×373、行间公式 720×271、`s0037` 那条长答案 720×1224。
+
+## 语音输入默认出图
+
+一条语音（不需要结束符）触发的那一轮，**默认用 Markdown 出图**回复：
+语音的诉求通常是「说一句、让它办件事」，回答往往是要点多、需要排版；
+显式写 `//md` 的文字提问同样出图，而 `//` 的普通文字提问仍是纯文本。
